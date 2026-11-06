@@ -5,14 +5,19 @@ plugins {
 }
 
 android {
+    val appVersionName: String = run {
+        val vf = rootProject.file("../VERSION")
+        if (vf.exists()) vf.readText().trim() else "2.0.0"
+    }
+
     namespace = "com.s23.airdrop"
     compileSdk = 36
     defaultConfig {
         applicationId = "com.s23.airdrop.v2"
         minSdk = 31
         targetSdk = 36
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 200
+        versionName = appVersionName
     }
 
     buildTypes {

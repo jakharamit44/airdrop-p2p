@@ -68,32 +68,34 @@ PLIST
   fi
 }
 
-stop_lan_daemons() {
+stop_http_daemons() {
   for pf in "$PID_FILE" "$MDNS_PID_FILE" "$AWDL_MDNS_PID_FILE"; do
     if [[ -f "$pf" ]]; then
       kill "$(cat "$pf")" 2>/dev/null || true
       rm -f "$pf"
     fi
   done
+  pkill -f "airdropp2p.local." 2>/dev/null || true
   pkill -f "s23airdrop.local." 2>/dev/null || true
   pkill -f "$MAC_SERVICE_ID" 2>/dev/null || true
 }
 
 stop_daemons() {
-  stop_lan_daemons
+  stop_http_daemons
   if [[ -f "$BLE_PID_FILE" ]]; then
     kill "$(cat "$BLE_PID_FILE")" 2>/dev/null || true
     rm -f "$BLE_PID_FILE"
   fi
+  pkill -f "airdrop-p2p-daemon" 2>/dev/null || true
   pkill -f "mac-ble-airdrop daemon" 2>/dev/null || true
 }
 
 start_daemons() {
   if [[ "${SKIP_BLE_RESTART:-0}" == "1" ]]; then
-    stop_lan_daemons
+    stop_http_daemons
   else
     stop_daemons
-    rm -f "$STATE_DIR/active_peers.json" "$STATE_DIR/s23_p2p_status" "$STATE_DIR/last_s23_ip"
+    rm -f "$STATE_DIR/active_peers.json" "$STATE_DIR/p2p_status" "$STATE_DIR/last_peer_ip"
   fi
   ensure_cert
   ensure_ble_bin
@@ -255,8 +257,27 @@ def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int) -
             "totalBytes": int(total_bytes),
             "timestamp": time.time(),
         }), encoding="utf-8")
+
+        summary = f"{len(file_names)} file(s)" if len(file_names) > 1 else (file_names[0] if file_names else "items")
+        def prompt_dialog():
+            time.sleep(1.0)
+            if dec_file.exists():
+                return
+            try:
+                res = subprocess.check_output([
+                    "osascript", "-e",
+                    f'display dialog "{sender_name} wants to share {summary} with you." with title "AirDrop P2P" buttons {{"Decline", "Accept"}} default button "Accept" giving up after 40'
+                ], text=True, stderr=subprocess.DEVNULL).strip()
+                if "button returned:Accept" in res:
+                    dec_file.write_text(json.dumps({"id": req_id, "accepted": True}), encoding="utf-8")
+                elif "button returned:Decline" in res:
+                    dec_file.write_text(json.dumps({"id": req_id, "accepted": False}), encoding="utf-8")
+            except Exception:
+                pass
+        threading.Thread(target=prompt_dialog, daemon=True).start()
+
         t_start = time.time()
-        while time.time() - t_start < 60.0:
+        while time.time() - t_start < 45.0:
             if dec_file.exists():
                 try:
                     d = json.loads(dec_file.read_text(encoding="utf-8"))
@@ -286,11 +307,18 @@ def restore_internet_wifi():
             subprocess.run([str(ble_bin), "restore-wifi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             return
         prev_file = STATE_DIR / "previous_wifi_ssid.txt"
-        # 1. Remove ephemeral P2P network from preferred list so macOS never reconnects to it
-        subprocess.run(
-            ["/usr/sbin/networksetup", "-removepreferredwirelessnetwork", "en0", "DIRECT-S23-AirDrop"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
-        )
+        # 1. Remove ephemeral P2P networks from preferred list so macOS never reconnects to them
+        try:
+            pref_out = subprocess.check_output(["/usr/sbin/networksetup", "-listpreferredwirelessnetworks", "en0"], text=True, stderr=subprocess.DEVNULL)
+            for line in pref_out.splitlines():
+                s = line.strip()
+                if s.startswith("DIRECT-"):
+                    subprocess.run(["/usr/sbin/networksetup", "-removepreferredwirelessnetwork", "en0", s], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        except Exception:
+            subprocess.run(
+                ["/usr/sbin/networksetup", "-removepreferredwirelessnetwork", "en0", "DIRECT-S23-AirDrop"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+            )
         # 2. Cycle Wi-Fi power cleanly so macOS airportd automatically associates to the
         # top preferred network (e.g. Jakhar wifi) using System Keychain with zero errors
         subprocess.run(
@@ -728,7 +756,7 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
 FORWARD_LOCK = threading.Lock()
 RECENT_UPLOADS = {}
 
-def forward_to_s23_worker(tmp_dir: Path, saved_files):
+def forward_to_peer_worker(tmp_dir: Path, saved_files):
     with FORWARD_LOCK:
         try:
             if saved_files:
@@ -740,14 +768,14 @@ def send_resp(conn, status: int, reason: str, body: bytes = b""):
     hdr = f"HTTP/1.1 {status} {reason}\r\nContent-Length: {len(body)}\r\n\r\n".encode("ascii")
     conn.sendall(hdr + body)
 
-def handle_client(conn, addr, is_s23_proxy: bool = False):
+def handle_client(conn, addr, is_p2p_proxy: bool = False):
     last_sender = "Android Peer"
     last_label = "Incoming File"
     last_total = 0
     last_count = 1
     peer_ip = str(addr[0]).replace("::ffff:", "")
     rx_lock = STATE_DIR / "rx_in_progress.lock"
-    if not is_s23_proxy and peer_ip.startswith("192.168.49."):
+    if not is_p2p_proxy and peer_ip.startswith("192.168.49."):
         try:
             rx_lock.write_text(f"{os.getpid()}\t{peer_ip}\t{time.time()}")
         except Exception:
@@ -779,24 +807,24 @@ def handle_client(conn, addr, is_s23_proxy: bool = False):
                 expected_total=exp_tot,
                 file_count=last_count,
             )
-            role = "Peer-Proxy" if is_s23_proxy else "Mac-RX"
+            role = "Finder-Proxy" if is_p2p_proxy else "P2P-Receiver"
             if not is_upload:
                 print(f"[{role}] {method} {path} from {addr} ({len(body)} B)")
             peer_ip = addr[0].replace("::ffff:", "")
-            if not is_s23_proxy:
+            if not is_p2p_proxy:
                 try:
                     if not peer_ip.startswith("127.") and not peer_ip.startswith("::1") and not peer_ip.startswith("fe80:"):
-                        (STATE_DIR / "last_s23_ip").write_text(peer_ip)
+                        (STATE_DIR / "last_peer_ip").write_text(peer_ip)
                 except Exception:
                     pass
 
             active_peer_name = (get_active_peers(12.0)[0].get("name") if get_active_peers(12.0) else "Android Peer")
             if method == "POST" and path == "/Discover":
-                if not is_s23_proxy and peer_ip.startswith("192.168.49."):
+                if not is_p2p_proxy and peer_ip.startswith("192.168.49."):
                     record_active_peer(f"p2p-{peer_ip}", active_peer_name, "5GHz Wi-Fi Direct P2P", f"{peer_ip}:8771", -48, 0)
                 resp = plistlib.dumps({
-                    "ReceiverComputerName": active_peer_name if is_s23_proxy else current_mac_name(),
-                    "ReceiverModelName": "iPhone16,2" if is_s23_proxy else "MacBookPro18,2",
+                    "ReceiverComputerName": active_peer_name if is_p2p_proxy else current_mac_name(),
+                    "ReceiverModelName": "iPhone16,2" if is_p2p_proxy else "MacBookPro18,2",
                     "ReceiverMediaCapabilities": MEDIA_CAP,
                     "IsAirDropable": True,
                 }, fmt=plistlib.FMT_BINARY)
@@ -811,16 +839,16 @@ def handle_client(conn, addr, is_s23_proxy: bool = False):
                 items = info.get("Items") or []
                 files = info.get("Files") or []
                 last_sender = str(info.get("SenderComputerName") or active_peer_name)
-                if not is_s23_proxy and peer_ip.startswith("192.168.49."):
+                if not is_p2p_proxy and peer_ip.startswith("192.168.49."):
                     record_active_peer(f"p2p-{peer_ip}", last_sender, "5GHz Wi-Fi Direct P2P", f"{peer_ip}:8771", -48, 0)
                 fnames = [str(fd.get("FileName") or "file") for fd in files if isinstance(fd, dict)]
                 last_label = fnames[0] if fnames else (str(items[0]) if items else "Incoming File")
                 last_count = max(1, len(fnames))
                 last_total = sum(int(fd.get("FileSize") or 0) for fd in files if isinstance(fd, dict))
 
-                if not is_s23_proxy:
+                if not is_p2p_proxy:
                     if not wait_for_user_accept(last_sender, fnames if fnames else [str(x) for x in items], last_total):
-                        print(f"[Mac-RX] Declined transfer from {last_sender}")
+                        print(f"[P2P-Receiver] Declined transfer from {last_sender}")
                         send_resp(conn, 403, "Forbidden", b"")
                         break
                     for it in items:
@@ -828,28 +856,28 @@ def handle_client(conn, addr, is_s23_proxy: bool = False):
                             append_history("URL", it, len(it), "received", last_sender)
                             subprocess.Popen(["open", it])
                 resp = plistlib.dumps({
-                    "ReceiverComputerName": active_peer_name if is_s23_proxy else current_mac_name(),
-                    "ReceiverModelName": "iPhone16,2" if is_s23_proxy else "MacBookPro18,2",
+                    "ReceiverComputerName": active_peer_name if is_p2p_proxy else current_mac_name(),
+                    "ReceiverModelName": "iPhone16,2" if is_p2p_proxy else "MacBookPro18,2",
                     "ReceiverMediaCapabilities": MEDIA_CAP,
                     "IsAirDropable": True,
                 }, fmt=plistlib.FMT_BINARY)
                 send_resp(conn, 200, "OK", resp)
             elif method == "POST" and path == "/Upload":
-                if is_s23_proxy:
-                    tmp_dir = Path(tempfile.mkdtemp(prefix="s23_finder_airdrop_"))
+                if is_p2p_proxy:
+                    tmp_dir = Path(tempfile.mkdtemp(prefix="airdrop_finder_proxy_"))
                     saved, rx_len = stream_upload_to_dir(f, headers, tmp_dir, track_progress=False, file_label=last_label, expected_total=exp_tot, file_count=last_count)
                     print(f"[{role}] {method} {path} from {addr} ({rx_len} B)")
                     sig = tuple((p.name, p.stat().st_size) for p in saved)
                     now = time.time()
                     send_resp(conn, 200, "OK", b"")
                     if sig and (now - RECENT_UPLOADS.get(sig, 0.0)) < 60.0:
-                        print(f"[Peer-Proxy] Skipping duplicate retry for {[p.name for p in saved]}")
+                        print(f"[Finder-Proxy] Skipping duplicate retry for {[p.name for p in saved]}")
                         shutil.rmtree(tmp_dir, ignore_errors=True)
                     else:
                         if sig:
                             RECENT_UPLOADS[sig] = now
-                        print(f"[Peer-Proxy] Forwarding {len(saved)} file(s) from Finder AirDrop to {active_peer_name}: {[p.name for p in saved]}")
-                        threading.Thread(target=forward_to_s23_worker, args=(tmp_dir, saved), daemon=True).start()
+                        print(f"[Finder-Proxy] Forwarding {len(saved)} file(s) from Finder AirDrop to {active_peer_name}: {[p.name for p in saved]}")
+                        threading.Thread(target=forward_to_peer_worker, args=(tmp_dir, saved), daemon=True).start()
                     break
                 else:
                     saved, rx_len = stream_upload_to_dir(f, headers, DOWNLOADS, track_progress=True, file_label=last_label, expected_total=exp_tot, file_count=last_count)
@@ -894,13 +922,13 @@ def handle_client(conn, addr, is_s23_proxy: bool = False):
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(CERT_FILE, KEY_FILE)
 
-def serve_port(bind_port: int, is_s23_proxy: bool):
+def serve_port(bind_port: int, is_p2p_proxy: bool):
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
     sock.bind(("::", bind_port))
     sock.listen(16)
-    label = "Native Finder AirDrop Proxy" if is_s23_proxy else f"MacBook Pro Receiver ('{current_mac_name()}')"
+    label = "Finder AirDrop Proxy" if is_p2p_proxy else f"5GHz Wi-Fi Direct P2P Receiver ('{current_mac_name()}')"
     print(f"[+] {label} listening on *:{bind_port}")
     while True:
         raw, addr = sock.accept()
@@ -911,7 +939,7 @@ def serve_port(bind_port: int, is_s23_proxy: bool):
             except Exception:
                 pass
             tls = ctx.wrap_socket(raw, server_side=True)
-            threading.Thread(target=handle_client, args=(tls, addr, is_s23_proxy), daemon=True).start()
+            threading.Thread(target=handle_client, args=(tls, addr, is_p2p_proxy), daemon=True).start()
         except Exception:
             raw.close()
 
@@ -946,7 +974,7 @@ def watch_awdl_mdns():
                 if proc and proc.poll() is None:
                     proc.terminate()
                 proc = subprocess.Popen(
-                    ["dns-sd", "-i", "awdl0", "-P", "380d472980b9", "_airdrop._tcp", "local.", "8774", "s23airdrop.local.", new_ip, "flags=136"],
+                    ["dns-sd", "-i", "awdl0", "-P", "380d472980b9", "_airdrop._tcp", "local.", "8774", "airdropp2p.local.", new_ip, "flags=136"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
                 pid_file.write_text(str(proc.pid))
@@ -961,7 +989,7 @@ threading.Thread(target=serve_port, args=(PROXY_PORT, True), daemon=True).start(
 serve_port(PORT, False)
 PYEOF
   echo $! >"$PID_FILE"
-  echo "[+] MacBook Pro AirDrop LAN receiver (port $PORT) + Native Finder AirDrop Galaxy S23 proxy (8774->8773) running."
+  echo "[+] 5GHz Wi-Fi Direct P2P Receiver ($PORT) + Native Finder AirDrop Proxy (8774->8773) running."
 }
 
 MODE="${1:-status}"
@@ -970,7 +998,7 @@ case "$MODE" in
   on)
     start_daemons
     ;;
-  restart-lan)
+  restart-receiver|restart|restart-lan)
     SKIP_BLE_RESTART=1 start_daemons
     ;;
   off)
@@ -978,25 +1006,26 @@ case "$MODE" in
     defaults delete com.apple.NetworkBrowser BrowseAllInterfaces 2>/dev/null || true
     defaults delete com.apple.Sharing BrowseAllInterfaces 2>/dev/null || true
     defaults delete com.apple.Sharing DisableAWDL 2>/dev/null || true
-    echo "[+] Stopped AirDrop LAN bridge and restored defaults."
+    echo "[+] Stopped AirDrop P2P daemons and restored defaults."
     ;;
   status)
-    echo "=== MacBook Pro AirDrop (Wi-Fi + Direct Bluetooth LE L2CAP + Native Finder AirDrop) Status ==="
+    echo "=== AirDrop P2P (5GHz Wi-Fi Direct + BLE L2CAP + Native Finder AirDrop) Status ==="
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-      echo "Wi-Fi HTTPS Receiver: RUNNING (PID $(cat "$PID_FILE"), port $PORT -> ~/Downloads, P2P proxy $PROXY_PORT)"
+      echo "5GHz P2P Receiver:    RUNNING (PID $(cat "$PID_FILE"), port $PORT -> ~/Downloads, Proxy $PROXY_PORT)"
     else
-      echo "Wi-Fi HTTPS Receiver: STOPPED"
-    fi
-    if [[ -f "$MDNS_PID_FILE" ]] && kill -0 "$(cat "$MDNS_PID_FILE")" 2>/dev/null; then
-      echo "mDNS _airdrop._tcp:   ADVERTISING ($MAC_SERVICE_ID._airdrop._tcp.local.:$PORT)"
-    else
-      echo "mDNS _airdrop._tcp:   STOPPED"
+      echo "5GHz P2P Receiver:    STOPPED"
     fi
     if [[ -f "$AWDL_MDNS_PID_FILE" ]] && kill -0 "$(cat "$AWDL_MDNS_PID_FILE")" 2>/dev/null; then
-      echo "Finder AirDrop Proxy: ADVERTISING on awdl0 (380d472980b9._airdrop._tcp.local.:8774 -> Galaxy S23)"
+      echo "Finder AirDrop Proxy: ADVERTISING on awdl0 (380d472980b9._airdrop._tcp.local.:8774 -> Android Peer)"
     else
       echo "Finder AirDrop Proxy: STOPPED"
     fi
+    if [[ -f "$BLE_PID_FILE" ]] && kill -0 "$(cat "$BLE_PID_FILE")" 2>/dev/null; then
+      echo "Direct BLE L2CAP RX:  RUNNING (PID $(cat "$BLE_PID_FILE") -> ~/Downloads + AWDL 8774 Bridge)"
+    else
+      echo "Direct BLE L2CAP RX:  STOPPED"
+    fi
+    ;;
     if [[ -f "$BLE_PID_FILE" ]] && kill -0 "$(cat "$BLE_PID_FILE")" 2>/dev/null; then
       echo "Direct BLE L2CAP RX:  RUNNING (PID $(cat "$BLE_PID_FILE") -> ~/Downloads + AWDL 8774 Bridge)"
     else
@@ -1012,7 +1041,7 @@ case "$MODE" in
         end if
       end tell' 2>/dev/null || true)"
       if [[ -z "$SELECTED" || ! -f "$SELECTED" ]]; then
-        SELECTED="$(osascript -e 'POSIX path of (choose file with prompt "Select a file to AirDrop to Galaxy S23:")' 2>/dev/null || true)"
+        SELECTED="$(osascript -e 'POSIX path of (choose file with prompt "Select a file to AirDrop to Android device:")' 2>/dev/null || true)"
       fi
       if [[ -z "$SELECTED" ]]; then
         exit 0
@@ -1024,7 +1053,7 @@ case "$MODE" in
 import json, os, plistlib, re, socket, ssl, struct, subprocess, sys, time, zlib
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("S23_AIRDROP_STATE_DIR", Path.home() / ".mac-airdrop-v2"))
+STATE_DIR = Path(os.environ.get("AIRDROP_P2P_STATE_DIR", os.environ.get("S23_AIRDROP_STATE_DIR", Path.home() / ".airdrop-p2p")))
 
 def write_progress(active: bool, direction: str = "", file_name: str = "", done_bytes: int = 0, total_bytes: int = 0, speed_bps: int = 0, eta_sec: int = 0, pct: int = 0, file_count: int = 1):
     pf = STATE_DIR / "transfer_progress.json"
@@ -1086,7 +1115,7 @@ for f in files:
 total_bytes = sum(f.stat().st_size for f in files)
 joined_p2p = False
 
-def discover_s23():
+def discover_android():
     global joined_p2p
     try:
         with socket.create_connection(("192.168.49.1", 8771), timeout=0.25):
@@ -1100,9 +1129,9 @@ try:
         host, _, port_s = peer_override.partition(":")
         port = int(port_s) if port_s else 8771
     else:
-        host, port = discover_s23()
+        host, port = discover_android()
 
-    print(f"[+] Connecting to Galaxy S23 over 5GHz Wi-Fi at {host}:{port}...")
+    print(f"[+] Connecting to Android peer over 5GHz Wi-Fi at {host}:{port}...")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -1143,7 +1172,7 @@ try:
             disc = plistlib.dumps({"DeviceSupportFlags": 111611}, fmt=plistlib.FMT_BINARY)
             s.sendall(f"POST /Discover HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {len(disc)}\r\nConnection: keep-alive\r\n\r\n".encode() + disc)
             st, body = read_http_response(f)
-            peer_name = plistlib.loads(body).get("ReceiverComputerName", "Galaxy S23") if body else "Galaxy S23"
+            peer_name = plistlib.loads(body).get("ReceiverComputerName", "Android Device") if body else "Android Device"
             print(f"[+] Discovered receiver: {peer_name} ({st})")
 
             sender_name = "MacBook Pro"
@@ -1256,7 +1285,7 @@ PYEOF
       fi
       echo "[*] Wi-Fi unreachable — switching to Direct Bluetooth LE L2CAP..."
       "$BLE_BIN" send "$@"
-      osascript -e "display notification \"Sent to Galaxy S23 over Direct Bluetooth\" with title \"AirDrop Complete\"" 2>/dev/null || true
+      osascript -e "display notification \"Sent to Android device over Direct Bluetooth\" with title \"AirDrop Complete\"" 2>/dev/null || true
     fi
     ;;
   ui)
@@ -1267,7 +1296,7 @@ PYEOF
     fi
     nohup "$BLE_BIN" >"$BLE_LOG_FILE" 2>&1 < /dev/null &
     echo $! >"$BLE_PID_FILE"
-    echo "[+] Opened S23 AirDrop macOS UI window (PID $!)."
+    echo "[+] Opened AirDrop P2P macOS UI window (PID $!)."
     ;;
   *)
     echo "Usage: $0 {on|off|status|ui|send [files_or_urls...]}"

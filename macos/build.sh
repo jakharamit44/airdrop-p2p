@@ -3,8 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || echo "2.0.0")"
 
-echo "[+] Building AirDrop P2P macOS daemon..."
+echo "[+] Building AirDrop P2P macOS daemon (v${VERSION})..."
 mkdir -p "$HOME/.airdrop-p2p"
 xcrun swiftc -O "$SCRIPT_DIR/mac-ble-airdrop.swift" -o "$HOME/.airdrop-p2p/airdrop-p2p-daemon"
 
@@ -18,7 +19,7 @@ cp -f "$SCRIPT_DIR/mac-airdrop-p2p.sh" "$APP_RES/mac-airdrop-p2p.sh"
 cp -f "$SCRIPT_DIR/claude_processor.py" "$APP_RES/claude_processor.py"
 chmod +x "$APP_RES/mac-airdrop-p2p.sh" "$APP_RES/claude_processor.py"
 
-cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
+cat > "$APP_DIR/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -36,7 +37,9 @@ cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>2.0</string>
+  <string>${VERSION}</string>
+  <key>CFBundleVersion</key>
+  <string>${VERSION}</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
@@ -48,3 +51,4 @@ cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
 PLIST
 
 echo "[+] AirDrop P2P.app bundle created at: $APP_DIR"
+

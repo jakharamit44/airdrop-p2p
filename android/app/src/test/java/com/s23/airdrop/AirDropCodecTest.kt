@@ -12,9 +12,9 @@ import java.nio.file.Files
 class AirDropCodecTest {
     @Test
     fun roundTripBplistAndDvzipCpio() {
-        val sampleBytes = "hello-s23-airdrop".toByteArray()
+        val sampleBytes = "hello-airdrop-p2p".toByteArray()
         val payload = mapOf(
-            "SenderComputerName" to "Galaxy S23",
+            "SenderComputerName" to "Android Phone",
             "SenderModelName" to "SM-S911B",
             "BundleID" to "com.apple.finder",
             "ConvertMediaFormats" to false,
@@ -35,7 +35,7 @@ class AirDropCodecTest {
         assertTrue(String(encoded, 0, 8, Charsets.US_ASCII) == "bplist00")
 
         val decoded = AirDropCodec.decodeBplistDict(encoded)
-        assertEquals("Galaxy S23", decoded["SenderComputerName"])
+        assertEquals("Android Phone", decoded["SenderComputerName"])
         assertEquals("SM-S911B", decoded["SenderModelName"])
         assertEquals(false, decoded["ConvertMediaFormats"])
         assertEquals(true, decoded["VerifiableIdentity"])

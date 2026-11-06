@@ -6,6 +6,19 @@
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS%2013%2B%20%28Apple%20Silicon%20%26%20Intel%29-blue.svg)](https://apple.com/macos)
 [![Protocol: AirDrop 1.0](https://img.shields.io/badge/Protocol-Apple%20AirDrop%201.0%20%2B%20WP2P-orange.svg)](docs/ARCHITECTURE.md)
 [![AI Engine: Claude 3.5](https://img.shields.io/badge/AI-Claude%203.5%20Sonnet%20%2F%20Haiku-purple.svg)](https://anthropic.com)
+[![Release: v2.0.0](https://img.shields.io/badge/Release-v2.0.0-blueviolet.svg)](https://github.com/jakharamit44/airdrop-p2p/releases/latest)
+
+---
+
+## Downloads
+
+Get pre-compiled release artifacts from [Releases](https://github.com/jakharamit44/airdrop-p2p/releases/latest):
+
+| Platform | Asset | Description |
+| :--- | :--- | :--- |
+| **Android** | [`AirDrop-P2P-v2.0.0.apk`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.0.0.apk) | Universal APK for Android (Samsung, Pixel, OnePlus, Xiaomi) |
+| **macOS** | [`AirDrop-P2P-v2.0.0.dmg`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.0.0.dmg) | Drag-and-drop installer for macOS 13+ (Ventura, Sonoma, Sequoia) |
+| **Checksums** | [`SHA256SUMS.txt`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/SHA256SUMS.txt) | Cryptographic SHA-256 verification hashes |
 
 ---
 
@@ -177,3 +190,4 @@ python3 macos/claude_processor.py --test
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+

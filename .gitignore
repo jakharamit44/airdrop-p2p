@@ -43,6 +43,7 @@ AirDrop P2P.app/
 *.app/
 *.dmg
 *.apk
+release/
 macos/*.o
 macos/*.dSYM
 
@@ -53,3 +54,4 @@ __pycache__/
 .pytest_cache/
 .venv/
 env/
+

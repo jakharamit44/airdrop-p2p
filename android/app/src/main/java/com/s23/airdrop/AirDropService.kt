@@ -61,7 +61,7 @@ class AirDropService : Service() {
 
         val statusNotif = NotificationCompat.Builder(this, CHANNEL_STATUS)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("S23 AirDrop v2 Active")
+            .setContentTitle("AirDrop P2P Active")
             .setContentText("Encrypted BLE L2CAP + 5GHz Wi-Fi Direct P2P")
             .setContentIntent(openAppIntent)
             .setOngoing(true)

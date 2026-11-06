@@ -61,16 +61,22 @@ func resolveRepoRoot() -> URL {
 
 let REPO_ROOT = resolveRepoRoot()
 let STATE_DIR: URL = {
-    if let env = ProcessInfo.processInfo.environment["S23_AIRDROP_STATE_DIR"], !env.isEmpty {
+    if let env = ProcessInfo.processInfo.environment["AIRDROP_P2P_STATE_DIR"] ?? ProcessInfo.processInfo.environment["S23_AIRDROP_STATE_DIR"], !env.isEmpty {
         let u = URL(fileURLWithPath: env)
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
         return u
     }
-    let u = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".mac-airdrop-v2")
+    let u = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p")
     try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
     return u
 }()
-let SCRIPT_PATH = REPO_ROOT.appendingPathComponent("mac-airdrop-lan.sh").path
+let SCRIPT_PATH: String = {
+    let p1 = REPO_ROOT.appendingPathComponent("macos/mac-airdrop-p2p.sh").path
+    if FileManager.default.fileExists(atPath: p1) { return p1 }
+    let p2 = REPO_ROOT.appendingPathComponent("mac-airdrop-p2p.sh").path
+    if FileManager.default.fileExists(atPath: p2) { return p2 }
+    return p1
+}()
 
 func currentMacLanIp() -> String {
     var ifaddr: UnsafeMutablePointer<ifaddrs>?
@@ -157,7 +163,7 @@ func writeProgressJson(
     ]
     if let data = try? JSONSerialization.data(withJSONObject: dict, options: []) {
         try? data.write(to: tmp)
-        try? FileManager.default.replaceItemAt(pf, withItemAt: tmp)
+        _ = try? FileManager.default.replaceItemAt(pf, withItemAt: tmp)
     }
 }
 
@@ -413,13 +419,27 @@ func topPreferredWifiNetwork() -> String {
     return ""
 }
 
-func restoreMacInternetWifi(ssid: String = "DIRECT-S23-AirDrop") {
-    // 1. ALWAYS unconditionally remove ephemeral P2P network from preferred list so macOS never stays stuck or reconnects to it
-    let rmProc = Process()
-    rmProc.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
-    rmProc.arguments = ["-removepreferredwirelessnetwork", "en0", ssid]
-    try? rmProc.run()
-    rmProc.waitUntilExit()
+func restoreMacInternetWifi(ssid: String = "DIRECT-") {
+    // 1. ALWAYS unconditionally remove any ephemeral P2P network from preferred list so macOS never stays stuck or reconnects to it
+    let listProc = Process()
+    let listPipe = Pipe()
+    listProc.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+    listProc.arguments = ["-listpreferredwirelessnetworks", "en0"]
+    listProc.standardOutput = listPipe
+    try? listProc.run()
+    listProc.waitUntilExit()
+    let prefNetworks = (String(data: listPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
+        .components(separatedBy: "\n")
+    for net in prefNetworks {
+        let trimmed = net.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("DIRECT-") {
+            let rmProc = Process()
+            rmProc.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+            rmProc.arguments = ["-removepreferredwirelessnetwork", "en0", trimmed]
+            try? rmProc.run()
+            rmProc.waitUntilExit()
+        }
+    }
 
     // 2. Check if en0 is still on P2P (192.168.49.)
     let ifc = Process()
@@ -431,15 +451,15 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-S23-AirDrop") {
     let outStr = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     ifc.waitUntilExit()
     if !outStr.contains("inet 192.168.49.") {
-        if outStr.contains("inet 192.168.") {
-            print("[BLE-Daemon] en0 already on Home Wi-Fi LAN (\(currentMacLanIp())). P2P removed from preferred list.")
+        if outStr.contains("inet 192.168.") || outStr.contains("inet 10.") || outStr.contains("inet 172.") {
+            print("[BLE-Daemon] en0 connected to normal Wi-Fi. P2P removed from preferred list.")
             fflush(stdout)
             try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
             return
         }
     }
 
-    print("[BLE-Daemon] Restoring Mac Internet Wi-Fi (disconnecting \(ssid))...")
+    print("[BLE-Daemon] Restoring Mac Internet Wi-Fi (disconnecting P2P)...")
     fflush(stdout)
 
     // 3. Disassociate en0 using CoreWLAN to cleanly detach from P2P
@@ -1050,8 +1070,8 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         let peerName: String = {
             if let ex = existingFull, ex.count > (advertisedName?.count ?? 0) { return ex }
             if let n = advertisedName, !n.isEmpty { return n }
-            if let ln = fallbackLocalName, !ln.isEmpty, !ln.hasPrefix("S23AD-") { return ln }
-            if let pn = peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines), !pn.isEmpty, !pn.hasPrefix("S23AD-") {
+            if let ln = fallbackLocalName, !ln.isEmpty, !ln.hasPrefix("S23AD-"), !ln.hasPrefix("AD-") { return ln }
+            if let pn = peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines), !pn.isEmpty, !pn.hasPrefix("S23AD-"), !pn.hasPrefix("AD-") {
                 return pn
             }
             return "Android Peer (\(peripheral.identifier.uuidString.prefix(4)))"
@@ -1166,8 +1186,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
                 }
             }
 
-            let macLanIp = currentMacLanIp()
-            let pingPayload = Data("\(macName)\t\(myPsm)\t\(currentRssi)\t\(macLanIp)".utf8)
+            let pingPayload = Data("\(macName)\t\(myPsm)\t\(currentRssi)\n".utf8)
             var frame = Data("PING".utf8)
             var mLen = UInt32(pingPayload.count).bigEndian
             var aLen = UInt32(0).bigEndian
@@ -1192,7 +1211,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
                 return String(data: lineBytes, encoding: .utf8)
             }
 
-            guard var replyLine = readLine() else {
+            guard let replyLine = readLine() else {
                 DispatchQueue.main.async { self?.discoveredS23Psm = 0 }
                 return
             }
@@ -1200,12 +1219,6 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
             if replyLine.hasPrefix("PONG\t") {
                 let parts = replyLine.dropFirst(5).split(separator: "\t").map(String.init)
                 let remoteName = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if parts.count >= 3 {
-                    let remoteLan = parts[2].trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !remoteLan.isEmpty && !remoteLan.hasPrefix("192.168.49.") {
-                        try? remoteLan.write(to: STATE_DIR.appendingPathComponent("last_s23_lan_ip"), atomically: true, encoding: .utf8)
-                    }
-                }
                 if !remoteName.isEmpty {
                     recordActivePeerOnDisk(
                         id: targetPeerId,
@@ -1313,7 +1326,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
     }
 
     func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
-        print("[BLE-Daemon] Advertising S23AD-\(publishedPsm) (error=\(String(describing: error)))")
+        print("[BLE-Daemon] Advertising AD-\(publishedPsm) (error=\(String(describing: error)))")
         fflush(stdout)
     }
 
@@ -1351,12 +1364,6 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
                 let peerName = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Android Peer"
                 let peerPsm = parts.count >= 2 ? (Int(parts[1]) ?? 0) : 0
                 let peerRssi = parts.count >= 3 ? (Int(parts[2]) ?? -55) : -55
-                if parts.count >= 4 {
-                    let peerLan = parts[3].trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !peerLan.isEmpty && !peerLan.hasPrefix("192.168.49.") {
-                        try? peerLan.write(to: STATE_DIR.appendingPathComponent("last_s23_lan_ip"), atomically: true, encoding: .utf8)
-                    }
-                }
                 let existingPeer = loadActivePeersFromDisk(maxAge: 30.0).first
                 let bestId = existingPeer?.id ?? ch.peer.identifier.uuidString
                 let bestAddr = existingPeer?.address ?? ch.peer.identifier.uuidString
@@ -1371,8 +1378,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
                 )
                 let macName = loadMacSettings().deviceName
                 let myPsm = self?.publishedPsm ?? 192
-                let macLanIp = currentMacLanIp()
-                _ = writeAll(out, data: Data("PONG\t\(macName)\t\(myPsm)\t\(macLanIp)\n".utf8))
+                _ = writeAll(out, data: Data("PONG\t\(macName)\t\(myPsm)\n".utf8))
                 return
             }
 
@@ -1593,33 +1599,8 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
             inp.open()
             out.open()
 
-            // Pure P2P High-Speed: Probe direct LAN if Android is on same Wi-Fi network first (zero network drops)
+            // 5GHz Wi-Fi Direct P2P Negotiation for large files
             if self.totalRawBytes >= 65_536 && !self.files.isEmpty {
-                if let lastIp = try? String(contentsOf: STATE_DIR.appendingPathComponent("last_s23_lan_ip"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-                   !lastIp.isEmpty && !lastIp.hasPrefix("192.168.49.") {
-                    let probe = Process()
-                    probe.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
-                    probe.arguments = ["-z", "-G", "1", lastIp, "8771"]
-                    try? probe.run()
-                    probe.waitUntilExit()
-                    if probe.terminationStatus == 0 {
-                        print("[BLE-Send] Android reachable directly over Home LAN at \(lastIp):8771 — streaming at LAN speed...")
-                        fflush(stdout)
-                        let txProc = Process()
-                        txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
-                        txProc.arguments = ["send", "--peer", "\(lastIp):8771"] + self.files.map { $0.path } + self.urls
-                        try? txProc.run()
-                        txProc.waitUntilExit()
-                        inp.close()
-                        out.close()
-                        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-                        if txProc.terminationStatus == 0 {
-                            print("[BLE-Send] Delivered via high-speed Home LAN!")
-                            exit(0)
-                        }
-                    }
-                }
-
                 print("[BLE-Send] Negotiating 5GHz Wi-Fi Direct P2P over BLE L2CAP...")
                 fflush(stdout)
                 if writeAll(out, data: Data("WP2P".utf8)) {
@@ -1726,18 +1707,19 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
             out.close()
             try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
             if ok && ackStr == "OK" {
+                let peerLabel = loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Android Device"
                 for f in self.files {
                     let sz = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? Int64) ?? 0
-                    appendReceivedLog(kind: "FILE", value: f.path, sizeBytes: sz, direction: "sent", peerName: "Galaxy S23")
+                    appendReceivedLog(kind: "FILE", value: f.path, sizeBytes: sz, direction: "sent", peerName: peerLabel)
                 }
                 for u in self.urls {
-                    appendReceivedLog(kind: "URL", value: u, sizeBytes: Int64(u.utf8.count), direction: "sent", peerName: "Galaxy S23")
+                    appendReceivedLog(kind: "URL", value: u, sizeBytes: Int64(u.utf8.count), direction: "sent", peerName: peerLabel)
                 }
                 let sound = Process()
                 sound.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
                 sound.arguments = ["/System/Library/Sounds/Glass.aiff"]
                 try? sound.run()
-                print("[BLE-Send] Delivered to Galaxy S23 via Direct Bluetooth LE L2CAP!")
+                print("[BLE-Send] Delivered to \(peerLabel) via Direct Bluetooth LE L2CAP!")
                 exit(0)
             } else {
                 print("[BLE-Send] Transfer incomplete (ok=\(ok), ack=\(String(describing: ackData)))")
@@ -2002,7 +1984,7 @@ final class MacAirDropViewModel: ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: "/bin/bash")
-                p.arguments = ["-c", "\"\(SCRIPT_PATH)\" restart-lan"]
+                p.arguments = ["-c", "\"\(SCRIPT_PATH)\" restart-receiver"]
                 try? p.run()
                 p.waitUntilExit()
                 DispatchQueue.main.async {
@@ -2033,7 +2015,7 @@ final class MacAirDropViewModel: ObservableObject {
             if turnOn {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: "/bin/bash")
-                p.arguments = ["-c", "\"\(SCRIPT_PATH)\" restart-lan"]
+                p.arguments = ["-c", "\"\(SCRIPT_PATH)\" restart-receiver"]
                 try? p.run()
                 p.waitUntilExit()
             } else {
@@ -2885,7 +2867,7 @@ struct MacAirDropMainView: View {
                     Text("No Transfers Yet")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundColor(.white)
-                    Text("Files sent or received between MacBook Pro and Galaxy S23 appear here with exact sizes and Finder shortcuts.")
+                    Text("Files sent or received between MacBook Pro and Android devices appear here with exact sizes and Finder shortcuts.")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -2973,13 +2955,13 @@ struct MacAirDropMainView: View {
                 Text("RECEIVING MODE")
                     .font(.system(size: 10, weight: .heavy))
                     .foregroundColor(MacCyanBright)
-                Text("Choose how incoming files from Galaxy S23 are handled on this Mac")
+                Text("Choose how incoming files from Android devices are handled on this Mac")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
 
                 macReceiveOptionCard(
                     title: "Direct Get (Instant Auto-Download)",
-                    subtitle: "Incoming files from Galaxy S23 save directly to ~/Downloads without any confirmation popup.",
+                    subtitle: "Incoming files from Android devices save directly to ~/Downloads without any confirmation popup.",
                     badge: "FASTEST",
                     selected: vm.autoAccept,
                     accent: MacEmerald
@@ -3636,7 +3618,7 @@ if args.count >= 2 && args[1] == "restore-wifi" {
     if let icns = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
        let iconImg = NSImage(contentsOf: icns) {
         app.applicationIconImage = iconImg
-    } else if let iconImg = NSImage(contentsOfFile: REPO_ROOT.appendingPathComponent("S23 AirDrop.app/Contents/Resources/AppIcon.icns").path) {
+    } else if let iconImg = NSImage(contentsOfFile: REPO_ROOT.appendingPathComponent("AirDrop P2P.app/Contents/Resources/AppIcon.icns").path) {
         app.applicationIconImage = iconImg
     }
     let daemon = BleAirDropDaemon()

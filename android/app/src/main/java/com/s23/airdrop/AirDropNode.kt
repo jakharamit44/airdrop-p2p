@@ -498,7 +498,7 @@ class AirDropNode(private val context: Context) {
     }
 
     fun log(msg: String) {
-        android.util.Log.i("S23AirDrop", msg)
+        android.util.Log.i("AirDropP2P", msg)
         val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(Date())
         _logs.update { (it + "[$time] $msg").takeLast(80) }
     }
