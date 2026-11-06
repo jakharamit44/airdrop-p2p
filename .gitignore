@@ -1,0 +1,55 @@
+# OS metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Security & Secrets (NEVER COMMIT)
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+claude_key.txt
+claude_config.json
+
+# Local runtime state & logs
+.mac-airdrop-v2/
+.airdrop-p2p/
+.gravitas/
+*.pid
+*.log
+*.lock
+*.flag
+last_s23_ip
+last_peer_ip
+active_peers.json
+transfer_progress.json
+pending_ask.json
+
+# Android build artifacts
+.gradle/
+build/
+android/build/
+android/app/build/
+android/.gradle/
+android/local.properties
+android/.idea/
+android/*.iml
+android/app/*.iml
+
+# macOS binaries & packages
+AirDrop P2P.app/
+*.app/
+*.dmg
+*.apk
+macos/*.o
+macos/*.dSYM
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+env/

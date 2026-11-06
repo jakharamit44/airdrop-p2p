@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer Radar Arc (AirDrop / Quick Share style) -->
+    <path
+        android:pathData="M30.5,67.5 A27,27 0 1,1 77.5,67.5"
+        android:strokeWidth="3.6"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="27"
+                android:startY="27"
+                android:endX="81"
+                android:endY="72"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF38BDF8" />
+                <item android:offset="0.5" android:color="#FF0EA5E9" />
+                <item android:offset="1.0" android:color="#FF6366F1" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Middle Radar Arc -->
+    <path
+        android:pathData="M36.8,63.2 A19.5,19.5 0 1,1 71.2,63.2"
+        android:strokeWidth="3.8"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:strokeColor="#FF38BDF8" />
+
+    <!-- Inner Radar Arc -->
+    <path
+        android:pathData="M43.2,58.8 A12,12 0 1,1 64.8,58.8"
+        android:strokeWidth="4.0"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:strokeColor="#FF7DD3FC" />
+
+    <!-- Center Quick Share / AirDrop Beacon & Upward Cone -->
+    <path
+        android:pathData="M54,48 L63.5,73.5 C64.2,75.3 62.9,77.2 61,77.2 L47,77.2 C45.1,77.2 43.8,75.3 44.5,73.5 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54"
+                android:startY="48"
+                android:endX="54"
+                android:endY="77.2"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FFFFFFFF" />
+                <item android:offset="1.0" android:color="#FF38BDF8" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Core Glowing Orb -->
+    <path
+        android:pathData="M54,52m-5.2,0a5.2,5.2 0,1 1,10.4 0a5.2,5.2 0,1 1,-10.4 0"
+        android:fillColor="#FFFFFFFF" />
+
+    <!-- Orbiting Satellite Peer Node (5GHz Direct indicator) -->
+    <path
+        android:pathData="M73.5,37.5m-3.6,0a3.6,3.6 0,1 1,7.2 0a3.6,3.6 0,1 1,-7.2 0"
+        android:fillColor="#FF10B981" />
+</vector>
