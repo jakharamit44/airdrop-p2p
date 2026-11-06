@@ -63,3 +63,4 @@ Please include:
 * Description of the vulnerability and attack vector.
 * Reproducible proof-of-concept steps or payload.
 * Affected platform and version (Android version, macOS version, hardware architecture).
+
