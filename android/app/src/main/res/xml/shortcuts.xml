@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
-    <share-target android:targetClass="com.s23.airdrop.MainActivity">
+    <share-target android:targetClass="com.airdrop.p2p.MainActivity">
         <data android:mimeType="*/*" />
-        <category android:name="com.s23.airdrop.v2.DIRECT_SHARE" />
+        <category android:name="com.airdrop.p2p.DIRECT_SHARE" />
     </share-target>
 </shortcuts>

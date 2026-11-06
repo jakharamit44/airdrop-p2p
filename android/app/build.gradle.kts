@@ -10,10 +10,10 @@ android {
         if (vf.exists()) vf.readText().trim() else "2.0.0"
     }
 
-    namespace = "com.s23.airdrop"
+    namespace = "com.airdrop.p2p"
     compileSdk = 36
     defaultConfig {
-        applicationId = "com.s23.airdrop.v2"
+        applicationId = "com.airdrop.p2p"
         minSdk = 31
         targetSdk = 36
         versionCode = 200

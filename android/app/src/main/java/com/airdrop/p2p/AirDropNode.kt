@@ -1,4 +1,4 @@
-package com.s23.airdrop
+package com.airdrop.p2p
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -187,7 +187,6 @@ class AirDropNode(private val context: Context) {
     private val prefs = context.getSharedPreferences("airdrop_p2p", Context.MODE_PRIVATE)
     val authTag = ByteArray(3).also { random.nextBytes(it) }
     val serviceId: String = prefs.getString("service_id", null)
-        ?: context.getSharedPreferences("s23_airdrop", Context.MODE_PRIVATE).getString("service_id", null)
         ?: ByteArray(6)
             .also { random.nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
@@ -195,8 +194,7 @@ class AirDropNode(private val context: Context) {
 
     private val initialDeviceName: String = run {
         val saved = prefs.getString("device_name", null)
-            ?: context.getSharedPreferences("s23_airdrop", Context.MODE_PRIVATE).getString("device_name", null)
-        if (saved.isNullOrBlank() || saved.contains("S23", ignoreCase = true)) {
+        if (saved.isNullOrBlank()) {
             defaultHardwareName()
         } else {
             saved
@@ -491,7 +489,7 @@ class AirDropNode(private val context: Context) {
                 .setShortLabel(remoteName)
                 .setLongLabel("AirDrop to $remoteName")
                 .setIcon(Icon.createWithResource(context, R.mipmap.ic_launcher_round))
-                .setCategories(setOf("com.s23.airdrop.v2.DIRECT_SHARE"))
+                .setCategories(setOf("com.airdrop.p2p.DIRECT_SHARE"))
                 .setIntent(shareIntent)
                 .setLongLived(true)
                 .setRank(0)

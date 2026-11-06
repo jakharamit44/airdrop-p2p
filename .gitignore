@@ -22,8 +22,6 @@ claude_config.json
 *.lock
 *.flag
 last_peer_ip
-last_s23_ip
-last_peer_ip
 active_peers.json
 transfer_progress.json
 pending_ask.json

@@ -1,4 +1,4 @@
-package com.s23.airdrop
+package com.airdrop.p2p
 
 import android.app.NotificationChannel
 import android.app.NotificationManager

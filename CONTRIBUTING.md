@@ -41,7 +41,7 @@ When writing code or designing features for AirDrop P2P, adhere strictly to thes
 
 ```
 ├── android/                        # Android Client Application
-│   ├── app/src/main/java/com/s23/airdrop/
+│   ├── app/src/main/java/com/airdrop/p2p/
 │   │   ├── MainActivity.kt        # Jetpack Compose UI & State
 │   │   ├── AirDropNode.kt         # Core Wi-Fi Direct & BLE Engine
 │   │   ├── AirDropCodec.kt        # bplist00 & DVZip CPIO Streaming Codec

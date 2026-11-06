@@ -34,7 +34,7 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.S23AirDrop"
+        android:theme="@style/Theme.AirDropP2P"
         android:windowSoftInputMode="adjustResize">
 
         <service

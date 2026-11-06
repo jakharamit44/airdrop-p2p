@@ -1,4 +1,4 @@
-package com.s23.airdrop.theme
+package com.airdrop.p2p.theme
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
@@ -28,7 +28,7 @@ private val LightColorScheme = lightColorScheme(
 )
 
 @Composable
-fun S23AirDropTheme(
+fun AirDropTheme(
     darkTheme: Boolean = true,
     content: @Composable () -> Unit
 ) {

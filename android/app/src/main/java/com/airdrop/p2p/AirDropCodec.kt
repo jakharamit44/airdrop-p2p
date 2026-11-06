@@ -1,4 +1,4 @@
-package com.s23.airdrop
+package com.airdrop.p2p
 
 import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream

@@ -1,4 +1,4 @@
-package com.s23.airdrop
+package com.airdrop.p2p
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals

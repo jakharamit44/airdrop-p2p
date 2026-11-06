@@ -1,4 +1,4 @@
-package com.s23.airdrop
+package com.airdrop.p2p
 
 import android.Manifest
 import android.app.DownloadManager
@@ -99,7 +99,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
-import com.s23.airdrop.theme.S23AirDropTheme
+import com.airdrop.p2p.theme.AirDropTheme
 import ds.tokens.DsDarkColors
 import ds.tokens.DsMotion
 import ds.tokens.DsSpace
@@ -169,7 +169,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val colors = DsDarkColors
             CompositionLocalProvider(LocalDsColors provides colors) {
-                S23AirDropTheme {
+                AirDropTheme {
                     Surface(
                         modifier = Modifier.fillMaxSize(),
                         color = colors.surfaceBase

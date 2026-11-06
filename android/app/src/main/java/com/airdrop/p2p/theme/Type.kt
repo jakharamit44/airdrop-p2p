@@ -1,4 +1,4 @@
-package com.s23.airdrop.theme
+package com.airdrop.p2p.theme
 
 import androidx.compose.material3.Typography
 import ds.tokens.DsType
