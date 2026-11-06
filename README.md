@@ -1,5 +1,7 @@
 # AirDrop P2P
 
+[![Views](https://komarev.com/ghpvc/?username=jakharamit44&repo=airdrop-p2p&color=blue)](https://github.com/jakharamit44/airdrop-p2p)
+
 > High-speed, pure peer-to-peer file transfer between any Android device and macOS, powered by 5GHz Wi-Fi Direct and BLE L2CAP, with automated file intelligence via the Anthropic Claude API.
 
 [![Platform: Android](https://img.shields.io/badge/Platform-Android%2012%2B-green.svg)](https://developer.android.com)
