@@ -147,12 +147,12 @@ class AirDropNode(private val context: Context) {
     companion object {
         const val AIRDROP_PORT = 8771
         const val PEER_TTL_MS = 12_000L
-        private const val KEYSTORE_ALIAS = "s23_airdrop_ec_v2"
+        private const val KEYSTORE_ALIAS = "airdrop_p2p_ec_v2"
         val MAC_BLE_SERVICE_UUID: UUID = UUID.fromString("52300001-a12d-4000-8000-523a12d00001")
         val MAC_BLE_PSM_CHAR_UUID: UUID = UUID.fromString("52300002-a12d-4000-8000-523a12d00002")
-        val S23_BLE_SERVICE_UUID: UUID = UUID.fromString("52300003-a12d-4000-8000-523a12d00003")
-        val S23_BLE_PSM_CHAR_UUID: UUID = UUID.fromString("52300004-a12d-4000-8000-523a12d00004")
-        val S23_BLE_DATA_UUID: ParcelUuid = ParcelUuid.fromString("0000cafe-0000-1000-8000-00805f9b34fb")
+        val P2P_BLE_SERVICE_UUID: UUID = UUID.fromString("52300003-a12d-4000-8000-523a12d00003")
+        val P2P_BLE_PSM_CHAR_UUID: UUID = UUID.fromString("52300004-a12d-4000-8000-523a12d00004")
+        val P2P_BLE_DATA_UUID: ParcelUuid = ParcelUuid.fromString("0000cafe-0000-1000-8000-00805f9b34fb")
         val MAC_BLE_DATA_UUID: ParcelUuid = ParcelUuid.fromString("0000caff-0000-1000-8000-00805f9b34fb")
 
         fun defaultHardwareName(): String {
@@ -184,16 +184,19 @@ class AirDropNode(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val random = SecureRandom()
     private val transferMutex = Mutex()
-    private val prefs = context.getSharedPreferences("s23_airdrop", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences("airdrop_p2p", Context.MODE_PRIVATE)
     val authTag = ByteArray(3).also { random.nextBytes(it) }
-    val serviceId: String = prefs.getString("service_id", null) ?: ByteArray(6)
-        .also { random.nextBytes(it) }
-        .joinToString("") { "%02x".format(it) }
-        .also { prefs.edit().putString("service_id", it).apply() }
+    val serviceId: String = prefs.getString("service_id", null)
+        ?: context.getSharedPreferences("s23_airdrop", Context.MODE_PRIVATE).getString("service_id", null)
+        ?: ByteArray(6)
+            .also { random.nextBytes(it) }
+            .joinToString("") { "%02x".format(it) }
+            .also { prefs.edit().putString("service_id", it).apply() }
 
     private val initialDeviceName: String = run {
         val saved = prefs.getString("device_name", null)
-        if (saved.isNullOrBlank() || saved == "Galaxy S23 Ultra" || saved == "Galaxy S23") {
+            ?: context.getSharedPreferences("s23_airdrop", Context.MODE_PRIVATE).getString("device_name", null)
+        if (saved.isNullOrBlank() || saved.contains("S23", ignoreCase = true)) {
             defaultHardwareName()
         } else {
             saved
@@ -275,7 +278,7 @@ class AirDropNode(private val context: Context) {
         runCatching {
             val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
             if (transferWakeLock == null) {
-                transferWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "s23airdrop:transfer_node_lock")?.apply {
+                transferWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "airdropp2p:transfer_node_lock")?.apply {
                     setReferenceCounted(false)
                 }
             }
@@ -289,7 +292,7 @@ class AirDropNode(private val context: Context) {
                     @Suppress("DEPRECATION")
                     WifiManager.WIFI_MODE_FULL_HIGH_PERF
                 }
-                transferWifiLock = wm?.createWifiLock(lockMode, "s23airdrop:transfer_wifi_lock")?.apply {
+                transferWifiLock = wm?.createWifiLock(lockMode, "airdropp2p:transfer_wifi_lock")?.apply {
                     setReferenceCounted(false)
                 }
             }
@@ -614,10 +617,10 @@ class AirDropNode(private val context: Context) {
                     log("BLE L2CAP server warning: ${t.message}")
                 }
             }
-            val s23Psm = localBlePsm
+            val peerPsm = localBlePsm
 
             // 2. Open GATT Server so Mac can read PSM + Full Device Name if needed
-            if (s23Psm > 0 && gattServer == null) {
+            if (peerPsm > 0 && gattServer == null) {
                 try {
                     val gattCb = object : BluetoothGattServerCallback() {
                         override fun onCharacteristicReadRequest(
@@ -643,11 +646,11 @@ class AirDropNode(private val context: Context) {
                     }
                     val gs = bm.openGattServer(context, gattCb)
                     val svc = BluetoothGattService(
-                        S23_BLE_SERVICE_UUID,
+                        P2P_BLE_SERVICE_UUID,
                         BluetoothGattService.SERVICE_TYPE_PRIMARY
                     )
                     val ch = BluetoothGattCharacteristic(
-                        S23_BLE_PSM_CHAR_UUID,
+                        P2P_BLE_PSM_CHAR_UUID,
                         BluetoothGattCharacteristic.PROPERTY_READ,
                         BluetoothGattCharacteristic.PERMISSION_READ
                     )
@@ -690,8 +693,8 @@ class AirDropNode(private val context: Context) {
             bleAdvertiser = advertiser
             stopBleAdvertisingOnly()
 
-            val s23Psm = localBlePsm
-            if (s23Psm <= 0) return
+            val peerPsm = localBlePsm
+            if (peerPsm <= 0) return
 
             val settings = AdvertiseSettings.Builder()
                 .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
@@ -702,26 +705,26 @@ class AirDropNode(private val context: Context) {
             // Primary AdvertiseData: Flags (3B) + 0xCAFE ServiceData (4B header + 2B PSM + up to 16B UTF-8 name = 22B) = 25B <= 31B!
             val cleanNameBytes = deviceName.take(16).toByteArray(StandardCharsets.UTF_8)
             val svcPayload = ByteArray(2 + cleanNameBytes.size).also { buf ->
-                buf[0] = (s23Psm and 0xFF).toByte()
-                buf[1] = ((s23Psm ushr 8) and 0xFF).toByte()
+                buf[0] = (peerPsm and 0xFF).toByte()
+                buf[1] = ((peerPsm ushr 8) and 0xFF).toByte()
                 System.arraycopy(cleanNameBytes, 0, buf, 2, cleanNameBytes.size)
             }
             val data = AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
-                .addServiceData(S23_BLE_DATA_UUID, svcPayload)
+                .addServiceData(P2P_BLE_DATA_UUID, svcPayload)
                 .build()
 
-            // Scan Response: 128-bit S23_BLE_SERVICE_UUID (18B <= 31B!)
+            // Scan Response: 128-bit P2P_BLE_SERVICE_UUID (18B <= 31B!)
             val scanResponse = AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
-                .addServiceUuid(ParcelUuid(S23_BLE_SERVICE_UUID))
+                .addServiceUuid(ParcelUuid(P2P_BLE_SERVICE_UUID))
                 .build()
 
             val cb = object : AdvertiseCallback() {
                 override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                    log("BLE P2P active (psm=$s23Psm, name=$deviceName)")
+                    log("BLE P2P active (psm=$peerPsm, name=$deviceName)")
                     val p2pSsid = wifiDirectCreds.substringBefore('\t').ifEmpty { "5GHz P2P Ready" }
-                    _p2pStatus.value = "BLE PSM $s23Psm • $p2pSsid"
+                    _p2pStatus.value = "BLE PSM $peerPsm • $p2pSsid"
                     refreshLocalAddresses()
                 }
 
@@ -796,9 +799,9 @@ class AirDropNode(private val context: Context) {
         var hasMacService = uuids.any { it.uuid == MAC_BLE_SERVICE_UUID }
         var parsedPsm = 0
         var remoteDisplayName = "MacBook Pro"
-        if (name.startsWith("AD-") || name.startsWith("S23AD-")) {
+        if (name.startsWith("AD-")) {
             hasMacService = true
-            val rest = if (name.startsWith("AD-")) name.removePrefix("AD-").trim() else name.removePrefix("S23AD-").trim()
+            val rest = name.removePrefix("AD-").trim()
             val psmPart = rest.substringBefore('-')
             parsedPsm = psmPart.toIntOrNull() ?: 0
             val customLabel = rest.substringAfter('-', "").trim()
@@ -984,7 +987,7 @@ class AirDropNode(private val context: Context) {
     // End-to-End AES-256-GCM authenticated encryption for BLE L2CAP frames
     private val bleAesKey: SecretKeySpec by lazy {
         val digest = MessageDigest.getInstance("SHA-256")
-            .digest("S23AirDrop-E2EE-AES256GCM-v2".toByteArray(StandardCharsets.UTF_8))
+            .digest("AirDropP2P-E2EE-AES256GCM-v2".toByteArray(StandardCharsets.UTF_8))
         SecretKeySpec(digest, "AES")
     }
 

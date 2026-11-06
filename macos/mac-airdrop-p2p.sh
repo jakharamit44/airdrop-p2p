@@ -6,7 +6,7 @@ set -euo pipefail
 # /Discover, /Ask, /Upload with bplist00 and DVZip 070707/070701 CPIO streaming archives).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_DIR="${AIRDROP_P2P_STATE_DIR:-${S23_AIRDROP_STATE_DIR:-$HOME/.airdrop-p2p}}"
+STATE_DIR="${AIRDROP_P2P_STATE_DIR:-$HOME/.airdrop-p2p}"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 
@@ -77,7 +77,7 @@ stop_http_daemons() {
     fi
   done
   pkill -f "airdropp2p.local." 2>/dev/null || true
-  pkill -f "s23airdrop.local." 2>/dev/null || true
+  pkill -f "airdrop-p2p.local." 2>/dev/null || true
   pkill -f "$MAC_SERVICE_ID" 2>/dev/null || true
 }
 
@@ -330,10 +330,7 @@ def restore_internet_wifi():
                 elif not target_ssid and not s.startswith("Preferred networks"):
                     target_ssid = s
         except Exception:
-            subprocess.run(
-                ["/usr/sbin/networksetup", "-removepreferredwirelessnetwork", "en0", "DIRECT-S23-AirDrop"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
-            )
+            pass
         # 2. Fast reassociation directly to preferred home network without cycling card power
         if target_ssid and not target_ssid.startswith("DIRECT-"):
             subprocess.run(["/usr/sbin/networksetup", "-setairportnetwork", "en0", target_ssid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -1087,7 +1084,7 @@ case "$MODE" in
 import json, os, plistlib, re, socket, ssl, struct, subprocess, sys, time, zlib
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("AIRDROP_P2P_STATE_DIR", os.environ.get("S23_AIRDROP_STATE_DIR", Path.home() / ".airdrop-p2p")))
+STATE_DIR = Path(os.environ.get("AIRDROP_P2P_STATE_DIR", Path.home() / ".airdrop-p2p"))
 
 def write_progress(active: bool, direction: str = "", file_name: str = "", done_bytes: int = 0, total_bytes: int = 0, speed_bps: int = 0, eta_sec: int = 0, pct: int = 0, file_count: int = 1):
     pf = STATE_DIR / "transfer_progress.json"

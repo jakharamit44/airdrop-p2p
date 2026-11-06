@@ -151,7 +151,7 @@ adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 AirDrop P2P features an automated AI processing pipeline that analyzes files as soon as they are received on macOS:
 
 * **Images (`.png`, `.jpg`, `.webp`)**: Runs Claude 3.5 Sonnet Vision to extract text (OCR), transcribe tables and receipts, or describe UI screens.
-* **Documents & Code (`.pdf`, `.txt`, `.md`, `.py`, `.kt`, `.json`)**: Generates an executive summary, key takeaways, and semantic topic tags.
+* **Documents & Code (`.pdf`, `.txt`, `.md`, `.py`, `.kt`, `.json`)**: Generates a structured summary, key takeaways, and semantic topic tags.
 * **Output**: Writes a companion `<filename>.claude.md` alongside the downloaded file in `~/Downloads`.
 
 ### Configuring Claude AI

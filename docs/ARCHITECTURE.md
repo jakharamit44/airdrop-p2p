@@ -69,5 +69,5 @@ AirDrop P2P enables high-speed, off-grid file transfers between Android and macO
 ### E. Claude AI Ingestion Pipeline
 * **Intelligent File Processing**: Configurable Anthropic Claude API hook (`claude_processor.py`).
 * **Multimodal Vision (Claude 3.5 Sonnet)**: Extracts OCR text, inspects receipts, analyzes UI screenshots, and describes photos.
-* **Document Synthesis**: Generates executive summaries, key takeaways, and action items for text, PDF, and code files.
+* **Document Synthesis**: Generates structured summaries, key takeaways, and action items for text, PDF, and code files.
 

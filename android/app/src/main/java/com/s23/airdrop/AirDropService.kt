@@ -79,7 +79,7 @@ class AirDropService : Service() {
 
         runCatching {
             val pm = getSystemService(PowerManager::class.java)
-            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "s23airdrop:transfer_lock")?.apply {
+            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "airdropp2p:transfer_lock")?.apply {
                 setReferenceCounted(false)
             }
         }

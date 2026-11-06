@@ -8,7 +8,7 @@ import CryptoKit
 import CoreWLAN
 import Darwin
 
-private let BLE_E2EE_KEY = SymmetricKey(data: SHA256.hash(data: Data("S23AirDrop-E2EE-AES256GCM-v2".utf8)))
+private let BLE_E2EE_KEY = SymmetricKey(data: SHA256.hash(data: Data("AirDropP2P-E2EE-AES256GCM-v2".utf8)))
 
 func encryptBlePayload(_ plain: Data) -> Data {
     if let sealed = try? AES.GCM.seal(plain, using: BLE_E2EE_KEY),
@@ -29,9 +29,9 @@ func decryptBlePayload(_ packet: Data) -> Data? {
 
 let MAC_SERVICE_UUID = CBUUID(string: "52300001-A12D-4000-8000-523A12D00001")
 let MAC_PSM_CHAR_UUID = CBUUID(string: "52300002-A12D-4000-8000-523A12D00002")
-let S23_SERVICE_UUID = CBUUID(string: "52300003-A12D-4000-8000-523A12D00003")
-let S23_PSM_CHAR_UUID = CBUUID(string: "52300004-A12D-4000-8000-523A12D00004")
-let S23_DATA_UUID = CBUUID(string: "CAFE")
+let P2P_SERVICE_UUID = CBUUID(string: "52300003-A12D-4000-8000-523A12D00003")
+let P2P_PSM_CHAR_UUID = CBUUID(string: "52300004-A12D-4000-8000-523A12D00004")
+let P2P_DATA_UUID = CBUUID(string: "CAFE")
 let SHOW_UI_NOTIFICATION = Notification.Name("com.airdrop.p2p.showWindow")
 
 func resolveRepoRoot() -> URL {
@@ -55,13 +55,16 @@ func resolveRepoRoot() -> URL {
         }
         url.deleteLastPathComponent()
     }
-    let v2Candidate = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Coding/s23-airdrop-v2")
-    return v2Candidate
+    let pwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    if FileManager.default.fileExists(atPath: pwd.appendingPathComponent("macos/mac-airdrop-p2p.sh").path) {
+        return pwd
+    }
+    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p")
 }
 
 let REPO_ROOT = resolveRepoRoot()
 let STATE_DIR: URL = {
-    if let env = ProcessInfo.processInfo.environment["AIRDROP_P2P_STATE_DIR"] ?? ProcessInfo.processInfo.environment["S23_AIRDROP_STATE_DIR"], !env.isEmpty {
+    if let env = ProcessInfo.processInfo.environment["AIRDROP_P2P_STATE_DIR"], !env.isEmpty {
         let u = URL(fileURLWithPath: env)
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
         return u
@@ -886,7 +889,7 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
 
     var savedFiles: [String] = []
     if !archiveData.isEmpty {
-        let tmpBin = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("s23_ble_\(UUID().uuidString).dvzip")
+        let tmpBin = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("airdrop_ble_\(UUID().uuidString).dvzip")
         try? archiveData.write(to: tmpBin)
         let py = Process()
         py.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -1006,12 +1009,12 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
     var cm: CBCentralManager!
     var activeChannels: [CBL2CAPChannel] = []
     var publishedPsm: CBL2CAPPSM = 0
-    var discoveredS23Peripheral: CBPeripheral?
-    var discoveredS23Psm: CBL2CAPPSM = 0
-    var discoveredS23Rssi: Int = -50
+    var discoveredPeerPeripheral: CBPeripheral?
+    var discoveredPeerPsm: CBL2CAPPSM = 0
+    var discoveredPeerRssi: Int = -50
     var lastDiscoveredTime: TimeInterval = 0
     var pingChannel: CBL2CAPChannel?
-    var isPingingS23: Bool = false
+    var isPingingPeer: Bool = false
     var pingStartedAt: TimeInterval = 0
     var lastPingTime: TimeInterval = 0
     var pingTimer: Timer?
@@ -1021,16 +1024,15 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         Self.shared = self
         try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("active_peers.json"))
         try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("p2p_status"))
-        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("s23_p2p_status"))
         pm = CBPeripheralManager(delegate: self, queue: nil)
         cm = CBCentralManager(delegate: self, queue: nil)
         pingTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
-            self?.pingS23IfNeeded()
+            self?.pingPeerIfNeeded()
         }
     }
 
     func rescanNow() {
-        isPingingS23 = false
+        isPingingPeer = false
         lastPingTime = 0
         if cm.state == .poweredOn {
             cm.stopScan()
@@ -1045,7 +1047,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
                 CBAdvertisementDataServiceUUIDsKey: [MAC_SERVICE_UUID, psmUuid]
             ])
         }
-        pingS23IfNeeded()
+        pingPeerIfNeeded()
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -1069,12 +1071,12 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
 
         let uuids = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
         let svcData = (advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]) ?? [:]
-        guard uuids.contains(S23_SERVICE_UUID) || svcData[S23_DATA_UUID] != nil else { return }
+        guard uuids.contains(P2P_SERVICE_UUID) || svcData[P2P_DATA_UUID] != nil else { return }
 
-        var s23Psm: UInt16 = 0
+        var peerPsm: UInt16 = 0
         var advertisedName: String? = nil
-        if let d = svcData[S23_DATA_UUID], d.count >= 2 {
-            s23Psm = UInt16(d[d.startIndex]) | (UInt16(d[d.startIndex + 1]) << 8)
+        if let d = svcData[P2P_DATA_UUID], d.count >= 2 {
+            peerPsm = UInt16(d[d.startIndex]) | (UInt16(d[d.startIndex + 1]) << 8)
             if d.count > 2 {
                 let nameSlice = d.subdata(in: (d.startIndex + 2)..<d.endIndex)
                 if let decoded = String(data: nameSlice, encoding: .utf8)?
@@ -1084,8 +1086,8 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
                 }
             }
         }
-        guard s23Psm > 0 else { return }
-        if discoveredS23Psm > 0 && s23Psm < discoveredS23Psm && s23Psm != 128 { return }
+        guard peerPsm > 0 else { return }
+        if discoveredPeerPsm > 0 && peerPsm < discoveredPeerPsm && peerPsm != 128 { return }
         let fallbackLocalName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         // Preserve full name if already learned via L2CAP or previous named packet
@@ -1094,8 +1096,8 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         let peerName: String = {
             if let ex = existingFull, ex.count > (advertisedName?.count ?? 0) { return ex }
             if let n = advertisedName, !n.isEmpty { return n }
-            if let ln = fallbackLocalName, !ln.isEmpty, !ln.hasPrefix("S23AD-"), !ln.hasPrefix("AD-") { return ln }
-            if let pn = peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines), !pn.isEmpty, !pn.hasPrefix("S23AD-"), !pn.hasPrefix("AD-") {
+            if let ln = fallbackLocalName, !ln.isEmpty, !ln.hasPrefix("AD-") { return ln }
+            if let pn = peripheral.name?.trimmingCharacters(in: .whitespacesAndNewlines), !pn.isEmpty, !pn.hasPrefix("AD-") {
                 return pn
             }
             return "Android Peer (\(peripheral.identifier.uuidString.prefix(4)))"
@@ -1104,28 +1106,28 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         recordActivePeerOnDisk(
             id: peripheral.identifier.uuidString,
             name: peerName,
-            transport: "5GHz P2P • BLE PSM \(s23Psm)",
+            transport: "5GHz P2P • BLE PSM \(peerPsm)",
             address: peripheral.identifier.uuidString,
-            psm: Int(s23Psm),
+            psm: Int(peerPsm),
             rssi: rssiVal
         )
 
-        discoveredS23Peripheral = peripheral
-        discoveredS23Psm = CBL2CAPPSM(s23Psm)
-        discoveredS23Rssi = rssiVal
+        discoveredPeerPeripheral = peripheral
+        discoveredPeerPsm = CBL2CAPPSM(peerPsm)
+        discoveredPeerRssi = rssiVal
         lastDiscoveredTime = Date().timeIntervalSince1970
-        pingS23IfNeeded()
+        pingPeerIfNeeded()
     }
 
     func cancelActivePing() {
-        isPingingS23 = false
+        isPingingPeer = false
         pingChannel = nil
-        if let p = discoveredS23Peripheral {
+        if let p = discoveredPeerPeripheral {
             cm.cancelPeripheralConnection(p)
         }
     }
 
-    func pingS23IfNeeded() {
+    func pingPeerIfNeeded() {
         let now = Date().timeIntervalSince1970
         let txLock = STATE_DIR.appendingPathComponent("tx_in_progress.lock")
         let rxLock = STATE_DIR.appendingPathComponent("rx_in_progress.lock")
@@ -1134,62 +1136,62 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
            FileManager.default.fileExists(atPath: rxLock.path) ||
            FileManager.default.fileExists(atPath: txProgress.path) ||
            hasActiveTcpReceiverConnection() {
-            if isPingingS23 {
-                isPingingS23 = false
+            if isPingingPeer {
+                isPingingPeer = false
                 pingChannel = nil
             }
             return
         }
-        if isPingingS23 {
+        if isPingingPeer {
             if now - pingStartedAt > 16.0 {
                 cancelActivePing()
             }
             return
         }
         guard cm.state == .poweredOn,
-              let p = discoveredS23Peripheral,
-              discoveredS23Psm > 0,
+              let p = discoveredPeerPeripheral,
+              discoveredPeerPsm > 0,
               now - lastDiscoveredTime <= 10.0,
               now - lastPingTime >= 1.8 else {
             return
         }
-        isPingingS23 = true
+        isPingingPeer = true
         pingStartedAt = now
         lastPingTime = now
         p.delegate = self
         if p.state == .connected {
-            p.openL2CAPChannel(discoveredS23Psm)
+            p.openL2CAPChannel(discoveredPeerPsm)
         } else {
             cm.connect(p, options: nil)
         }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        guard discoveredS23Psm > 0 else {
-            isPingingS23 = false
+        guard discoveredPeerPsm > 0 else {
+            isPingingPeer = false
             return
         }
-        peripheral.openL2CAPChannel(discoveredS23Psm)
+        peripheral.openL2CAPChannel(discoveredPeerPsm)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        isPingingS23 = false
+        isPingingPeer = false
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        isPingingS23 = false
+        isPingingPeer = false
     }
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         guard let ch = channel, error == nil else {
-            discoveredS23Psm = 0
-            isPingingS23 = false
+            discoveredPeerPsm = 0
+            isPingingPeer = false
             return
         }
         pingChannel = ch
         let targetPeerId = peripheral.identifier.uuidString
-        let currentPsm = Int(discoveredS23Psm)
-        let currentRssi = discoveredS23Rssi
+        let currentPsm = Int(discoveredPeerPsm)
+        let currentRssi = discoveredPeerRssi
         let myPsm = Int(publishedPsm > 0 ? publishedPsm : 192)
         let macName = loadMacSettings().deviceName
 
@@ -1203,8 +1205,8 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
                 out.close()
                 DispatchQueue.main.async {
                     self?.pingChannel = nil
-                    self?.isPingingS23 = false
-                    if let s = self, let p = s.discoveredS23Peripheral {
+                    self?.isPingingPeer = false
+                    if let s = self, let p = s.discoveredPeerPeripheral {
                         s.cm.cancelPeripheralConnection(p)
                     }
                 }
@@ -1219,7 +1221,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
             frame.append(pingPayload)
 
             guard writeAll(out, data: frame) else {
-                DispatchQueue.main.async { self?.discoveredS23Psm = 0 }
+                DispatchQueue.main.async { self?.discoveredPeerPsm = 0 }
                 return
             }
 
@@ -1236,7 +1238,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
             }
 
             guard let replyLine = readLine() else {
-                DispatchQueue.main.async { self?.discoveredS23Psm = 0 }
+                DispatchQueue.main.async { self?.discoveredPeerPsm = 0 }
                 return
             }
 
@@ -1471,7 +1473,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
 }
 
 // ============================================================================
-// Sender Mode: Mac -> S23 Direct BLE L2CAP Sender (Central)
+// Sender Mode: Mac -> Android Direct BLE L2CAP Sender (Central)
 // ============================================================================
 final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var cm: CBCentralManager!
@@ -1553,9 +1555,9 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     ) {
         let uuids = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
         let svcData = (advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]) ?? [:]
-        guard uuids.contains(S23_SERVICE_UUID) || svcData[S23_DATA_UUID] != nil else { return }
+        guard uuids.contains(P2P_SERVICE_UUID) || svcData[P2P_DATA_UUID] != nil else { return }
 
-        guard let d = svcData[S23_DATA_UUID], d.count >= 2 else { return }
+        guard let d = svcData[P2P_DATA_UUID], d.count >= 2 else { return }
         let psm = UInt16(d[d.startIndex]) | (UInt16(d[d.startIndex + 1]) << 8)
         guard psm > 0 else { return }
         // Ignore older leaked advertisements if we already know a newer PSM
@@ -1579,20 +1581,20 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
             fflush(stdout)
             peripheral.openL2CAPChannel(targetPsm)
         } else {
-            peripheral.discoverServices([S23_SERVICE_UUID])
+            peripheral.discoverServices([P2P_SERVICE_UUID])
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard let svcs = peripheral.services else { return }
-        for s in svcs where s.uuid == S23_SERVICE_UUID {
-            peripheral.discoverCharacteristics([S23_PSM_CHAR_UUID], for: s)
+        for s in svcs where s.uuid == P2P_SERVICE_UUID {
+            peripheral.discoverCharacteristics([P2P_PSM_CHAR_UUID], for: s)
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard let chars = service.characteristics else { return }
-        for c in chars where c.uuid == S23_PSM_CHAR_UUID {
+        for c in chars where c.uuid == P2P_PSM_CHAR_UUID {
             peripheral.readValue(for: c)
         }
     }
