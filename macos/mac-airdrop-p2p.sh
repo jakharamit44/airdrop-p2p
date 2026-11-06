@@ -308,11 +308,18 @@ def read_line(f):
 
 def restore_internet_wifi():
     try:
-        ble_bin = STATE_DIR / "mac-ble-airdrop"
-        if ble_bin.exists() and os.access(str(ble_bin), os.X_OK):
-            subprocess.run([str(ble_bin), "restore-wifi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            return
+        for b_name in ["airdrop-p2p-daemon", "mac-ble-airdrop"]:
+            ble_bin = STATE_DIR / b_name
+            if ble_bin.exists() and os.access(str(ble_bin), os.X_OK):
+                subprocess.run([str(ble_bin), "restore-wifi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                return
         prev_file = STATE_DIR / "previous_wifi_ssid.txt"
+        target_ssid = ""
+        if prev_file.exists():
+            try:
+                target_ssid = prev_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
         # 1. Remove ephemeral P2P networks from preferred list so macOS never reconnects to them
         try:
             pref_out = subprocess.check_output(["/usr/sbin/networksetup", "-listpreferredwirelessnetworks", "en0"], text=True, stderr=subprocess.DEVNULL)
@@ -320,17 +327,26 @@ def restore_internet_wifi():
                 s = line.strip()
                 if s.startswith("DIRECT-"):
                     subprocess.run(["/usr/sbin/networksetup", "-removepreferredwirelessnetwork", "en0", s], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                elif not target_ssid and not s.startswith("Preferred networks"):
+                    target_ssid = s
         except Exception:
             subprocess.run(
                 ["/usr/sbin/networksetup", "-removepreferredwirelessnetwork", "en0", "DIRECT-S23-AirDrop"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
             )
-        # 2. Cycle Wi-Fi power cleanly so macOS airportd automatically associates to the
-        # top preferred network (e.g. Jakhar wifi) using System Keychain with zero errors
-        subprocess.run(
-            ["/bin/bash", "-c", "/usr/sbin/networksetup -setairportpower en0 off >/dev/null 2>&1; sleep 1.0; /usr/sbin/networksetup -setairportpower en0 on >/dev/null 2>&1"],
-            check=False
-        )
+        # 2. Fast reassociation directly to preferred home network without cycling card power
+        if target_ssid and not target_ssid.startswith("DIRECT-"):
+            subprocess.run(["/usr/sbin/networksetup", "-setairportnetwork", "en0", target_ssid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        else:
+            subprocess.run(
+                ["/usr/sbin/networksetup", "-setairportpower", "en0", "off"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+            )
+            time.sleep(0.3)
+            subprocess.run(
+                ["/usr/sbin/networksetup", "-setairportpower", "en0", "on"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+            )
         if prev_file.exists():
             try:
                 prev_file.unlink(missing_ok=True)

@@ -462,14 +462,28 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     print("[BLE-Daemon] Restoring Mac Internet Wi-Fi (disconnecting P2P)...")
     fflush(stdout)
 
-    // 3. Disassociate en0 using CoreWLAN to cleanly detach from P2P
-    // On macOS Sequoia, disassociating triggers native airportd to auto-join top preferred network immediately!
+    // 3. Resolve target home network to restore
+    let savedSsid = (try? String(contentsOf: PREV_WIFI_FILE, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let targetSsid = (!savedSsid.isEmpty && !savedSsid.hasPrefix("DIRECT-")) ? savedSsid : topPreferredWifiNetwork()
+
+    // 4. Disassociate en0 using CoreWLAN to cleanly detach from P2P
     if let iface = CWWiFiClient.shared().interface(withName: "en0") {
         iface.disassociate()
     }
 
-    // 4. Fallback: If after 2.5s not connected, do a quick airport power cycle
-    DispatchQueue.global().asyncAfter(deadline: .now() + 2.5) {
+    // 5. If target network is known, reassociate immediately without power cycling
+    if !targetSsid.isEmpty {
+        print("[BLE-Daemon] Fast-reassociating en0 to home Wi-Fi '\(targetSsid)'...")
+        fflush(stdout)
+        let joinProc = Process()
+        joinProc.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+        joinProc.arguments = ["-setairportnetwork", "en0", targetSsid]
+        try? joinProc.run()
+        joinProc.waitUntilExit()
+    }
+
+    // 6. Fallback safety verification: only cycle power if en0 is completely wedged on 192.168.49.x
+    DispatchQueue.global().asyncAfter(deadline: .now() + 3.0) {
         let checkPipe = Pipe()
         let checkProc = Process()
         checkProc.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
@@ -478,12 +492,21 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
         try? checkProc.run()
         checkProc.waitUntilExit()
         let checkStr = String(data: checkPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        if !checkStr.contains("inet 192.168.") {
-            let cycle = Process()
-            cycle.executableURL = URL(fileURLWithPath: "/bin/bash")
-            cycle.arguments = ["-c", "/usr/sbin/networksetup -setairportpower en0 off >/dev/null 2>&1; sleep 0.5; /usr/sbin/networksetup -setairportpower en0 on >/dev/null 2>&1"]
-            try? cycle.run()
-            cycle.waitUntilExit()
+        let hasValidIp = checkStr.contains("inet ") && !checkStr.contains("inet 192.168.49.")
+        if !hasValidIp {
+            print("[BLE-Daemon] Network did not reassociate automatically — power cycling radio as fallback...")
+            fflush(stdout)
+            let cycleOff = Process()
+            cycleOff.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+            cycleOff.arguments = ["-setairportpower", "en0", "off"]
+            try? cycleOff.run()
+            cycleOff.waitUntilExit()
+            Thread.sleep(forTimeInterval: 0.3)
+            let cycleOn = Process()
+            cycleOn.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+            cycleOn.arguments = ["-setairportpower", "en0", "on"]
+            try? cycleOn.run()
+            cycleOn.waitUntilExit()
         }
     }
 
@@ -759,11 +782,11 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
             lastActivity = Date()
             idleCount = 0
         } else {
-            // Only count idle if NO activity has been seen for at least 15.0 seconds
-            if Date().timeIntervalSince(lastActivity) > 15.0 {
+            // If all transfer activity and TCP sockets have completed for > 3.0s, restore Wi-Fi promptly
+            if Date().timeIntervalSince(lastActivity) > 3.0 {
                 idleCount += 1
-                if idleCount >= 20 { // 20 * 0.5s = 10.0s sustained dead idle -> 25.0s total silence
-                    print("[BLE-Daemon] Transfer stream ended (idle timeout) — restoring Wi-Fi")
+                if idleCount >= 4 { // 4 * 0.5s = 2.0s -> ~5.0s of dead silence
+                    print("[BLE-Daemon] Transfer stream ended (idle timeout) — restoring Wi-Fi immediately")
                     fflush(stdout)
                     break
                 }
