@@ -997,6 +997,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         super.init()
         Self.shared = self
         try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("active_peers.json"))
+        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("p2p_status"))
         try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("s23_p2p_status"))
         pm = CBPeripheralManager(delegate: self, queue: nil)
         cm = CBCentralManager(delegate: self, queue: nil)
@@ -1776,7 +1777,7 @@ final class MacAirDropViewModel: ObservableObject {
     @Published var macDeviceName: String = Host.current().localizedName ?? "Amit’s MacBook Pro"
     @Published var editingDeviceName: String = ""
     @Published var activePeers: [MacDiscoveredPeer] = []
-    @Published var lastS23Ip: String = "0 Active Devices • Scanning BLE + 5GHz P2P..."
+    @Published var peerStatusSummary: String = "0 Active Devices • Scanning BLE + 5GHz P2P..."
     @Published var transferStatus: String = "5GHz Wi-Fi Direct + BLE L2CAP Ready — No shared router required"
     @Published var isTransferring: Bool = false
     @Published var liveProgress: MacLiveProgress? = nil
@@ -1830,8 +1831,8 @@ final class MacAirDropViewModel: ObservableObject {
         } else {
             statusLine = "0 Active Devices • Scanning BLE + 5GHz Wi-Fi Direct..."
         }
-        if lastS23Ip != statusLine {
-            lastS23Ip = statusLine
+        if peerStatusSummary != statusLine {
+            peerStatusSummary = statusLine
         }
 
         // 1. Poll real-time transfer progress JSON
@@ -1983,8 +1984,8 @@ final class MacAirDropViewModel: ObservableObject {
         if !receiverRunning {
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/bin/bash")
-                p.arguments = ["-c", "\"\(SCRIPT_PATH)\" restart-receiver"]
+                p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                p.arguments = ["restart-receiver"]
                 try? p.run()
                 p.waitUntilExit()
                 DispatchQueue.main.async {
@@ -2014,8 +2015,8 @@ final class MacAirDropViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             if turnOn {
                 let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/bin/bash")
-                p.arguments = ["-c", "\"\(SCRIPT_PATH)\" restart-receiver"]
+                p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                p.arguments = ["restart-receiver"]
                 try? p.run()
                 p.waitUntilExit()
             } else {
@@ -3079,7 +3080,7 @@ struct MacAirDropMainView: View {
                     .controlSize(.small)
                 }
 
-                Text(vm.lastS23Ip)
+                Text(vm.peerStatusSummary)
                     .font(.system(size: 12, weight: .bold).monospacedDigit())
                     .foregroundColor(MacEmerald)
 
@@ -3606,7 +3607,7 @@ if args.count >= 2 && args[1] == "restore-wifi" {
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
-                p.arguments = ["restart-lan"]
+                p.arguments = ["restart-receiver"]
                 try? p.run()
                 p.waitUntilExit()
             }

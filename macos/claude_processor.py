@@ -22,10 +22,17 @@ import urllib.error
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
-FAST_MODEL = "claude-3-5-haiku-20241022"
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-3-5-haiku-20241022")
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
+# Note: In Anthropic's Messages API specification, "2023-06-01" is the canonical protocol version identifier
+# required by the /v1/messages endpoint. Modern 2024-2026 capabilities (caching, PDFs, fast reasoning)
+# are delivered through anthropic-beta headers.
+ANTHROPIC_VERSION = os.environ.get("ANTHROPIC_VERSION", "2023-06-01")
+ANTHROPIC_BETA = os.environ.get("ANTHROPIC_BETA", "prompt-caching-2024-07-31,pdfs-2024-09-25")
+
+MAX_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MB Anthropic vision limit
+MAX_TEXT_CHARS = 120_000            # ~30,000 tokens safe context bound
 
 CONFIG_DIR = Path.home() / ".airdrop-p2p"
 CONFIG_FILE = CONFIG_DIR / "claude_config.json"
@@ -96,15 +103,19 @@ def call_claude_api(
         "messages": messages,
     }
 
+    req_headers = {
+        "x-api-key": key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
+        "user-agent": "AirDrop-P2P-Claude-Bridge/1.0"
+    }
+    if ANTHROPIC_BETA:
+        req_headers["anthropic-beta"] = ANTHROPIC_BETA
+
     req = urllib.request.Request(
         ANTHROPIC_API_URL,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "x-api-key": key,
-            "anthropic-version": ANTHROPIC_VERSION,
-            "content-type": "application/json",
-            "user-agent": "AirDrop-P2P-Claude-Bridge/1.0"
-        },
+        headers=req_headers,
         method="POST"
     )
 
@@ -123,6 +134,13 @@ def call_claude_api(
 
 def analyze_image_file(image_path: Path, api_key: Optional[str] = None) -> str:
     """Perform multimodal vision analysis and OCR on an image file."""
+    file_size = image_path.stat().st_size
+    if file_size > MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"Image file exceeds Anthropic vision limit ({file_size / (1024*1024):.1f} MB > "
+            f"{MAX_IMAGE_BYTES / (1024*1024):.1f} MB)"
+        )
+
     mime_type, _ = mimetypes.guess_type(str(image_path))
     if not mime_type or not mime_type.startswith("image/"):
         ext = image_path.suffix.lower()
@@ -178,9 +196,9 @@ def analyze_text_file(file_path: Path, api_key: Optional[str] = None) -> str:
     except Exception as e:
         raise RuntimeError(f"Could not read text file: {e}")
 
-    # Limit to first ~100k characters for prompt safety
-    truncated = len(content) > 100_000
-    sample = content[:100_000]
+    # Limit to safe token bound for prompt safety
+    truncated = len(content) > MAX_TEXT_CHARS
+    sample = content[:MAX_TEXT_CHARS]
 
     system_prompt = (
         "You are an intelligent file intake assistant running locally on macOS. "
@@ -281,8 +299,16 @@ def main():
             sys.exit(1)
         new_key = sys.argv[2].strip()
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            CONFIG_DIR.chmod(0o700)
+        except Exception:
+            pass
         CONFIG_FILE.write_text(json.dumps({"api_key": new_key, "enabled": True}, indent=2))
-        print(f"[+] Saved API key to {CONFIG_FILE}")
+        try:
+            CONFIG_FILE.chmod(0o600)
+        except Exception:
+            pass
+        print(f"[+] Saved API key securely to {CONFIG_FILE}")
         sys.exit(0)
 
     target_file = Path(cmd)

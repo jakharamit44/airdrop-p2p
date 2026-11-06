@@ -8,6 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${AIRDROP_P2P_STATE_DIR:-${S23_AIRDROP_STATE_DIR:-$HOME/.airdrop-p2p}}"
 mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
 
 PID_FILE="$STATE_DIR/daemon.pid"
 MDNS_PID_FILE="$STATE_DIR/mdns.pid"
@@ -265,8 +266,13 @@ def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int) -
                 return
             try:
                 res = subprocess.check_output([
-                    "osascript", "-e",
-                    f'display dialog "{sender_name} wants to share {summary} with you." with title "AirDrop P2P" buttons {{"Decline", "Accept"}} default button "Accept" giving up after 40'
+                    "osascript",
+                    "-e", "on run argv",
+                    "-e", 'tell application "System Events" to display dialog ((item 1 of argv) & " wants to share " & (item 2 of argv) & " with you.") with title "AirDrop P2P" buttons {"Decline", "Accept"} default button "Accept" giving up after 40',
+                    "-e", "end run",
+                    "--",
+                    str(sender_name)[:80],
+                    str(summary)[:120]
                 ], text=True, stderr=subprocess.DEVNULL).strip()
                 if "button returned:Accept" in res:
                     dec_file.write_text(json.dumps({"id": req_id, "accepted": True}), encoding="utf-8")
@@ -712,6 +718,7 @@ def extract_cpio_stream(stream, dest_dir: Path):
 def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = False, file_label: str = "Incoming File", expected_total: int = 0, file_count: int = 1):
     t0 = time.time()
     last_emit = [0.0]
+    last_term_log = [0.0]
     last_touch = [0.0]
     done = [0]
     cancel_file = STATE_DIR / "cancel_transfer.flag"
@@ -735,6 +742,13 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
                 eta = int(max(0, tot - done[0]) / max(1, spd))
                 pct = min(99, int((done[0] * 100) / tot))
                 write_progress(True, "Receiving", file_label, min(done[0], tot), tot, spd, eta, pct, file_count)
+                if now - last_term_log[0] >= 2.0 or done[0] >= tot:
+                    last_term_log[0] = now
+                    mb_done = done[0] / (1024 * 1024)
+                    mb_tot = tot / (1024 * 1024)
+                    spd_mb = spd / (1024 * 1024)
+                    print(f"[P2P-Receiver] Receiving '{file_label}': {mb_done:.1f} MB / {mb_tot:.1f} MB ({pct}%, {spd_mb:.1f} MB/s, ETA {eta}s)")
+                    sys.stdout.flush()
 
     try:
         is_chunked = "chunked" in headers.get("transfer-encoding", "").lower()
@@ -810,6 +824,10 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
             role = "Finder-Proxy" if is_p2p_proxy else "P2P-Receiver"
             if not is_upload:
                 print(f"[{role}] {method} {path} from {addr} ({len(body)} B)")
+            else:
+                tot_mb = exp_tot / (1024 * 1024)
+                print(f"[{role}] {method} {path} from {addr} (streaming incoming file: '{last_label}', ~{tot_mb:.1f} MB)...")
+            sys.stdout.flush()
             peer_ip = addr[0].replace("::ffff:", "")
             if not is_p2p_proxy:
                 try:

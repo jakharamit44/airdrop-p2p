@@ -143,3 +143,4 @@ print(f"\n=======================================================")
 print(f" Release {TAG} published successfully!")
 print(f" URL: https://github.com/{OWNER}/{REPO}/releases/tag/{TAG}")
 print(f"=======================================================")
+

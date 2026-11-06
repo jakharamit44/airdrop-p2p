@@ -7,6 +7,13 @@
 [![Protocol: AirDrop 1.0](https://img.shields.io/badge/Protocol-Apple%20AirDrop%201.0%20%2B%20WP2P-orange.svg)](docs/ARCHITECTURE.md)
 [![AI Engine: Claude 3.5](https://img.shields.io/badge/AI-Claude%203.5%20Sonnet%20%2F%20Haiku-purple.svg)](https://anthropic.com)
 [![Release: v2.0.0](https://img.shields.io/badge/Release-v2.0.0-blueviolet.svg)](https://github.com/jakharamit44/airdrop-p2p/releases/latest)
+[![Security: Hardened](https://img.shields.io/badge/Security-Audit%20Hardened-success.svg)](SECURITY.md)
+[![Status: Public Beta](https://img.shields.io/badge/Status-Public%20Beta-amber.svg)](SECURITY.md)
+
+> [!WARNING]
+> **Active Public Beta Stage (v2.0.0)**
+> AirDrop P2P is currently in active public beta. The protocol and transport layers are functional and audited, but edge cases across different OEM Wi-Fi chipsets and macOS versions are actively being refined.
+> Please review [SECURITY.md](SECURITY.md) and report any issues or contributions via [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
@@ -167,6 +174,14 @@ To verify connectivity:
 python3 macos/claude_processor.py --test
 ```
 
+#### Protocol Versioning & Advanced Features
+* **Protocol Version (`ANTHROPIC_VERSION`)**: In Anthropic's Messages REST API (`/v1/messages`), `2023-06-01` is the canonical protocol specification version identifier (similar to HTTP/1.1 or TLS 1.3). Future capability flags and features are negotiated via beta headers.
+* **Modern Model Configuration**: Default model is `claude-3-5-sonnet-20241022` with fast fallback to `claude-3-5-haiku-20241022`. Override anytime via:
+  ```bash
+  export ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"
+  export ANTHROPIC_BETA="prompt-caching-2024-07-31,pdfs-2024-09-25"
+  ```
+
 ---
 
 ## Usage
@@ -184,6 +199,13 @@ python3 macos/claude_processor.py --test
 * **Direct Point-to-Point**: Files travel directly over encrypted peer-to-peer Wi-Fi frames without passing through external routers or cloud intermediaries.
 * **End-to-End Encryption**: BLE handshakes and HTTPS transports utilize ephemeral ECDH key pairs (curve P-256) and AES-GCM-256.
 * **Ephemeral Credentials**: Wi-Fi Direct passphrases are generated randomly per session and purged immediately upon connection teardown.
+
+---
+
+## Contributing & Security
+
+* **Contributing**: Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, development guidelines, and pull request procedures.
+* **Security & Vulnerabilities**: Please review [SECURITY.md](SECURITY.md) for our security architecture, public beta boundary advisory, and responsible disclosure process.
 
 ---
 

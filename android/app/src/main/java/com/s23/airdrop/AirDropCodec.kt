@@ -544,6 +544,9 @@ object AirDropCodec {
             if (isRegularFile) {
                 val baseName = safeFileName(rawName)
                 var outFile = File(destDir, baseName)
+                if (!outFile.canonicalPath.startsWith(destDir.canonicalPath)) {
+                    throw SecurityException("CPIO path traversal detected: $rawName")
+                }
                 var suffix = 1
                 while (outFile.exists()) {
                     val dot = baseName.lastIndexOf('.')
