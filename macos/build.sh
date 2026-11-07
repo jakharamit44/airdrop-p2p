@@ -17,6 +17,9 @@ mkdir -p "$APP_MACOS" "$APP_RES"
 cp -f "$HOME/.airdrop-p2p/airdrop-p2p-daemon" "$APP_MACOS/AirDropP2P"
 cp -f "$SCRIPT_DIR/mac-airdrop-p2p.sh" "$APP_RES/mac-airdrop-p2p.sh"
 cp -f "$SCRIPT_DIR/claude_processor.py" "$APP_RES/claude_processor.py"
+if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
+  cp -f "$SCRIPT_DIR/AppIcon.icns" "$APP_RES/AppIcon.icns"
+fi
 chmod +x "$APP_RES/mac-airdrop-p2p.sh" "$APP_RES/claude_processor.py"
 
 cat > "$APP_DIR/Contents/Info.plist" << PLIST

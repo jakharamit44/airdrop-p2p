@@ -36,7 +36,12 @@ cd "$ROOT_DIR"
 # 3. Create macOS DMG Package
 echo "[3/4] Creating macOS DMG installer..."
 DMG_DEST="$RELEASE_DIR/AirDrop-P2P-v${VERSION}.dmg"
-hdiutil create -volname "AirDrop P2P v${VERSION}" -srcfolder "$ROOT_DIR/AirDrop P2P.app" -ov -format UDZO "$DMG_DEST"
+DMG_TMP="$(mktemp -d /tmp/airdrop_dmg_XXXXXX)"
+cp -R "$ROOT_DIR/AirDrop P2P.app" "$DMG_TMP/"
+ln -s /Applications "$DMG_TMP/Applications"
+rm -f "$DMG_DEST"
+hdiutil create -volname "AirDrop P2P v${VERSION}" -srcfolder "$DMG_TMP" -ov -format UDZO "$DMG_DEST"
+rm -rf "$DMG_TMP"
 echo "  -> Created: $DMG_DEST ($(du -h "$DMG_DEST" | cut -f1))"
 
 # 4. Generate SHA256 Checksums
