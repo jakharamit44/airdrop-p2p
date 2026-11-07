@@ -109,4 +109,32 @@ class AirDropCodecTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun bplistDoubleAndFloatSupport() {
+        val payload = mapOf(
+            "DoubleVal" to 42.125,
+            "FloatVal" to 3.5f,
+            "NegativeInt" to -500L
+        )
+        val encoded = AirDropCodec.encodeBplist(payload)
+        val decoded = AirDropCodec.decodeBplistDict(encoded)
+        assertEquals(42.125, (decoded["DoubleVal"] as Double), 0.0001)
+        assertEquals(3.5, (decoded["FloatVal"] as Double), 0.0001)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun odcSizeLimitEnforced() {
+        val out = ByteArrayOutputStream()
+        AirDropCodec.writeDvzipCpio(
+            listOf(
+                AirDropCodec.OutgoingEntry(
+                    name = "giant.bin",
+                    size = 9_000_000_000L,
+                    openStream = { ByteArrayInputStream(ByteArray(0)) }
+                )
+            ),
+            out
+        )
+    }
 }

@@ -11,11 +11,11 @@ import Darwin
 private let BLE_E2EE_KEY = SymmetricKey(data: SHA256.hash(data: Data("AirDropP2P-E2EE-AES256GCM-v2".utf8)))
 
 func encryptBlePayload(_ plain: Data) -> Data {
-    if let sealed = try? AES.GCM.seal(plain, using: BLE_E2EE_KEY),
-       let combined = sealed.combined {
-        return combined // 12-byte nonce + ciphertext + 16-byte GCM tag
+    guard let sealed = try? AES.GCM.seal(plain, using: BLE_E2EE_KEY),
+          let combined = sealed.combined else {
+        fatalError("[BLE-Security] BLE encryption failed - refusing to transmit unencrypted payload")
     }
-    return plain
+    return combined
 }
 
 func decryptBlePayload(_ packet: Data) -> Data? {
@@ -25,6 +25,14 @@ func decryptBlePayload(_ packet: Data) -> Data? {
         return opened
     }
     return nil
+}
+
+func readUInt32BE(_ data: Data, offset: Int) -> Int {
+    let b0 = Int(data[data.startIndex + offset]) << 24
+    let b1 = Int(data[data.startIndex + offset + 1]) << 16
+    let b2 = Int(data[data.startIndex + offset + 2]) << 8
+    let b3 = Int(data[data.startIndex + offset + 3])
+    return b0 | b1 | b2 | b3
 }
 
 let MAC_SERVICE_UUID = CBUUID(string: "52300001-A12D-4000-8000-523A12D00001")
@@ -320,7 +328,7 @@ func saveMacSettings(autoAccept: Bool, visible: Bool, deviceName: String) {
         "deviceName": deviceName
     ]
     if let d = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
-        try? d.write(to: sf)
+        try? d.write(to: sf, options: [.atomic])
     }
 }
 
@@ -341,7 +349,7 @@ func waitForMacUserAccept(senderName: String, fileNames: [String], totalBytes: I
         "timestamp": Date().timeIntervalSince1970
     ]
     if let d = try? JSONSerialization.data(withJSONObject: payload) {
-        try? d.write(to: askFile)
+        try? d.write(to: askFile, options: [.atomic])
     }
     DistributedNotificationCenter.default().postNotificationName(
         SHOW_UI_NOTIFICATION,
@@ -475,9 +483,12 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     if let iface = CWWiFiClient.shared().interface(withName: "en0") {
         iface.disassociate()
     }
+    // Give macOS airportd native auto-join 2.0s to reconnect to preferred network
+    Thread.sleep(forTimeInterval: 2.0)
 
-    // 5. If target network is known, reassociate immediately without power cycling
-    if !targetSsid.isEmpty {
+    // 5. If target network is known and not yet reconnected, reassociate
+    let activeNow = currentWifiSsid()
+    if activeNow.isEmpty && !targetSsid.isEmpty {
         print("[BLE-Daemon] Fast-reassociating en0 to home Wi-Fi '\(targetSsid)'...")
         fflush(stdout)
         let joinProc = Process()
@@ -879,12 +890,14 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                let scheme = parsed.scheme?.lowercased(),
                (scheme == "http" || scheme == "https"),
                parsed.host != nil {
-                print("[BLE-RX] Opening URL from \(sender): \(s)")
+                print("[BLE-RX] Received URL from \(sender): \(s)")
                 appendReceivedLog(kind: "URL", value: s, sizeBytes: Int64(s.utf8.count), direction: "received", peerName: sender)
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                p.arguments = [s]
-                try? p.run()
+                DispatchQueue.main.async {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(s, forType: .string)
+                }
+                safeMacNotification(message: "\(s)\n(Copied to clipboard)", title: "AirDrop link from \(sender)")
             }
         }
     }
@@ -900,6 +913,53 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
             """
             import gzip, io, os, struct, sys, zlib
             from pathlib import Path
+
+            class DvzipReader(io.RawIOBase):
+                def __init__(self, raw):
+                    self.raw = raw
+                    self.buf = bytearray()
+                    self.eof = False
+                    self.cur_stored = False
+                    self.cur_rem = 0
+                    self.decompressor = None
+
+                def readinto(self, b):
+                    while len(self.buf) < len(b) and not self.eof:
+                        if self.cur_rem > 0:
+                            chunk = self.raw.read(min(65536, self.cur_rem))
+                            if not chunk:
+                                self.eof = True
+                                break
+                            self.cur_rem -= len(chunk)
+                            if self.cur_stored:
+                                self.buf.extend(chunk)
+                            else:
+                                try:
+                                    self.buf.extend(self.decompressor.decompress(chunk))
+                                except zlib.error:
+                                    self.decompressor = zlib.decompressobj()
+                                    self.buf.extend(self.decompressor.decompress(chunk))
+                        else:
+                            hdr4 = self.raw.read(4)
+                            if len(hdr4) < 4:
+                                self.eof = True
+                                break
+                            v = struct.unpack(">I", hdr4)[0]
+                            if v == 0:
+                                if self.decompressor:
+                                    self.buf.extend(self.decompressor.flush())
+                                self.eof = True
+                                break
+                            self.cur_stored = bool(v & 0x80000000)
+                            self.cur_rem = v & 0x7FFFFFFF
+                            if not self.cur_stored and self.decompressor is None:
+                                self.decompressor = zlib.decompressobj()
+
+                    take = min(len(b), len(self.buf))
+                    b[:take] = self.buf[:take]
+                    del self.buf[:take]
+                    return take if (take > 0 or not self.eof) else 0
+
             src = Path(sys.argv[1])
             dest = Path(sys.argv[2]).resolve()
             with src.open("rb") as f:
@@ -910,18 +970,7 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                 elif len(prefix) >= 6 and prefix[:6] in (b"070707", b"070701", b"070702"):
                     stream = f
                 else:
-                    out = bytearray()
-                    while True:
-                        hdr4 = f.read(4)
-                        if len(hdr4) < 4:
-                            break
-                        v = struct.unpack(">I", hdr4)[0]
-                        blen = v & 0x7FFFFFFF
-                        chunk = f.read(blen)
-                        if not chunk:
-                            break
-                        out.extend(chunk if (v & 0x80000000) else zlib.decompress(chunk))
-                    stream = io.BytesIO(out)
+                    stream = io.BufferedReader(DvzipReader(f), buffer_size=65536)
 
                 while True:
                     magic = stream.read(6)
@@ -1285,8 +1334,8 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
             if replyLine == "ADRP" || replyLine == "ADRE" {
                 DispatchQueue.main.async { self?.pingStartedAt = Date().timeIntervalSince1970 + 90.0 }
                 guard let lenHdr = readExact(inp, count: 8) else { return }
-                let metaLen = Int(lenHdr.subdata(in: 0..<4).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
-                let archLen = Int(lenHdr.subdata(in: 4..<8).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
+                let metaLen = readUInt32BE(lenHdr, offset: 0)
+                let archLen = readUInt32BE(lenHdr, offset: 4)
                 guard metaLen > 0 && metaLen <= 10_000_000 && archLen >= 0 && archLen <= 100_000_000_000 else { return }
 
                 let isEncrypted = (replyLine == "ADRE")
@@ -1396,8 +1445,8 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
             }
             guard let hdr = readExact(inp, count: 12) else { return }
             let magic = String(data: hdr.subdata(in: 0..<4), encoding: .ascii) ?? ""
-            let metaLen = Int(hdr.subdata(in: 4..<8).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
-            let archLen = Int(hdr.subdata(in: 8..<12).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
+            let metaLen = readUInt32BE(hdr, offset: 4)
+            let archLen = readUInt32BE(hdr, offset: 8)
             guard metaLen > 0 && metaLen <= 10_000_000 && archLen >= 0 && archLen <= 100_000_000_000 else {
                 print("[BLE-Daemon] Rejected out-of-bounds frame: metaLen=\(metaLen), archLen=\(archLen)")
                 return
@@ -1739,12 +1788,35 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                 }
             }
 
+            var payloadFrame = self.frameData
+            if payloadFrame.isEmpty && !self.files.isEmpty {
+                guard let (gzData, fileDicts) = try? buildDvzipCpio(files: self.files) else { exit(1) }
+                let metaDict: [String: Any] = [
+                    "SenderComputerName": loadMacSettings().deviceName,
+                    "SenderModelName": "MacBookPro18,2",
+                    "BundleID": self.urls.isEmpty ? "com.apple.finder" : "com.apple.Safari",
+                    "Items": self.urls as [Any],
+                    "Files": fileDicts
+                ]
+                guard let metaData = try? PropertyListSerialization.data(fromPropertyList: metaDict, format: .binary, options: 0) else { exit(1) }
+                let encMeta = encryptBlePayload(metaData)
+                let encArch = gzData.isEmpty ? Data() : encryptBlePayload(gzData)
+                var frame = Data("ADRE".utf8)
+                var mLen = UInt32(encMeta.count).bigEndian
+                var aLen = UInt32(encArch.count).bigEndian
+                frame.append(Data(bytes: &mLen, count: 4))
+                frame.append(Data(bytes: &aLen, count: 4))
+                frame.append(encMeta)
+                frame.append(encArch)
+                payloadFrame = frame
+            }
+
             let label = self.files.first?.lastPathComponent ?? (self.urls.first ?? "BLE Transfer")
-            print("[BLE-Send] Streaming \(self.frameData.count) bytes over Direct Bluetooth LE L2CAP...")
+            print("[BLE-Send] Streaming \(payloadFrame.count) bytes over Direct Bluetooth LE L2CAP...")
             fflush(stdout)
             let ok = writeAll(
                 out,
-                data: self.frameData,
+                data: payloadFrame,
                 trackProgress: true,
                 fileLabel: label,
                 fileCount: max(1, self.files.count)
@@ -1934,7 +2006,7 @@ final class MacAirDropViewModel: ObservableObject {
         let decFile = STATE_DIR.appendingPathComponent("ask_decision.json")
         let dict: [String: Any] = ["id": ask.id, "accepted": accepted]
         if let d = try? JSONSerialization.data(withJSONObject: dict) {
-            try? d.write(to: decFile)
+            try? d.write(to: decFile, options: [.atomic])
         }
         pendingAsk = nil
     }

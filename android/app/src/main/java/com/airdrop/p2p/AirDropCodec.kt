@@ -6,6 +6,7 @@ import java.io.ByteArrayOutputStream
 import java.io.EOFException
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
@@ -142,6 +143,14 @@ object AirDropCodec {
                 null -> out.write(0x00)
                 false -> out.write(0x08)
                 true -> out.write(0x09)
+                is Double -> {
+                    out.write(0x23)
+                    writeIntSized(java.lang.Double.doubleToRawLongBits(obj), 8)
+                }
+                is Float -> {
+                    out.write(0x22)
+                    writeIntSized(java.lang.Float.floatToRawIntBits(obj).toLong() and 0xFFFFFFFFL, 4)
+                }
                 is Number -> {
                     val v = obj.toLong()
                     when {
@@ -424,6 +433,9 @@ object AirDropCodec {
             nameBytes: ByteArray,
             fileSize: Long
         ) {
+            require(fileSize in 0..0x1FFFFFFFFL) {
+                "File size $fileSize exceeds CPIO odc 8 GiB limit"
+            }
             val header = String.format(
                 java.util.Locale.US,
                 "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o",
@@ -615,6 +627,14 @@ object AirDropCodec {
             private val oneByte = ByteArray(1)
             private var eof = false
 
+            private fun drainCompLeft() {
+                while (compLeft > 0) {
+                    val n = combined.read(inBuf, 0, minOf(inBuf.size, compLeft))
+                    if (n <= 0) throw EOFException("Truncated DVZip block tail")
+                    compLeft -= n
+                }
+            }
+
             override fun read(): Int {
                 val n = read(oneByte, 0, 1)
                 return if (n <= 0) -1 else (oneByte[0].toInt() and 0xFF)
@@ -632,35 +652,22 @@ object AirDropCodec {
                     }
                     val inf = inflater
                     if (inf != null) {
+                        if (inf.needsDictionary()) {
+                            throw IOException("Zlib preset dictionary not supported in DVZip")
+                        }
                         val produced = inf.inflate(b, off, len)
                         if (produced > 0) {
                             if (inf.finished()) {
                                 inf.end()
                                 inflater = null
-                                if (compLeft > 0) {
-                                    var toSkip = compLeft.toLong()
-                                    while (toSkip > 0) {
-                                        val skipped = combined.skip(toSkip)
-                                        if (skipped <= 0) break
-                                        toSkip -= skipped
-                                    }
-                                    compLeft = 0
-                                }
+                                drainCompLeft()
                             }
                             return produced
                         }
                         if (inf.finished()) {
                             inf.end()
                             inflater = null
-                            if (compLeft > 0) {
-                                var toSkip = compLeft.toLong()
-                                while (toSkip > 0) {
-                                    val skipped = combined.skip(toSkip)
-                                    if (skipped <= 0) break
-                                    toSkip -= skipped
-                                }
-                                compLeft = 0
-                            }
+                            drainCompLeft()
                             continue
                         }
                         if (inf.needsInput()) {

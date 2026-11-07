@@ -456,6 +456,7 @@ class AirDropNode(private val context: Context) {
     private var learnedMacName: String? = null
     @Volatile
     private var lastMacP2pIp: String = ""
+    private var wifiTeardownJob: Job? = null
 
     private class PendingMacTx(
         val metaBytes: ByteArray,
@@ -628,7 +629,7 @@ class AirDropNode(private val context: Context) {
                             offset: Int,
                             characteristic: BluetoothGattCharacteristic
                         ) {
-                            val fullNameBytes = deviceName.take(24).toByteArray(StandardCharsets.UTF_8)
+                            val fullNameBytes = utf8PrefixBytes(deviceName, 24)
                             val psmBytes = ByteArray(2 + fullNameBytes.size).also { buf ->
                                 buf[0] = (localBlePsm and 0xFF).toByte()
                                 buf[1] = ((localBlePsm ushr 8) and 0xFF).toByte()
@@ -684,6 +685,16 @@ class AirDropNode(private val context: Context) {
         }
     }
 
+    private fun utf8PrefixBytes(input: String, maxBytes: Int): ByteArray {
+        val raw = input.toByteArray(StandardCharsets.UTF_8)
+        if (raw.size <= maxBytes) return raw
+        var len = maxBytes
+        while (len > 0 && (raw[len].toInt() and 0xC0) == 0x80) {
+            len--
+        }
+        return raw.copyOf(len)
+    }
+
     @SuppressLint("MissingPermission")
     private fun restartBleAdvertisingOnly() {
         try {
@@ -702,7 +713,7 @@ class AirDropNode(private val context: Context) {
                 .build()
 
             // Primary AdvertiseData: Flags (3B) + 0xCAFE ServiceData (4B header + 2B PSM + up to 16B UTF-8 name = 22B) = 25B <= 31B!
-            val cleanNameBytes = deviceName.take(16).toByteArray(StandardCharsets.UTF_8)
+            val cleanNameBytes = utf8PrefixBytes(deviceName, 16)
             val svcPayload = ByteArray(2 + cleanNameBytes.size).also { buf ->
                 buf[0] = (peerPsm and 0xFF).toByte()
                 buf[1] = ((peerPsm ushr 8) and 0xFF).toByte()
@@ -973,6 +984,7 @@ class AirDropNode(private val context: Context) {
     }
 
     private suspend fun ensureWifiDirectCreds(): String {
+        wifiTeardownJob?.cancel()
         if (wifiDirectCreds.isNotEmpty()) return wifiDirectCreds
         startWifiDirectGroup()
         var waited = 0
@@ -1105,8 +1117,15 @@ class AirDropNode(private val context: Context) {
                                 }
                                 if (!wp2pJoined && !txOk && !transferCancelled) {
                                     val startedAt = System.currentTimeMillis()
+                                    val rawArchBytes = if (tx.archiveBytes.isNotEmpty()) {
+                                        tx.archiveBytes
+                                    } else if (tx.entries.isNotEmpty()) {
+                                        ByteArrayOutputStream().also { AirDropCodec.writeDvzipCpio(tx.entries, it) }.toByteArray()
+                                    } else {
+                                        ByteArray(0)
+                                    }
                                     val encMeta = encryptBlePayload(tx.metaBytes)
-                                    val encArch = if (tx.archiveBytes.isNotEmpty()) encryptBlePayload(tx.archiveBytes) else ByteArray(0)
+                                    val encArch = if (rawArchBytes.isNotEmpty()) encryptBlePayload(rawArchBytes) else ByteArray(0)
                                     val total = encArch.size.toLong().coerceAtLeast(1L)
                                     out.write("ADRE\n".toByteArray(StandardCharsets.US_ASCII))
                                     dos.writeInt(encMeta.size)
@@ -1162,7 +1181,7 @@ class AirDropNode(private val context: Context) {
                                             )
                                         }
                                     }
-                                    log("BLE L2CAP E2EE TX complete (${formatBytes(tx.archiveBytes.size.toLong())}, ack=$ackStr, ok=$txOk)")
+                                    log("BLE L2CAP E2EE TX complete (${formatBytes(rawArchBytes.size.toLong())}, ack=$ackStr, ok=$txOk)")
                                 }
                             } catch (t: Throwable) {
                                 log("BLE piggyback TX warning: ${t.message}")
@@ -1453,7 +1472,7 @@ class AirDropNode(private val context: Context) {
                                 val dos = DataOutputStream(BufferedOutputStream(sock.outputStream, 65536))
                                 val inp = sock.inputStream
 
-                                if (totalRawBytes >= 65_536L && entries.isNotEmpty()) {
+                                if (attempt == 1 && totalRawBytes >= 65_536L && entries.isNotEmpty() && totalRawBytes <= 50_000_000L) {
                                     val creds = ensureWifiDirectCreds()
                                     if (creds.isNotEmpty()) {
                                         val credParts = creds.split('\t')
@@ -1479,14 +1498,21 @@ class AirDropNode(private val context: Context) {
                                                     return@withLock p2pOk
                                                 }
                                             }
-                                            throw IOException("WP2P fallback to BLE L2CAP")
+                                            log("WP2P negotiation declined or failed, falling back to direct BLE L2CAP")
                                         }
                                     }
                                 }
 
                                 val startedAt = System.currentTimeMillis()
+                                val rawArchBytes = if (archiveBytes.isNotEmpty()) {
+                                    archiveBytes
+                                } else if (entries.isNotEmpty()) {
+                                    ByteArrayOutputStream().also { AirDropCodec.writeDvzipCpio(entries, it) }.toByteArray()
+                                } else {
+                                    ByteArray(0)
+                                }
                                 val encMeta = encryptBlePayload(metaBytes)
-                                val encArch = if (archiveBytes.isNotEmpty()) encryptBlePayload(archiveBytes) else ByteArray(0)
+                                val encArch = if (rawArchBytes.isNotEmpty()) encryptBlePayload(rawArchBytes) else ByteArray(0)
                                 val encTotal = encArch.size.toLong().coerceAtLeast(1L)
                                 dos.write("ADRE".toByteArray(StandardCharsets.US_ASCII))
                                 dos.writeInt(encMeta.size)
@@ -1542,7 +1568,7 @@ class AirDropNode(private val context: Context) {
                                         )
                                     }
                                 }
-                                log("BLE L2CAP E2EE TX complete (${formatBytes(archiveBytes.size.toLong())}, ack=$ackStr, ok=$ok)")
+                                log("BLE L2CAP E2EE TX complete (${formatBytes(rawArchBytes.size.toLong())}, ack=$ackStr, ok=$ok)")
                                 return@withLock ok
                             }
                         } catch (t: Throwable) {
@@ -1602,6 +1628,7 @@ class AirDropNode(private val context: Context) {
         fileCount: Int
     ): Boolean {
         acquireTransferLocks()
+        wifiTeardownJob?.cancel()
         var keepAliveJob: Job? = null
         return try {
             val sslCtx = buildSslContext()
@@ -1621,6 +1648,7 @@ class AirDropNode(private val context: Context) {
             }
             val connectedRaw = rawSock ?: throw (lastConnErr ?: IOException("Could not connect to $host:$port"))
             connectedRaw.use { raw ->
+                activeTransferSocket = raw
                 raw.soTimeout = 300_000
                 raw.tcpNoDelay = true
                 raw.keepAlive = true
@@ -1628,31 +1656,17 @@ class AirDropNode(private val context: Context) {
                 raw.receiveBufferSize = 524288
 
                 // Launch active ARP keepalive coroutine during 5GHz Wi-Fi Direct transfers
-                // Sends UDP pulse to port 8774 and runs /system/bin/ping every 2s to keep Android ARP entry REACHABLE
+                // Sends UDP pulse to port 8774 and runs ICMP reachable check every 2s to keep Android ARP entry REACHABLE
                 if (host.startsWith("192.168.49.")) {
                     keepAliveJob = scope.launch(Dispatchers.IO) {
-                        var udpSock: DatagramSocket? = null
-                        try {
-                            udpSock = DatagramSocket()
+                        DatagramSocket().use { udpSock ->
                             val dummy = byteArrayOf(0xAD.toByte())
                             val targetAddr = InetAddress.getByName(host)
                             while (isActive && activeTransferSocket != null && !transferCancelled) {
-                                try {
-                                    udpSock.send(DatagramPacket(dummy, 1, targetAddr, 8774))
-                                } catch (_: Throwable) {}
-                                try {
-                                    val proc = Runtime.getRuntime().exec(arrayOf("/system/bin/ping", "-c", "1", "-w", "1", host))
-                                    proc.waitFor()
-                                    runCatching { proc.inputStream.close() }
-                                    runCatching { proc.errorStream.close() }
-                                    runCatching { proc.outputStream.close() }
-                                    proc.destroy()
-                                } catch (_: Throwable) {}
+                                runCatching { udpSock.send(DatagramPacket(dummy, 1, targetAddr, 8774)) }
+                                runCatching { targetAddr.isReachable(1000) }
                                 kotlinx.coroutines.delay(2000)
                             }
-                        } catch (_: Throwable) {
-                        } finally {
-                            runCatching { udpSock?.close() }
                         }
                     }
                 }
@@ -1820,11 +1834,14 @@ class AirDropNode(private val context: Context) {
             releaseTransferLocks()
             activeTransferSocket = null
             lastMacP2pIp = ""
-            // Tear down ephemeral 5GHz Wi-Fi Direct group so Mac immediately returns to Internet Wi-Fi
+            // Tear down ephemeral 5GHz Wi-Fi Direct group with grace period so Mac immediately returns to Internet Wi-Fi
             if (host.startsWith("192.168.49.")) {
-                scope.launch {
-                    kotlinx.coroutines.delay(2000)
-                    stopWifiDirectGroup()
+                wifiTeardownJob?.cancel()
+                wifiTeardownJob = scope.launch {
+                    kotlinx.coroutines.delay(5000)
+                    if (!isTransferInProgress) {
+                        stopWifiDirectGroup()
+                    }
                 }
             }
         }
@@ -2110,10 +2127,13 @@ class AirDropNode(private val context: Context) {
             }
             if (didUpload || transferCancelled) {
                 lastMacP2pIp = ""
-                // Tear down ephemeral 5GHz Wi-Fi Direct group immediately after /Upload so Mac reconnects to Internet Wi-Fi!
-                scope.launch {
-                    kotlinx.coroutines.delay(500)
-                    stopWifiDirectGroup()
+                // Tear down ephemeral 5GHz Wi-Fi Direct group with grace period so consecutive transfers reuse group
+                wifiTeardownJob?.cancel()
+                wifiTeardownJob = scope.launch {
+                    kotlinx.coroutines.delay(5000)
+                    if (!isTransferInProgress) {
+                        stopWifiDirectGroup()
+                    }
                 }
             }
         }
@@ -2287,8 +2307,12 @@ class AirDropNode(private val context: Context) {
             init(ks, null)
         }
         val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+                require(!chain.isNullOrEmpty()) { "Client TLS certificate chain is empty" }
+            }
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+                require(!chain.isNullOrEmpty()) { "Server TLS certificate chain is empty" }
+            }
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
         })
         return SSLContext.getInstance("TLS").apply {
