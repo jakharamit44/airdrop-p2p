@@ -4,6 +4,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import ds.tokens.DsDarkColors
+import ds.tokens.DsLightColors
+import ds.tokens.LocalDsColors
 
 private val DarkColorScheme = darkColorScheme(
     primary = AppDarkColors.bgActionPrimary,
@@ -29,9 +33,12 @@ private val LightColorScheme = lightColorScheme(
 
 @Composable
 fun AirDropTheme(
-    darkTheme: Boolean = true,
+    darkTheme: Boolean = false,
     content: @Composable () -> Unit
 ) {
+    val dsColors = if (darkTheme) DsDarkColors else DsLightColors
     val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme
-    MaterialTheme(colorScheme = colorScheme, typography = Typography, content = content)
+    CompositionLocalProvider(LocalDsColors provides dsColors) {
+        MaterialTheme(colorScheme = colorScheme, typography = Typography, content = content)
+    }
 }

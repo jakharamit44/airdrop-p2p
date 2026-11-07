@@ -55,9 +55,9 @@ if [ -f "$ROOT_DIR/macos/AppIcon.icns" ]; then
 fi
 
 # Provide first-time user guidance for Gatekeeper bypass
-cat > "$DMG_TMP/READ ME - HOW TO OPEN.txt" << 'EOF'
+cat > "$DMG_TMP/READ ME - HOW TO OPEN.txt" << EOF
 ===========================================================
-  AirDrop P2P v2.0.2 - Installation & First Launch Guide
+  AirDrop P2P v${VERSION} - Installation & First Launch Guide
 ===========================================================
 
 1. INSTALLATION:

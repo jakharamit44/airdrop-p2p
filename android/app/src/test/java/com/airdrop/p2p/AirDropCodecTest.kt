@@ -172,4 +172,56 @@ class AirDropCodecTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun precompressedExtensionUsesStoredBlocksDirectly() {
+        val payload = ByteArray(128 * 1024) { (it * 31).toByte() }
+        val out = ByteArrayOutputStream()
+        AirDropCodec.writeDvzipCpio(
+            listOf(
+                AirDropCodec.OutgoingEntry(
+                    name = "clip.mkv",
+                    size = payload.size.toLong(),
+                    openStream = { ByteArrayInputStream(payload) }
+                )
+            ),
+            out
+        )
+        val encoded = out.toByteArray()
+        val firstHdr = java.nio.ByteBuffer.wrap(encoded, 0, 4).int
+        assertTrue("Expected stored DVZip header flag (0x80000000)", (firstHdr and AirDropCodec.DVZIP_STORED) != 0)
+
+        val tempDir = Files.createTempDirectory("airdrop-precomp-test").toFile()
+        try {
+            val extracted = AirDropCodec.extractDvzipCpio(ByteArrayInputStream(encoded), tempDir)
+            assertEquals(1, extracted.size)
+            assertArrayEquals(payload, File(tempDir, "clip.mkv").readBytes())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun multiMegabyteOneMibStoredBlocksRoundTrip() {
+        val payload = ByteArray(3 * 1024 * 1024 + 137_913) { ((it * 17) xor (it ushr 9)).toByte() }
+        val out = ByteArrayOutputStream()
+        AirDropCodec.writeDvzipCpio(
+            listOf(
+                AirDropCodec.OutgoingEntry(
+                    name = "movie_4k.mp4",
+                    size = payload.size.toLong(),
+                    openStream = { ByteArrayInputStream(payload) }
+                )
+            ),
+            out
+        )
+        val tempDir = Files.createTempDirectory("airdrop-1mib-test").toFile()
+        try {
+            val extracted = AirDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
+            assertEquals(1, extracted.size)
+            assertArrayEquals(payload, File(tempDir, "movie_4k.mp4").readBytes())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

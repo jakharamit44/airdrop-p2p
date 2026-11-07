@@ -85,10 +85,24 @@ class AirDropService : Service() {
         }
 
         val node = getNode(applicationContext)
-        node.onTransferProgress = { fileName, pct, doneBytes, totalBytes, speedBps, isSending ->
+        node.onTransferProgress = { fileName, pct, doneBytes, totalBytes, speedBps, isSending, isConnecting, phase ->
             if (pct >= 100 || pct < 0) {
                 runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
                 nm.cancel(1999)
+            } else if (isConnecting) {
+                runCatching { wakeLock?.acquire(15 * 60 * 1000L) }
+                val connectTitle = if (isSending) "Connecting to AirDrop peer…" else "Incoming AirDrop connection…"
+                val connectBody = phase.ifEmpty { fileName }
+                val progressNotif = NotificationCompat.Builder(this, CHANNEL_RX)
+                    .setSmallIcon(R.mipmap.ic_launcher)
+                    .setContentTitle(connectTitle)
+                    .setContentText(connectBody)
+                    .setProgress(100, 0, true)
+                    .setOngoing(true)
+                    .setOnlyAlertOnce(true)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .build()
+                nm.notify(1999, progressNotif)
             } else {
                 runCatching { wakeLock?.acquire(15 * 60 * 1000L) }
                 val speedStr = if (speedBps > 0L) " • ${AirDropNode.formatSpeed(speedBps)}" else ""

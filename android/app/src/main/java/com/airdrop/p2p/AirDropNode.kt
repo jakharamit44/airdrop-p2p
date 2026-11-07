@@ -135,7 +135,10 @@ data class TransferProgress(
     val speedBytesPerSec: Long = 0L,
     val etaSeconds: Long = 0L,
     val fileCount: Int = 1,
-    val isSending: Boolean = false
+    val isSending: Boolean = false,
+    val isConnecting: Boolean = false,
+    val phase: String = "",
+    val peerName: String = ""
 )
 
 /**
@@ -227,8 +230,23 @@ class AirDropNode(private val context: Context) {
             prefs.edit().putBoolean("auto_accept", value).apply()
         }
 
+    private val _themeModeFlow = MutableStateFlow(prefs.getString("theme_mode", "system") ?: "system")
+    val themeModeFlow: StateFlow<String> = _themeModeFlow.asStateFlow()
+
+    var themeMode: String
+        get() = _themeModeFlow.value
+        set(value) {
+            val normalized = when (value.lowercase(java.util.Locale.US)) {
+                "light", "day" -> "light"
+                "dark", "night" -> "dark"
+                else -> "system"
+            }
+            _themeModeFlow.value = normalized
+            prefs.edit().putString("theme_mode", normalized).apply()
+        }
+
     var onItemReceived: ((ReceivedItem) -> Unit)? = null
-    var onTransferProgress: ((String, Int, Long, Long, Long, Boolean) -> Unit)? = null
+    var onTransferProgress: ((String, Int, Long, Long, Long, Boolean, Boolean, String) -> Unit)? = null
 
     private val _running = MutableStateFlow(false)
     val running: StateFlow<Boolean> = _running.asStateFlow()
@@ -337,7 +355,7 @@ class AirDropNode(private val context: Context) {
     fun cancelActiveTransfer() {
         transferCancelled = true
         _transferProgress.value = null
-        onTransferProgress?.invoke("Transfer cancelled", -1, 0L, 0L, 0L, false)
+        onTransferProgress?.invoke("Transfer cancelled", -1, 0L, 0L, 0L, false, false, "")
         pendingMacTx?.let { tx ->
             pendingMacTx = null
             tx.result.complete(false)
@@ -407,7 +425,33 @@ class AirDropNode(private val context: Context) {
 
     private fun clearProgressNotification() {
         _transferProgress.value = null
-        onTransferProgress?.invoke("", -1, 0L, 0L, 0L, true)
+        onTransferProgress?.invoke("", -1, 0L, 0L, 0L, true, false, "")
+    }
+
+    private fun reportConnecting(
+        label: String,
+        total: Long,
+        fileCount: Int,
+        isSending: Boolean,
+        phase: String,
+        peerName: String = learnedMacName ?: "Nearby Peer"
+    ) {
+        if (transferCancelled) return
+        val cleanPeer = peerName.substringBefore(" (PSM").trim().ifEmpty { "Nearby Peer" }
+        _transferProgress.value = TransferProgress(
+            label = label,
+            percent = 0,
+            doneBytes = 0L,
+            totalBytes = total,
+            speedBytesPerSec = 0L,
+            etaSeconds = 0L,
+            fileCount = fileCount.coerceAtLeast(1),
+            isSending = isSending,
+            isConnecting = true,
+            phase = phase,
+            peerName = cleanPeer
+        )
+        onTransferProgress?.invoke(label, 0, 0L, total, 0L, isSending, true, phase)
     }
 
     private fun isValidPeerTransferIp(ip: String): Boolean {
@@ -433,13 +477,16 @@ class AirDropNode(private val context: Context) {
         total: Long,
         startedAtMs: Long,
         fileCount: Int,
-        isSending: Boolean
+        isSending: Boolean,
+        peerName: String = learnedMacName ?: "Nearby Peer"
     ) {
         if (pct >= 100) {
             _transferProgress.value = null
-            onTransferProgress?.invoke(label, 100, total, total, 0L, isSending)
+            onTransferProgress?.invoke(label, 100, total, total, 0L, isSending, false, "")
             return
         }
+        val cleanPeer = peerName.substringBefore(" (PSM").trim().ifEmpty { "Nearby Peer" }
+        val phaseLabel = if (isSending) "Sending files" else "Receiving files"
         val elapsedMs = (System.currentTimeMillis() - startedAtMs).coerceAtLeast(120L)
         val speedBps = (done * 1000L) / elapsedMs
         val remBytes = (total - done).coerceAtLeast(0L)
@@ -452,9 +499,12 @@ class AirDropNode(private val context: Context) {
             speedBytesPerSec = speedBps,
             etaSeconds = etaSec,
             fileCount = fileCount,
-            isSending = isSending
+            isSending = isSending,
+            isConnecting = false,
+            phase = phaseLabel,
+            peerName = cleanPeer
         )
-        onTransferProgress?.invoke(label, pct, done, total, speedBps, isSending)
+        onTransferProgress?.invoke(label, pct, done, total, speedBps, isSending, false, phaseLabel)
     }
 
     private val sslContext: SSLContext by lazy { buildSslContext() }
@@ -1107,12 +1157,14 @@ class AirDropNode(private val context: Context) {
                             try {
                                 val dos = DataOutputStream(out)
                                 if (tx.totalRawBytes >= 65_536L && tx.entries.isNotEmpty()) {
+                                    reportConnecting(tx.label, tx.totalRawBytes, tx.fileCount, isSending = true, phase = "Starting 5GHz Wi-Fi Direct…", peerName = macName)
                                     val creds = ensureWifiDirectCreds()
                                     if (creds.isNotEmpty()) {
                                         val credParts = creds.split('\t')
                                         if (credParts.size >= 2) {
                                             out.write("WP2P\t${credParts[0]}\t${credParts[1]}\n".toByteArray(StandardCharsets.UTF_8))
                                             out.flush()
+                                            reportConnecting(tx.label, tx.totalRawBytes, tx.fileCount, isSending = true, phase = "Waiting for $macName to join 5GHz link…", peerName = macName)
                                             val replyLine = readBleLineBounded(sock, dis, 22_000L).orEmpty()
                                             if (replyLine.startsWith("OK ")) {
                                                 val macIp = replyLine.removePrefix("OK ").trim()
@@ -1236,10 +1288,38 @@ class AirDropNode(private val context: Context) {
                 if (magicStr == "WP2P") {
                     val isAuthorized = (pendingMacTx != null && (pendingMacTx?.targetPeerAddress == null || pendingMacTx?.targetPeerAddress == remoteAddr)) ||
                                        (learnedMacName != null && bleMacDevice?.address == remoteAddr)
+                    if (isAuthorized) {
+                        reportConnecting(
+                            label = "Incoming transfer",
+                            total = 0L,
+                            fileCount = 1,
+                            isSending = false,
+                            phase = "Opening 5GHz Wi-Fi Direct link…",
+                            peerName = learnedMacName ?: "MacBook Pro"
+                        )
+                    }
                     val creds = if (isAuthorized) ensureWifiDirectCreds() else ""
                     val reply = if (creds.isNotEmpty()) "OK\t$creds\n" else "NO\n"
                     out.write(reply.toByteArray(StandardCharsets.UTF_8))
                     out.flush()
+                    if (creds.isNotEmpty()) {
+                        reportConnecting(
+                            label = "Incoming transfer",
+                            total = 0L,
+                            fileCount = 1,
+                            isSending = false,
+                            phase = "Waiting for peer to join 5GHz link…",
+                            peerName = learnedMacName ?: "MacBook Pro"
+                        )
+                        scope.launch {
+                            kotlinx.coroutines.delay(18_000L)
+                            if (_transferProgress.value?.isConnecting == true && activeTransferSocket == null) {
+                                clearProgressNotification()
+                            }
+                        }
+                    } else if (_transferProgress.value?.isConnecting == true) {
+                        clearProgressNotification()
+                    }
                     log("BLE WP2P handshake with $remoteAddr -> ${if (creds.isNotEmpty()) "5GHz P2P Ready" else "Rejected/Fallback"}")
                     continue
                 }
@@ -1453,10 +1533,18 @@ class AirDropNode(private val context: Context) {
 
                 val label = entries.firstOrNull()?.name ?: (url ?: "BLE Transfer")
                 val fileCount = maxOf(1, entries.size)
+                val targetPeerLabel = learnedMacName ?: "MacBook Pro"
+
+                // Pre-warm 5GHz Wi-Fi Direct group concurrently with BLE handshake so SSID/passphrase are ready immediately
+                if (totalRawBytes >= 65_536L && entries.isNotEmpty() && wifiDirectCreds.isEmpty()) {
+                    wifiTeardownJob?.cancel()
+                    startWifiDirectGroup()
+                }
 
                 // 1. Fast path: if Mac is already joined to our 5GHz Wi-Fi Direct group, stream directly at 5GHz speed!
                 val cachedIp = lastMacP2pIp
                 if (cachedIp.startsWith("192.168.49.")) {
+                    reportConnecting(label, totalRawBytes, fileCount, isSending = true, phase = "Connecting over 5GHz Wi-Fi Direct…", peerName = targetPeerLabel)
                     log("Streaming directly over active 5GHz Wi-Fi Direct link ($cachedIp:8772)…")
                     if (sendOverWifiDirectHttps(cachedIp, 8772, metaBytes, archiveBytes, entries, url, label, fileCount)) {
                         return@withLock true
@@ -1465,6 +1553,7 @@ class AirDropNode(private val context: Context) {
                 }
 
                 // 2. Queue transfer for Mac's 1.5s BLE L2CAP heartbeat (works even when Android BLE scan is blocked by OS Location toggle)
+                reportConnecting(label, totalRawBytes, fileCount, isSending = true, phase = "Connecting via Bluetooth LE…", peerName = targetPeerLabel)
                 val deferred = CompletableDeferred<Boolean>()
                 val targetAddr = bleMacDevice?.address
                 val tx = PendingMacTx(
@@ -1481,8 +1570,11 @@ class AirDropNode(private val context: Context) {
                 pendingMacTx = tx
                 log("Queued transfer for Mac BLE L2CAP P2P channel\u2026")
 
+                // Wait one heartbeat window (2.2s) if we already scanned the peer's PSM so we can connect directly without delay;
+                // otherwise wait full 12s for passive BLE heartbeat pickup.
+                val initialHeartbeatWaitMs = if (bleMacDevice != null && bleMacPsm > 0) 2_200L else 12_000L
                 var waitedMs = 0L
-                while (waitedMs < 12_000L && !deferred.isCompleted && !tx.claimed && !transferCancelled) {
+                while (waitedMs < initialHeartbeatWaitMs && !deferred.isCompleted && !tx.claimed && !transferCancelled) {
                     kotlinx.coroutines.delay(100)
                     waitedMs += 100
                 }
@@ -1507,6 +1599,7 @@ class AirDropNode(private val context: Context) {
                         stopBleScanOnly()
                         kotlinx.coroutines.delay(80)
                         try {
+                            reportConnecting(label, totalRawBytes, fileCount, isSending = true, phase = "Connecting via Bluetooth LE…", peerName = targetPeerLabel)
                             log("Connecting to Mac via Direct BLE L2CAP (${targetDev.address} PSM $targetPsm, attempt $attempt)\u2026")
                             targetDev.createInsecureL2capChannel(targetPsm).use { sock ->
                                 activeTransferSocket = sock
@@ -1515,6 +1608,7 @@ class AirDropNode(private val context: Context) {
                                 val inp = sock.inputStream
 
                                 if (totalRawBytes >= 65_536L && entries.isNotEmpty()) {
+                                    reportConnecting(label, totalRawBytes, fileCount, isSending = true, phase = "Starting 5GHz Wi-Fi Direct…", peerName = targetPeerLabel)
                                     val creds = ensureWifiDirectCreds()
                                     if (creds.isNotEmpty()) {
                                         val credParts = creds.split('\t')
@@ -1526,6 +1620,7 @@ class AirDropNode(private val context: Context) {
                                             dos.write(wp2pPayload)
                                             dos.flush()
 
+                                            reportConnecting(label, totalRawBytes, fileCount, isSending = true, phase = "Waiting for $targetPeerLabel to join 5GHz link…", peerName = targetPeerLabel)
                                             val replyLine = readBleLineBounded(sock, inp, 22_000L).orEmpty()
                                             if (replyLine.startsWith("OK ")) {
                                                 val macIp = replyLine.removePrefix("OK ").trim()
@@ -1688,7 +1783,7 @@ class AirDropNode(private val context: Context) {
         var keepAliveJob: Job? = null
         var writeWatchdogJob: Job? = null
         return try {
-            val sslCtx = buildSslContext()
+            val sslCtx = sslContext
             var rawSock: Socket? = null
             var lastConnErr: Throwable? = null
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
@@ -1704,10 +1799,25 @@ class AirDropNode(private val context: Context) {
             } else {
                 null
             }
+            val totalPlannedBytes = entries.sumOf { it.size }
+            reportConnecting(
+                label = label,
+                total = totalPlannedBytes,
+                fileCount = fileCount,
+                isSending = true,
+                phase = "Opening 5GHz TLS channel…",
+                peerName = learnedMacName ?: "MacBook Pro"
+            )
             for (attempt in 1..10) {
                 if (transferCancelled) return false
                 try {
                     val candidate = Socket()
+                    runCatching {
+                        candidate.tcpNoDelay = true
+                        candidate.keepAlive = true
+                        candidate.sendBufferSize = 4_194_304
+                        candidate.receiveBufferSize = 4_194_304
+                    }
                     if (isP2pTarget) {
                         p2pNetwork?.bindSocket(candidate)
                     }
@@ -1725,8 +1835,10 @@ class AirDropNode(private val context: Context) {
                 raw.soTimeout = 60_000
                 raw.tcpNoDelay = true
                 raw.keepAlive = true
-                raw.sendBufferSize = 524288
-                raw.receiveBufferSize = 524288
+                runCatching {
+                    raw.sendBufferSize = 4_194_304
+                    raw.receiveBufferSize = 4_194_304
+                }
 
                 // Launch active ARP keepalive coroutine during 5GHz Wi-Fi Direct transfers
                 // Bound to p2pNetwork so pulses egress on p2p-wlan0-* rather than wlan0
@@ -1745,11 +1857,20 @@ class AirDropNode(private val context: Context) {
                 }
                 (sslCtx.socketFactory.createSocket(raw, host, port, true) as SSLSocket).use { tls ->
                     activeTransferSocket = tls
+                    configureHighThroughputTls(tls)
                     tls.startHandshake()
                     val inp = BufferedInputStream(tls.inputStream, 65536)
                     val rawOut = tls.outputStream
 
                     // 1. /Ask
+                    reportConnecting(
+                        label = label,
+                        total = totalPlannedBytes,
+                        fileCount = fileCount,
+                        isSending = true,
+                        phase = "Waiting for receiver approval…",
+                        peerName = learnedMacName ?: "MacBook Pro"
+                    )
                     val askHdr = buildString {
                         append("POST /Ask HTTP/1.1\r\n")
                         append("Host: $host:$port\r\n")
@@ -1807,9 +1928,11 @@ class AirDropNode(private val context: Context) {
                         reportProgress(label, 0, 0L, total, startedAt, fileCount, isSending = true)
                         var lastUpdate = 0L
 
-                        // Contiguous chunk buffer: 16 bytes reserved for hex prefix + 262144 bytes data + 2 bytes CRLF
-                        // Emits entire chunk in ONE socket write, eliminating split TLS frames and double buffering
-                        val chunkBuffer = ByteArray(16 + 262144 + 2)
+                        // Contiguous 1 MiB chunk buffer: 16 bytes reserved for hex prefix + 1048576 bytes data + 2 bytes CRLF
+                        // Emits entire 1 MiB HTTP chunk in ONE socket write, maximizing 5GHz Wi-Fi Direct A-MPDU aggregation
+                        val chunkCap = 1_048_576
+                        val flushThreshold = 4_194_304
+                        val chunkBuffer = ByteArray(16 + chunkCap + 2)
                         val dataOffset = 16
                         var buffered = 0
 
@@ -1834,10 +1957,10 @@ class AirDropNode(private val context: Context) {
 
                             override fun write(b: Int) {
                                 chunkBuffer[dataOffset + buffered++] = b.toByte()
-                                if (buffered == 262144) {
+                                if (buffered == chunkCap) {
                                     flushChunk()
-                                    bytesSinceFlush += 262144
-                                    if (bytesSinceFlush >= 2097152) {
+                                    bytesSinceFlush += chunkCap
+                                    if (bytesSinceFlush >= flushThreshold) {
                                         lastWriteActivityMs.set(System.currentTimeMillis())
                                         rawOut.flush()
                                         lastWriteActivityMs.set(System.currentTimeMillis())
@@ -1850,15 +1973,15 @@ class AirDropNode(private val context: Context) {
                                 var o = off
                                 var rem = len
                                 while (rem > 0) {
-                                    val take = minOf(rem, 262144 - buffered)
+                                    val take = minOf(rem, chunkCap - buffered)
                                     System.arraycopy(b, o, chunkBuffer, dataOffset + buffered, take)
                                     buffered += take
                                     o += take
                                     rem -= take
-                                    if (buffered == 262144) {
+                                    if (buffered == chunkCap) {
                                         flushChunk()
-                                        bytesSinceFlush += 262144
-                                        if (bytesSinceFlush >= 2097152) {
+                                        bytesSinceFlush += chunkCap
+                                        if (bytesSinceFlush >= flushThreshold) {
                                             lastWriteActivityMs.set(System.currentTimeMillis())
                                             rawOut.flush()
                                             lastWriteActivityMs.set(System.currentTimeMillis())
@@ -1974,12 +2097,29 @@ class AirDropNode(private val context: Context) {
     // 5 GHz Wi-Fi Direct P2P HTTPS Receiver (/Discover, /Ask, /Upload) on :8771
     // =========================================================================
 
+    private fun configureHighThroughputTls(tls: SSLSocket) {
+        runCatching {
+            val supportedProtos = tls.supportedProtocols.orEmpty()
+            val desiredProtos = listOf("TLSv1.3", "TLSv1.2").filter { it in supportedProtos }
+            if (desiredProtos.isNotEmpty()) {
+                tls.enabledProtocols = desiredProtos.toTypedArray()
+            }
+            val currentSuites = tls.enabledCipherSuites ?: return@runCatching
+            val fastSuite = "TLS_AES_128_GCM_SHA256"
+            if (fastSuite in currentSuites && currentSuites.firstOrNull() != fastSuite) {
+                tls.enabledCipherSuites = (listOf(fastSuite) + currentSuites.filter { it != fastSuite }).toTypedArray()
+            }
+        }
+    }
+
     private fun startHttpsReceiver() {
         scope.launch {
             try {
                 val srv = sslContext.serverSocketFactory
-                    .createServerSocket(AIRDROP_PORT) as SSLServerSocket
+                    .createServerSocket() as SSLServerSocket
                 srv.reuseAddress = true
+                runCatching { srv.receiveBufferSize = 4_194_304 }
+                srv.bind(InetSocketAddress(AIRDROP_PORT), 32)
                 srv.wantClientAuth = true
                 srv.needClientAuth = false
                 serverSocket = srv
@@ -2015,8 +2155,15 @@ class AirDropNode(private val context: Context) {
         var didUpload = false
         try {
             sock.soTimeout = 30_000
+            sock.tcpNoDelay = true
+            sock.keepAlive = true
+            runCatching {
+                sock.receiveBufferSize = 4_194_304
+                sock.sendBufferSize = 4_194_304
+            }
+            configureHighThroughputTls(sock)
             sock.startHandshake()
-            val inp = BufferedInputStream(sock.inputStream, 65536)
+            val inp = BufferedInputStream(sock.inputStream, 1_048_576)
             val out = BufferedOutputStream(sock.outputStream, 65536)
             var lastSenderName = "MacBook Pro"
             var lastAskLabel = "Incoming AirDrop"
@@ -2055,6 +2202,14 @@ class AirDropNode(private val context: Context) {
                     }
                     method == "POST" && path == "/Discover" -> {
                         readHttpBodyBytes(inp, headers)
+                        reportConnecting(
+                            label = "Incoming transfer",
+                            total = 0L,
+                            fileCount = 1,
+                            isSending = false,
+                            phase = "Handshaking over 5GHz Wi-Fi Direct…",
+                            peerName = learnedMacName ?: "MacBook Pro"
+                        )
                         val resp = AirDropCodec.encodeBplist(
                             mapOf(
                                 "ReceiverComputerName" to deviceName,
@@ -2096,6 +2251,14 @@ class AirDropNode(private val context: Context) {
                         }
 
                         log("ASK from $sender: $summary")
+                        reportConnecting(
+                            label = lastAskLabel,
+                            total = totalAskBytes,
+                            fileCount = lastAskFileCount,
+                            isSending = false,
+                            phase = if (autoAccept) "Starting incoming stream…" else "Waiting for your approval…",
+                            peerName = sender
+                        )
                         val accepted = if (autoAccept) {
                             true
                         } else {
@@ -2158,6 +2321,7 @@ class AirDropNode(private val context: Context) {
                             break
                         }
                         didUpload = true
+                        acquireTransferLocks()
                         activeTransferSocket = sock
                         sock.soTimeout = 30_000
                         val downloads = File(
@@ -2239,6 +2403,7 @@ class AirDropNode(private val context: Context) {
         } catch (t: Throwable) {
             log("RX session ($remote) ended: ${t.message}")
         } finally {
+            if (didUpload) releaseTransferLocks()
             if (activeTransferSocket === sock) activeTransferSocket = null
             clearProgressNotification()
             try {
@@ -2301,13 +2466,54 @@ class AirDropNode(private val context: Context) {
 
     suspend fun sendUrisToPeer(peer: AirDropPeer, uris: List<Uri>): Boolean =
         withContext(Dispatchers.IO) {
+            if (uris.isEmpty()) return@withContext false
+            val peerClean = peer.name.substringBefore(" (PSM").trim().ifEmpty { learnedMacName ?: "MacBook Pro" }
+            val firstMeta = inspectUriMeta(uris.first())
+            reportConnecting(
+                label = firstMeta.first,
+                total = firstMeta.second,
+                fileCount = uris.size,
+                isSending = true,
+                phase = "Preparing ${uris.size} file(s)…",
+                peerName = peerClean
+            )
             val entries = uris.mapNotNull { uri -> resolveUriEntry(uri) }
             if (entries.isEmpty()) {
+                clearProgressNotification()
                 log("No readable files selected")
                 return@withContext false
             }
             return@withContext sendOverBleL2cap(entries, null)
         }
+
+    fun inspectUriMeta(uri: Uri): Pair<String, Long> {
+        if (uri.scheme == "file") {
+            val f = File(uri.path ?: return "shared_file" to 0L)
+            return (f.name.ifEmpty { "shared_file" }) to f.length().coerceAtLeast(0L)
+        }
+        val cr = context.contentResolver
+        var name = uri.lastPathSegment?.substringAfterLast('/') ?: "shared_file"
+        var size = -1L
+        runCatching {
+            cr.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)
+                ?.use { c ->
+                    if (c.moveToFirst()) {
+                        val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                        if (nameIdx >= 0 && !c.isNull(nameIdx)) name = c.getString(nameIdx)
+                        if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx)
+                    }
+                }
+        }
+        if (size < 0L) {
+            runCatching {
+                cr.openFileDescriptor(uri, "r")?.use { pfd ->
+                    if (pfd.statSize >= 0L) size = pfd.statSize
+                }
+            }
+        }
+        return name to size.coerceAtLeast(0L)
+    }
 
     suspend fun sendTextSnippetToPeer(peer: AirDropPeer, text: String): Boolean =
         withContext(Dispatchers.IO) {

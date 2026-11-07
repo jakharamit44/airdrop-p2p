@@ -1,6 +1,7 @@
 package com.airdrop.p2p
 
 import android.Manifest
+import android.app.Activity
 import android.app.DownloadManager
 import android.bluetooth.BluetoothAdapter
 import android.content.ClipData
@@ -10,6 +11,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.os.StatFs
 import android.provider.Settings
 import android.webkit.MimeTypeMap
 import android.widget.Toast
@@ -20,6 +23,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
@@ -33,6 +37,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -44,19 +49,21 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -66,14 +73,15 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -82,52 +90,91 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
 import com.airdrop.p2p.theme.AirDropTheme
-import ds.tokens.DsDarkColors
 import ds.tokens.DsMotion
-import ds.tokens.DsSpace
-import ds.tokens.DsType
 import ds.tokens.LocalDsColors
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
-import kotlin.math.cos
-import kotlin.math.roundToInt
-import kotlin.math.sin
 
-// Tabular figures helper (STD-visual-details-02)
-private val TabularNums = TextStyle(fontFeatureSettings = "tnum")
+data class StagedFileItem(
+    val id: String,
+    val uri: Uri? = null,
+    val textOrUrl: String? = null,
+    val name: String,
+    val sizeBytes: Long,
+    val category: String
+)
 
-// Subtle 0.97 press scale feedback (STD-mobile-touch-05)
+data class StorageBreakdown(
+    val totalBytes: Long,
+    val freeBytes: Long,
+    val usedBytes: Long
+)
+
+private fun middleTruncate(text: String, maxChars: Int = 34): String {
+    if (text.length <= maxChars) return text
+    val dotIdx = text.lastIndexOf('.')
+    if (dotIdx in 2 until text.length - 1 && (text.length - dotIdx) <= 10) {
+        val ext = text.substring(dotIdx)
+        val stemBudget = (maxChars - ext.length - 1).coerceAtLeast(6)
+        val head = (stemBudget * 2 / 3).coerceAtLeast(4)
+        val tail = (stemBudget - head).coerceAtLeast(2)
+        val stem = text.substring(0, dotIdx)
+        return stem.take(head) + "\u2026" + stem.takeLast(tail) + ext
+    }
+    val keepStart = (maxChars * 3 / 5).coerceAtLeast(6)
+    val keepEnd = (maxChars - 1 - keepStart).coerceAtLeast(4)
+    return text.take(keepStart) + "\u2026" + text.takeLast(keepEnd)
+}
+
+private fun categoryForFileName(name: String, isUrl: Boolean = false): String {
+    if (isUrl) return "Link"
+    return when (name.substringAfterLast('.', "").lowercase(Locale.US)) {
+        "jpg", "jpeg", "png", "webp", "heic", "heif", "gif", "bmp", "svg" -> "Image"
+        "mp4", "mkv", "mov", "avi", "webm", "m4v", "ts" -> "Video"
+        "mp3", "m4a", "flac", "wav", "aac", "ogg", "opus" -> "Audio"
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "json" -> "Doc"
+        "apk", "aab", "dmg", "pkg", "zip", "7z", "rar", "tar", "gz" -> "Archive"
+        else -> "File"
+    }
+}
+
 private fun Modifier.pressableScale(
     enabled: Boolean = true,
+    pressedScale: Float = DsMotion.scalePress,
     onClick: () -> Unit
 ): Modifier = composed {
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
     val scale by animateFloatAsState(
-        targetValue = if (isPressed && enabled) DsMotion.scalePress else 1f,
-        animationSpec = tween(durationMillis = DsMotion.durationMicroMs),
+        targetValue = if (isPressed && enabled) pressedScale else 1f,
+        animationSpec = DsMotion.springEffectsDefault(),
         label = "pressScale"
     )
     this
@@ -143,19 +190,36 @@ private fun Modifier.pressableScale(
         )
 }
 
-// Middle truncation for filenames and paths so extensions remain visible (break-ui rule)
-private fun middleTruncate(text: String, maxChars: Int = 34): String {
-    if (text.length <= maxChars) return text
-    val keepStart = (maxChars - 1) / 2
-    val keepEnd = maxChars - 1 - keepStart
-    return text.take(keepStart) + "\u2026" + text.takeLast(keepEnd)
+private fun timeOfDayGreeting(): String {
+    val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+    return when (hour) {
+        in 5..11 -> "Good Morning"
+        in 12..16 -> "Good Afternoon"
+        in 17..21 -> "Good Evening"
+        else -> "Ready to Share"
+    }
+}
+
+private fun readInternalStorage(): StorageBreakdown {
+    return try {
+        val stat = StatFs(Environment.getDataDirectory().path)
+        val total = stat.totalBytes.coerceAtLeast(1L)
+        val free = stat.availableBytes.coerceIn(0L, total)
+        StorageBreakdown(
+            totalBytes = total,
+            freeBytes = free,
+            usedBytes = (total - free).coerceAtLeast(0L)
+        )
+    } catch (_: Throwable) {
+        StorageBreakdown(totalBytes = 128L * 1024 * 1024 * 1024, freeBytes = 64L * 1024 * 1024 * 1024, usedBytes = 64L * 1024 * 1024 * 1024)
+    }
 }
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var node: AirDropNode
     private val sharedUris = MutableStateFlow<List<Uri>>(emptyList())
-    private val sharedUrl = MutableStateFlow<String?>(null)
+    private val sharedText = MutableStateFlow<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -167,33 +231,50 @@ class MainActivity : ComponentActivity() {
 
         enableEdgeToEdge()
         setContent {
-            val colors = DsDarkColors
-            CompositionLocalProvider(LocalDsColors provides colors) {
-                AirDropTheme {
-                    Surface(
-                        modifier = Modifier.fillMaxSize(),
-                        color = colors.surfaceBase
-                    ) {
-                        AirDropScreen(
-                            node = node,
-                            pendingSharedUris = sharedUris.collectAsState().value,
-                            pendingSharedUrl = sharedUrl.collectAsState().value,
-                            onClearPendingShare = {
-                                sharedUris.value = emptyList()
-                                sharedUrl.value = null
-                            },
-                            onOpenUrl = { url ->
-                                runCatching {
-                                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                                }
-                            },
-                            onOpenDownloads = {
-                                runCatching {
-                                    startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
-                                }
+            val themeMode by node.themeModeFlow.collectAsState()
+            val systemDark = isSystemInDarkTheme()
+            val isDark = when (themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> systemDark
+            }
+            val view = LocalView.current
+            if (!view.isInEditMode) {
+                SideEffect {
+                    val window = (view.context as? Activity)?.window ?: return@SideEffect
+                    val controller = WindowCompat.getInsetsController(window, view)
+                    controller.isAppearanceLightStatusBars = !isDark
+                    controller.isAppearanceLightNavigationBars = !isDark
+                }
+            }
+
+            AirDropTheme(darkTheme = isDark) {
+                val colors = LocalDsColors.current
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = colors.surfaceBase
+                ) {
+                    AirDropScreen(
+                        node = node,
+                        isDark = isDark,
+                        themeMode = themeMode,
+                        pendingSharedUris = sharedUris.collectAsState().value,
+                        pendingSharedText = sharedText.collectAsState().value,
+                        onClearPendingShare = {
+                            sharedUris.value = emptyList()
+                            sharedText.value = null
+                        },
+                        onOpenUrl = { url ->
+                            runCatching {
+                                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
                             }
-                        )
-                    }
+                        },
+                        onOpenDownloads = {
+                            runCatching {
+                                startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+                            }
+                        }
+                    )
                 }
             }
         }
@@ -207,8 +288,6 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        // Do NOT stop the node or kill AirDropService on activity destroy.
-        // The foreground service keeps background transfers alive and maintains discovery.
         super.onDestroy()
     }
 
@@ -221,18 +300,20 @@ class MainActivity : ComponentActivity() {
         if (intent == null) return
         when (intent.action) {
             Intent.ACTION_SEND -> {
-                val text = intent.getStringExtra(Intent.EXTRA_TEXT)
-                if (!text.isNullOrBlank() && (text.startsWith("http://") || text.startsWith("https://"))) {
-                    sharedUrl.value = text.trim()
-                    return
-                }
                 val stream = if (Build.VERSION.SDK_INT >= 33) {
                     intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
                 } else {
                     @Suppress("DEPRECATION")
                     intent.getParcelableExtra(Intent.EXTRA_STREAM)
                 }
-                if (stream != null) sharedUris.value = listOf(stream)
+                if (stream != null) {
+                    sharedUris.value = listOf(stream)
+                    return
+                }
+                val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+                if (!text.isNullOrBlank()) {
+                    sharedText.value = text.trim()
+                }
             }
             Intent.ACTION_SEND_MULTIPLE -> {
                 val streams = if (Build.VERSION.SDK_INT >= 33) {
@@ -247,18 +328,25 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private enum class QuickIconKind {
+    SEND, RECEIVE, HISTORY, SETTINGS,
+    IMAGE, VIDEO, DOC, AUDIO, LINK, FOLDER,
+    SUN, MOON, REFRESH, CHECK, CLOSE, PLUS, SEARCH, BLUETOOTH, UPLOAD, DOWNLOAD
+}
+
 @Composable
 fun AirDropScreen(
     node: AirDropNode,
+    isDark: Boolean,
+    themeMode: String,
     pendingSharedUris: List<Uri>,
-    pendingSharedUrl: String?,
+    pendingSharedText: String?,
     onClearPendingShare: () -> Unit,
     onOpenUrl: (String) -> Unit,
     onOpenDownloads: () -> Unit
 ) {
     val c = LocalDsColors.current
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
     val running by node.running.collectAsState()
     val endpoints by node.localEndpoints.collectAsState()
     val peers by node.peers.collectAsState()
@@ -269,298 +357,350 @@ fun AirDropScreen(
     val logs by node.logs.collectAsState()
     val deviceName by node.deviceNameFlow.collectAsState()
     val autoAccept by node.autoAcceptFlow.collectAsState()
-    val bluetoothEnabled by node.bluetoothEnabled.collectAsState()
+    val btEnabled by node.bluetoothEnabled.collectAsState()
     val wifiEnabled by node.wifiEnabled.collectAsState()
-    val permissionsGranted by node.permissionsGranted.collectAsState()
+    val permsGranted by node.permissionsGranted.collectAsState()
 
-    // Navigation items named for their contents (STD-visual-details-34)
-    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Nearby, 1 = History, 2 = Settings
-    var historyFilter by remember { mutableIntStateOf(0) } // 0 = All, 1 = Received, 2 = Sent
-    var showLogs by remember { mutableStateOf(false) }
-    var linkPeerTarget by remember { mutableStateOf<AirDropPeer?>(null) }
-    var linkText by remember { mutableStateOf("") }
+    // 4 Separate Tabs: 0 = Send, 1 = Receive, 2 = History, 3 = Settings
+    var activeTab by rememberSaveable { mutableIntStateOf(0) }
+    var historyFilter by rememberSaveable { mutableIntStateOf(0) }
+    var historyQuery by rememberSaveable { mutableStateOf("") }
+    var showLogs by rememberSaveable { mutableStateOf(false) }
+
+    val stagedItems = remember { mutableStateListOf<StagedFileItem>() }
+    var selectedPeerId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    var showTextModal by remember { mutableStateOf(false) }
+    var textSnippetDraft by remember { mutableStateOf("") }
     var showRenameDialog by remember { mutableStateOf(false) }
     var renameText by remember { mutableStateOf(deviceName) }
-    var targetPeerForPicker by remember { mutableStateOf<AirDropPeer?>(null) }
+
+    var storageInfo by remember { mutableStateOf(readInternalStorage()) }
+    LaunchedEffect(receivedItems.size, activeTab) {
+        withContext(Dispatchers.IO) {
+            storageInfo = readInternalStorage()
+        }
+    }
+
+    fun stageUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        var added = 0
+        for (uri in uris) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            val key = uri.toString()
+            if (stagedItems.none { it.id == key }) {
+                val (name, size) = node.inspectUriMeta(uri)
+                stagedItems.add(
+                    StagedFileItem(
+                        id = key,
+                        uri = uri,
+                        name = name,
+                        sizeBytes = size,
+                        category = categoryForFileName(name)
+                    )
+                )
+                added++
+            }
+        }
+        activeTab = 0
+        if (added > 0) {
+            Toast.makeText(context, "${stagedItems.size} file(s) staged — tap Send when ready", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun stageTextOrUrl(raw: String) {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return
+        val isLink = trimmed.startsWith("http://") || trimmed.startsWith("https://")
+        val key = "text:$trimmed"
+        if (stagedItems.none { it.id == key }) {
+            stagedItems.add(
+                StagedFileItem(
+                    id = key,
+                    textOrUrl = trimmed,
+                    name = if (isLink) trimmed else "Text note (${trimmed.take(28)})",
+                    sizeBytes = trimmed.toByteArray().size.toLong(),
+                    category = if (isLink) "Link" else "Doc"
+                )
+            )
+        }
+        activeTab = 0
+    }
+
+    // Ingest system Share Sheet intents into staging queue (never auto-sends without user confirmation)
+    LaunchedEffect(pendingSharedUris, pendingSharedText) {
+        if (pendingSharedUris.isNotEmpty()) {
+            stageUris(pendingSharedUris)
+            onClearPendingShare()
+        } else if (!pendingSharedText.isNullOrBlank()) {
+            stageTextOrUrl(pendingSharedText)
+            onClearPendingShare()
+        }
+    }
+
+    // Pickers — ALL stage into stagedItems rather than immediately transmitting
+    val anyFilePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> stageUris(uris) }
+
+    val imagePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> stageUris(uris) }
+
+    val videoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> stageUris(uris) }
+
+    val audioPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> stageUris(uris) }
+
+    val docPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> stageUris(uris) }
 
     val requiredPermissions = remember {
         buildList {
-            if (Build.VERSION.SDK_INT >= 33) {
-                add(Manifest.permission.NEARBY_WIFI_DEVICES)
-                add(Manifest.permission.POST_NOTIFICATIONS)
-            }
-            if (Build.VERSION.SDK_INT >= 31) {
-                add(Manifest.permission.BLUETOOTH_ADVERTISE)
-                add(Manifest.permission.BLUETOOTH_CONNECT)
-                add(Manifest.permission.BLUETOOTH_SCAN)
-            }
+            add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            add(Manifest.permission.BLUETOOTH_CONNECT)
+            add(Manifest.permission.BLUETOOTH_SCAN)
             add(Manifest.permission.ACCESS_FINE_LOCATION)
             add(Manifest.permission.ACCESS_COARSE_LOCATION)
+            if (Build.VERSION.SDK_INT >= 33) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+                add(Manifest.permission.NEARBY_WIFI_DEVICES)
+                add(Manifest.permission.READ_MEDIA_IMAGES)
+                add(Manifest.permission.READ_MEDIA_VIDEO)
+                add(Manifest.permission.READ_MEDIA_AUDIO)
+            } else {
+                add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
         }.toTypedArray()
     }
 
     val permLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
+        contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
         node.refreshSystemReadiness()
         node.start()
     }
 
-    val enableBtLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) {
-        node.refreshSystemReadiness()
-        node.refreshP2p()
-    }
-
-    val wifiPanelLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) {
-        node.refreshSystemReadiness()
-        node.refreshP2p()
-    }
-
-    val filePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris ->
-        val peer = targetPeerForPicker ?: peers.firstOrNull()
-        if (peer != null && uris.isNotEmpty()) {
-            node.sendUrisAsync(peer, uris) { ok ->
-                Toast.makeText(
-                    context.applicationContext,
-                    if (ok) "Sent ${uris.size} file(s) to ${peer.name.substringBefore(" (")}" else "Transfer failed",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        }
-    }
-
-    val mediaPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris ->
-        val peer = targetPeerForPicker ?: peers.firstOrNull()
-        if (peer != null && uris.isNotEmpty()) {
-            node.sendUrisAsync(peer, uris) { ok ->
-                Toast.makeText(
-                    context.applicationContext,
-                    if (ok) "Sent ${uris.size} media item(s) to ${peer.name.substringBefore(" (")}" else "Transfer failed",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        }
-    }
-
     LaunchedEffect(Unit) {
-        node.refreshSystemReadiness()
         permLauncher.launch(requiredPermissions)
     }
 
-    // Incoming Transfer Accept / Decline Modal (When Ask First is active)
-    incomingAsk?.let { prompt ->
+    // Trigger sending staged items only when user explicitly taps Send
+    fun triggerSendStaged() {
+        if (stagedItems.isEmpty() || transferProgress != null) return
+        val activePeer = peers.firstOrNull { it.id == selectedPeerId }
+            ?: peers.firstOrNull()
+            ?: AirDropPeer(
+                id = "ble-mac",
+                name = "Nearby Mac",
+                host = "ble://mac",
+                port = 192,
+                rssi = -55,
+                transport = "BLE + 5GHz P2P"
+            )
+        val urisToSend = stagedItems.mapNotNull { it.uri }
+        val textsToSend = stagedItems.mapNotNull { it.textOrUrl }
+
+        if (urisToSend.isNotEmpty()) {
+            node.sendUrisAsync(activePeer, urisToSend) { ok ->
+                if (ok) {
+                    stagedItems.removeAll { it.uri != null }
+                    if (textsToSend.isNotEmpty()) {
+                        node.sendTextSnippetAsync(activePeer, textsToSend.joinToString("\n")) { textOk ->
+                            if (textOk) stagedItems.clear()
+                        }
+                    } else {
+                        Toast.makeText(context, "Sent ${urisToSend.size} file(s)", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    Toast.makeText(context, "Transfer did not complete — files kept in selection", Toast.LENGTH_LONG).show()
+                }
+            }
+        } else if (textsToSend.isNotEmpty()) {
+            val combined = textsToSend.joinToString("\n")
+            node.sendTextSnippetAsync(activePeer, combined) { ok ->
+                if (ok) {
+                    stagedItems.clear()
+                    Toast.makeText(context, "Sent shared link / text", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "Transfer did not complete — item kept in selection", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    // Incoming Ask Consent Modal
+    incomingAsk?.let { ask ->
         AlertDialog(
-            onDismissRequest = { prompt.decision.complete(false) },
+            onDismissRequest = { ask.decision.complete(false) },
             containerColor = c.surfaceOverlay,
             titleContentColor = c.textPrimary,
             textContentColor = c.textSecondary,
-            shape = RoundedCornerShape(DsSpace.radiusOverlay),
+            shape = RoundedCornerShape(20.dp),
             title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(DsSpace.space12)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(DsSpace.sizeControlMd)
-                            .clip(RoundedCornerShape(DsSpace.radius8))
-                            .background(c.bgAccentSubtle),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        DsVectorIcon(kind = IconKind.Download, tint = c.iconAccent, size = DsSpace.sizeIconMd)
-                    }
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Incoming files",
-                            style = DsType.titleSm,
-                            color = c.textPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = "From ${prompt.senderName}",
-                            style = DsType.bodySm,
-                            color = c.textSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
+                Text(
+                    text = "Incoming AirDrop",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
             },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(DsSpace.space8)) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "${ask.senderName} wants to send:",
+                        color = c.textSecondary,
+                        fontSize = 14.sp
+                    )
                     Surface(
                         color = c.surfaceSunken,
-                        shape = RoundedCornerShape(DsSpace.radius8),
-                        border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, c.borderSubtle),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(
-                            modifier = Modifier.padding(DsSpace.space12),
-                            verticalArrangement = Arrangement.spacedBy(DsSpace.space4)
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
-                            if (prompt.fileNames.isNotEmpty()) {
-                                val countLabel = if (prompt.fileNames.size == 1) "1 file" else "${prompt.fileNames.size} files"
+                            Text(
+                                text = ask.summary,
+                                color = c.textPrimary,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp,
+                                maxLines = 4,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (ask.totalBytes > 0L) {
                                 Text(
-                                    text = "$countLabel · ${AirDropNode.formatBytes(prompt.totalBytes)}",
-                                    style = DsType.bodySm.merge(TabularNums),
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = c.textAccent
-                                )
-                                prompt.fileNames.take(4).forEach { fname ->
-                                    Text(
-                                        text = middleTruncate(fname, 36),
-                                        style = DsType.bodyMd,
-                                        color = c.textPrimary,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                                if (prompt.fileNames.size > 4) {
-                                    Text(
-                                        text = "+${prompt.fileNames.size - 4} more",
-                                        style = DsType.bodySm,
-                                        color = c.textSecondary
-                                    )
-                                }
-                            } else {
-                                Text(
-                                    text = prompt.summary,
-                                    style = DsType.bodyMd,
-                                    color = c.textPrimary
+                                    text = "Total size: ${AirDropNode.formatBytes(ask.totalBytes)}",
+                                    color = c.textAccent,
+                                    fontSize = 12.sp,
+                                    style = TextStyle(fontFeatureSettings = "tnum")
                                 )
                             }
                         }
                     }
-                    Text(
-                        text = "Saves to Downloads/AirDrop",
-                        style = DsType.bodySm,
-                        color = c.textTertiary
-                    )
                 }
             },
             confirmButton = {
                 Button(
-                    onClick = { prompt.decision.complete(true) },
+                    onClick = { ask.decision.complete(true) },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = c.bgActionPrimary,
                         contentColor = c.textOnAction
                     ),
-                    shape = RoundedCornerShape(DsSpace.radiusControl)
+                    shape = RoundedCornerShape(10.dp)
                 ) {
-                    Text("Accept", style = DsType.labelLg, fontWeight = FontWeight.SemiBold)
+                    Text("Accept", fontWeight = FontWeight.SemiBold)
                 }
             },
             dismissButton = {
                 OutlinedButton(
-                    onClick = { prompt.decision.complete(false) },
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderDefault),
-                    shape = RoundedCornerShape(DsSpace.radiusControl)
+                    onClick = { ask.decision.complete(false) },
+                    border = BorderStroke(1.dp, c.borderDefault),
+                    shape = RoundedCornerShape(10.dp)
                 ) {
-                    Text("Decline", style = DsType.labelLg, color = c.textSecondary)
+                    Text("Decline", color = c.textPrimary)
                 }
             }
         )
     }
 
-    // Send Text / Link Dialog
-    linkPeerTarget?.let { peer ->
-        val peerShort = peer.name.substringBefore(" (")
+    // Add Link / Text Snippet Dialog (stages into selection queue)
+    if (showTextModal) {
         AlertDialog(
-            onDismissRequest = { linkPeerTarget = null },
+            onDismissRequest = { showTextModal = false },
             containerColor = c.surfaceOverlay,
-            titleContentColor = c.textPrimary,
-            shape = RoundedCornerShape(DsSpace.radiusOverlay),
+            shape = RoundedCornerShape(20.dp),
             title = {
                 Text(
-                    text = "Send link or text to $peerShort",
-                    style = DsType.titleSm,
+                    text = "Stage Link or Note",
                     color = c.textPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
                 )
             },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(DsSpace.space8)) {
-                    OutlinedTextField(
-                        value = linkText,
-                        onValueChange = { linkText = it },
-                        placeholder = { Text("https://… or note text", style = DsType.bodyMd, color = c.textTertiary) },
-                        textStyle = DsType.bodyMd.copy(color = c.textPrimary),
-                        singleLine = false,
-                        maxLines = 4,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    TextButton(
-                        onClick = {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            val clip = cm?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
-                            if (!clip.isNullOrBlank()) {
-                                linkText = clip
-                            }
-                        },
-                        contentPadding = PaddingValues(horizontal = DsSpace.space8, vertical = DsSpace.space4)
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Paste from clipboard", style = DsType.bodySm, color = c.textLink)
+                        Text(
+                            text = "Add a URL or text note to your send queue",
+                            color = c.textSecondary,
+                            fontSize = 13.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(
+                            onClick = {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                val pasted = cm?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                                if (pasted.isNotBlank()) textSnippetDraft = pasted
+                            }
+                        ) {
+                            Text("Paste", color = c.textAccent, fontWeight = FontWeight.SemiBold)
+                        }
                     }
+                    OutlinedTextField(
+                        value = textSnippetDraft,
+                        onValueChange = { textSnippetDraft = it },
+                        placeholder = { Text("https://example.com or note…", color = c.textTertiary) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 96.dp, max = 180.dp)
+                    )
                 }
             },
             confirmButton = {
                 Button(
+                    enabled = textSnippetDraft.isNotBlank(),
                     onClick = {
-                        val payload = linkText.trim()
-                        linkPeerTarget = null
-                        linkText = ""
-                        if (payload.isNotEmpty()) {
-                            node.sendTextSnippetAsync(peer, payload) { ok ->
-                                Toast.makeText(
-                                    context.applicationContext,
-                                    if (ok) "Sent to $peerShort" else "Send failed",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            }
-                        }
+                        stageTextOrUrl(textSnippetDraft)
+                        textSnippetDraft = ""
+                        showTextModal = false
                     },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = c.bgActionPrimary,
                         contentColor = c.textOnAction
                     ),
-                    shape = RoundedCornerShape(DsSpace.radiusControl)
+                    shape = RoundedCornerShape(10.dp)
                 ) {
-                    Text("Send", style = DsType.labelLg, fontWeight = FontWeight.SemiBold)
+                    Text("Add to Selection", fontWeight = FontWeight.SemiBold)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { linkPeerTarget = null }) {
-                    Text("Cancel", style = DsType.labelLg, color = c.textSecondary)
+                TextButton(onClick = { showTextModal = false }) {
+                    Text("Cancel", color = c.textSecondary)
                 }
             }
         )
     }
 
-    // Rename Device Dialog
+    // Rename Device Modal
     if (showRenameDialog) {
         AlertDialog(
             onDismissRequest = { showRenameDialog = false },
             containerColor = c.surfaceOverlay,
-            titleContentColor = c.textPrimary,
-            shape = RoundedCornerShape(DsSpace.radiusOverlay),
-            title = { Text("Device name", style = DsType.titleSm, color = c.textPrimary) },
+            shape = RoundedCornerShape(20.dp),
+            title = {
+                Text("Device Name", color = c.textPrimary, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            },
             text = {
                 OutlinedTextField(
                     value = renameText,
-                    onValueChange = { renameText = it.take(32) },
-                    placeholder = { Text("Visible to nearby devices", style = DsType.bodyMd, color = c.textTertiary) },
-                    textStyle = DsType.bodyMd.copy(color = c.textPrimary),
+                    onValueChange = { renameText = it.take(28) },
                     singleLine = true,
+                    label = { Text("Visible to nearby Macs") },
                     modifier = Modifier.fillMaxWidth()
                 )
             },
@@ -574,14 +714,14 @@ fun AirDropScreen(
                         containerColor = c.bgActionPrimary,
                         contentColor = c.textOnAction
                     ),
-                    shape = RoundedCornerShape(DsSpace.radiusControl)
+                    shape = RoundedCornerShape(10.dp)
                 ) {
-                    Text("Save", style = DsType.labelLg, fontWeight = FontWeight.SemiBold)
+                    Text("Save", fontWeight = FontWeight.SemiBold)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showRenameDialog = false }) {
-                    Text("Cancel", style = DsType.labelLg, color = c.textSecondary)
+                    Text("Cancel", color = c.textSecondary)
                 }
             }
         )
@@ -590,34 +730,31 @@ fun AirDropScreen(
     Scaffold(
         containerColor = c.surfaceBase,
         topBar = {
-            TopHeaderBar(
+            QuickShareTopBar(
                 deviceName = deviceName,
                 running = running,
-                autoAccept = autoAccept,
+                isDark = isDark,
+                stagedCount = stagedItems.size,
+                onToggleTheme = {
+                    node.themeMode = if (isDark) "light" else "dark"
+                },
                 onRenameClick = {
                     renameText = deviceName
                     showRenameDialog = true
                 },
-                onReceiveModeClick = {
-                    node.autoAccept = !autoAccept
-                    Toast.makeText(
-                        context,
-                        if (node.autoAccept) "Auto-accept enabled" else "Ask before receiving enabled",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                },
                 onRescanClick = {
                     node.refreshP2p()
-                    Toast.makeText(context, "Scanning nearby devices\u2026", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Scanning nearby BLE + 5GHz P2P…", Toast.LENGTH_SHORT).show()
                 }
             )
         },
         bottomBar = {
-            BottomTabNavigation(
-                selectedTab = selectedTab,
+            QuickShareBottomBar(
+                activeTab = activeTab,
+                stagedCount = stagedItems.size,
                 peerCount = peers.size,
                 historyCount = receivedItems.size,
-                onSelectTab = { selectedTab = it }
+                onSelectTab = { activeTab = it }
             )
         }
     ) { innerPadding ->
@@ -625,141 +762,126 @@ fun AirDropScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .padding(horizontal = DsSpace.space16)
         ) {
-            // System Readiness Banner (Permissions + Bluetooth + Wi-Fi power states)
-            AnimatedVisibility(visible = !permissionsGranted || !bluetoothEnabled || !wifiEnabled) {
-                Box(modifier = Modifier.padding(top = DsSpace.space8, bottom = DsSpace.space4)) {
-                    SystemReadinessBanner(
-                        permissionsGranted = permissionsGranted,
-                        bluetoothEnabled = bluetoothEnabled,
-                        wifiEnabled = wifiEnabled,
-                        onRequestPermissions = { permLauncher.launch(requiredPermissions) },
-                        onEnableBluetooth = {
-                            runCatching {
-                                enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
-                            }.onFailure {
-                                runCatching {
-                                    context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
-                                }
-                            }
-                        },
-                        onEnableWifi = {
-                            runCatching {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                    wifiPanelLauncher.launch(Intent(Settings.Panel.ACTION_WIFI))
-                                } else {
-                                    context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
-                                }
-                            }.onFailure {
-                                runCatching {
-                                    context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
-                                }
-                            }
-                        }
+            if (!btEnabled || !wifiEnabled || !permsGranted) {
+                RadioReadinessCard(
+                    btEnabled = btEnabled,
+                    wifiEnabled = wifiEnabled,
+                    permsGranted = permsGranted,
+                    onEnableBluetooth = {
+                        runCatching { context.startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)) }
+                    },
+                    onEnableWifi = {
+                        runCatching { context.startActivity(Intent(Settings.Panel.ACTION_WIFI)) }
+                    },
+                    onGrantPerms = { permLauncher.launch(requiredPermissions) }
+                )
+            }
+
+            // Live Connecting / Connected Peer Bridge Card (visible during both handshake AND transfer)
+            AnimatedVisibility(visible = transferProgress != null) {
+                transferProgress?.let { prog ->
+                    LiveConnectionBridgeCard(
+                        localDeviceName = deviceName,
+                        progress = prog,
+                        onCancel = { node.cancelActiveTransfer() }
                     )
                 }
             }
 
-            // Active transfer bar (only visible when sending or receiving)
-            AnimatedVisibility(visible = transferProgress != null) {
-                transferProgress?.let { tp ->
-                    Box(modifier = Modifier.padding(top = DsSpace.space8, bottom = DsSpace.space4)) {
-                        LiveTransferTelemetryCard(
-                            tp = tp,
-                            onCancel = {
-                                node.cancelActiveTransfer()
-                                Toast.makeText(context, "Transfer stopped", Toast.LENGTH_SHORT).show()
-                            }
-                        )
-                    }
-                }
-            }
-
-            // System Share Sheet Banner
-            if (pendingSharedUris.isNotEmpty() || pendingSharedUrl != null) {
-                PendingShareBanner(
-                    uris = pendingSharedUris,
-                    url = pendingSharedUrl,
+            when (activeTab) {
+                0 -> SendHomeTab(
+                    stagedItems = stagedItems,
                     peers = peers,
-                    onSendToPeer = { peer ->
-                        val u = pendingSharedUris
-                        val link = pendingSharedUrl
-                        val peerLabel = peer.name.substringBefore(" (")
-                        onClearPendingShare()
-                        if (link != null) {
-                            node.sendUrlAsync(peer, link) { ok ->
-                                Toast.makeText(
-                                    context.applicationContext,
-                                    if (ok) "Sent to $peerLabel" else "Transfer failed",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            }
-                        } else {
-                            node.sendUrisAsync(peer, u) { ok ->
-                                Toast.makeText(
-                                    context.applicationContext,
-                                    if (ok) "Sent to $peerLabel" else "Transfer failed",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            }
-                        }
+                    selectedPeerId = selectedPeerId,
+                    transferActive = transferProgress != null,
+                    storage = storageInfo,
+                    recentSent = receivedItems.filter { it.isOutgoing }.take(3),
+                    onSelectPeer = { selectedPeerId = it },
+                    onRemoveStaged = { item -> stagedItems.remove(item) },
+                    onClearStaged = { stagedItems.clear() },
+                    onSendStaged = { triggerSendStaged() },
+                    onPickImages = { imagePicker.launch(arrayOf("image/*")) },
+                    onPickVideos = { videoPicker.launch(arrayOf("video/*")) },
+                    onPickDocs = {
+                        docPicker.launch(
+                            arrayOf(
+                                "application/pdf",
+                                "text/*",
+                                "application/msword",
+                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                "application/vnd.ms-excel",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                "application/vnd.ms-powerpoint",
+                                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                            )
+                        )
                     },
-                    onDismiss = onClearPendingShare
+                    onPickAudio = { audioPicker.launch(arrayOf("audio/*")) },
+                    onStageLinkOrText = { showTextModal = true },
+                    onPickAnyFiles = { anyFilePicker.launch(arrayOf("*/*")) },
+                    onSwitchToReceive = { activeTab = 1 },
+                    onSwitchToHistory = {
+                        historyFilter = 2
+                        activeTab = 2
+                    },
+                    onRescan = { node.refreshP2p() }
                 )
-            }
-
-            when (selectedTab) {
-                0 -> NearbyRadarTab(
+                1 -> ReceiveRadarTab(
                     running = running,
                     deviceName = deviceName,
-                    p2pStatus = p2pStatus,
+                    autoAccept = autoAccept,
                     peers = peers,
+                    p2pStatus = p2pStatus,
+                    recentReceived = receivedItems.filter { !it.isOutgoing }.take(4),
+                    onToggleAutoAccept = { node.autoAccept = it },
                     onRescan = { node.refreshP2p() },
-                    onSendFiles = { peer ->
-                        targetPeerForPicker = peer
-                        filePicker.launch(arrayOf("*/*"))
+                    onStartSendToPeer = { peer ->
+                        selectedPeerId = peer.id
+                        activeTab = 0
+                        if (stagedItems.isEmpty()) {
+                            anyFilePicker.launch(arrayOf("*/*"))
+                        }
                     },
-                    onSendMedia = { peer ->
-                        targetPeerForPicker = peer
-                        mediaPicker.launch(arrayOf("image/*", "video/*"))
+                    onOpenHistoryItem = { item ->
+                        if (item.isUrl) onOpenUrl(item.pathOrUrl)
+                        else openFileWithProvider(context, item.pathOrUrl, onOpenDownloads)
                     },
-                    onSendTextOrLink = { peer ->
-                        linkPeerTarget = peer
+                    onViewAllReceived = {
+                        historyFilter = 1
+                        activeTab = 2
                     }
                 )
-                1 -> TransfersHistoryTab(
+                2 -> TransfersHistoryScreen(
                     items = receivedItems,
                     filter = historyFilter,
+                    query = historyQuery,
+                    onQueryChange = { historyQuery = it },
                     onFilterChange = { historyFilter = it },
-                    onOpenDownloads = onOpenDownloads,
-                    onClearHistory = { node.clearReceivedItems() },
                     onOpenItem = { item ->
-                        if (item.isUrl) {
-                            onOpenUrl(item.pathOrUrl)
-                        } else {
-                            openFileWithProvider(context, item.pathOrUrl, onOpenDownloads)
-                        }
+                        if (item.isUrl) onOpenUrl(item.pathOrUrl)
+                        else openFileWithProvider(context, item.pathOrUrl, onOpenDownloads)
                     },
-                    onShareItem = { item ->
-                        shareFileOrUrl(context, item)
-                    }
+                    onShareItem = { item -> shareFileOrUrl(context, item) },
+                    onCopyText = { txt ->
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        cm?.setPrimaryClip(ClipData.newPlainText("AirDrop", txt))
+                        Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+                    },
+                    onClearAll = { node.clearReceivedItems() }
                 )
-                2 -> SettingsAndP2pTab(
+                else -> SettingsScreenTab(
                     running = running,
                     deviceName = deviceName,
-                    serviceId = node.serviceId,
+                    themeMode = themeMode,
                     autoAccept = autoAccept,
                     p2pStatus = p2pStatus,
                     endpoints = endpoints,
                     logs = logs,
                     showLogs = showLogs,
-                    onToggleRunning = { enabled ->
-                        if (enabled) node.start() else node.stop()
-                    },
-                    onSelectDirectGet = { direct ->
-                        node.autoAccept = direct
-                    },
+                    onSelectThemeMode = { node.themeMode = it },
+                    onToggleRunning = { enabled -> if (enabled) node.start() else node.stop() },
+                    onSelectAutoAccept = { node.autoAccept = it },
                     onRenameDevice = {
                         renameText = deviceName
                         showRenameDialog = true
@@ -767,7 +889,7 @@ fun AirDropScreen(
                     onOpenDownloads = onOpenDownloads,
                     onRescanP2p = {
                         node.refreshP2p()
-                        Toast.makeText(context, "Refreshed P2P + BLE radio", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Refreshed BLE + 5GHz P2P radio", Toast.LENGTH_SHORT).show()
                     },
                     onToggleLogs = { showLogs = !showLogs },
                     onClearLogs = { node.clearLogs() }
@@ -778,15 +900,16 @@ fun AirDropScreen(
 }
 
 // ============================================================================
-// Top Shell Header — Overflow-proof at 320dp..430dp and 200% font scale
+// Top Bar — Greeting + Device Chip + Day/Dark Quick Switch + Rescan
 // ============================================================================
 @Composable
-private fun TopHeaderBar(
+private fun QuickShareTopBar(
     deviceName: String,
     running: Boolean,
-    autoAccept: Boolean,
+    isDark: Boolean,
+    stagedCount: Int,
+    onToggleTheme: () -> Unit,
     onRenameClick: () -> Unit,
-    onReceiveModeClick: () -> Unit,
     onRescanClick: () -> Unit
 ) {
     val c = LocalDsColors.current
@@ -800,361 +923,361 @@ private fun TopHeaderBar(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = DsSpace.sizeRowLg)
-                    .padding(horizontal = DsSpace.space16, vertical = DsSpace.space8),
+                    .padding(horizontal = 18.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(DsSpace.space12)
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // Brand Mark (40dp control container, 8dp nested radius)
-                Box(
-                    modifier = Modifier
-                        .size(DsSpace.sizeControlMd)
-                        .clip(RoundedCornerShape(DsSpace.radius8))
-                        .background(c.bgAccentSubtle)
-                        .border(DsSpace.borderWidthDefault, c.borderAccent.copy(alpha = 0.45f), RoundedCornerShape(DsSpace.radius8)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    DsVectorIcon(kind = IconKind.Radar, tint = c.iconAccent, size = DsSpace.sizeIconMd)
-                }
-
-                // Title & Device Name Column — weight(1f) prevents right-side controls from EVER overflowing!
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .pressableScale(onClick = onRenameClick),
-                    verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
-                ) {
+                Column(modifier = Modifier.weight(1f)) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(DsSpace.space6)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
-                            text = "AirDrop P2P",
-                            style = DsType.titleMd,
+                            text = timeOfDayGreeting(),
                             color = c.textPrimary,
+                            fontSize = 21.sp,
+                            fontWeight = FontWeight.Bold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        Box(
-                            modifier = Modifier
-                                .size(DsSpace.space6)
-                                .clip(CircleShape)
-                                .background(if (running) c.textSuccess else c.textTertiary)
-                        )
+                        if (stagedCount > 0) {
+                            Surface(
+                                color = c.bgAccentSubtle,
+                                shape = CircleShape
+                            ) {
+                                Text(
+                                    text = "$stagedCount queued",
+                                    color = c.textAccent,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    style = TextStyle(fontFeatureSettings = "tnum"),
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
                     }
-                    Text(
-                        text = deviceName,
-                        style = DsType.bodySm,
-                        color = c.textSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                // Receive Mode Status Chip (flex-shrink: 0)
-                Surface(
-                    color = if (autoAccept) c.bgSuccessSubtle else c.bgNeutralSubtle,
-                    shape = RoundedCornerShape(DsSpace.radiusControl),
-                    border = BorderStroke(
-                        DsSpace.borderWidthDefault,
-                        if (autoAccept) c.borderSuccess.copy(alpha = 0.55f) else c.borderSubtle
-                    ),
-                    modifier = Modifier.pressableScale(onClick = onReceiveModeClick)
-                ) {
+                    Spacer(modifier = Modifier.height(2.dp))
                     Row(
-                        modifier = Modifier
-                            .heightIn(min = DsSpace.sizeControlSm)
-                            .padding(horizontal = DsSpace.space8, vertical = DsSpace.space4),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(DsSpace.space4)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.clickable(onClick = onRenameClick)
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(DsSpace.space6)
+                                .size(7.dp)
                                 .clip(CircleShape)
-                                .background(if (autoAccept) c.textSuccess else c.textWarning)
+                                .background(if (running) c.bgSuccessBold else c.textTertiary)
                         )
                         Text(
-                            text = if (autoAccept) "Auto-accept" else "Ask first",
-                            style = DsType.labelMd,
-                            fontWeight = FontWeight.Medium,
-                            color = if (autoAccept) c.textSuccess else c.textPrimary,
-                            maxLines = 1
+                            text = "$deviceName · 5GHz P2P",
+                            color = c.textSecondary,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
 
-                // Scan Icon Action (40dp control height with 48dp touch area)
-                Box(
+                // 1-Tap Day / Dark Theme Button
+                Surface(
+                    color = c.surfaceRaised,
+                    shape = CircleShape,
+                    border = BorderStroke(1.dp, c.borderSubtle),
                     modifier = Modifier
-                        .size(DsSpace.sizeControlMd)
-                        .clip(RoundedCornerShape(DsSpace.radiusControl))
-                        .background(c.surfaceRaised)
-                        .border(DsSpace.borderWidthDefault, c.borderSubtle, RoundedCornerShape(DsSpace.radiusControl))
-                        .pressableScale(onClick = onRescanClick),
-                    contentAlignment = Alignment.Center
+                        .size(40.dp)
+                        .pressableScale(onClick = onToggleTheme)
                 ) {
-                    DsVectorIcon(kind = IconKind.Refresh, tint = c.iconDefault, size = DsSpace.sizeIconSm)
+                    Box(contentAlignment = Alignment.Center) {
+                        QuickVectorIcon(
+                            kind = if (isDark) QuickIconKind.SUN else QuickIconKind.MOON,
+                            tint = c.iconDefault,
+                            size = 18.dp
+                        )
+                    }
                 }
-            }
-            HorizontalDivider(thickness = DsSpace.borderWidthDefault, color = c.borderSeparator)
-        }
-    }
-}
 
-// ============================================================================
-// System Readiness Banner — Permissions + Bluetooth & Wi-Fi Power Prompts
-// ============================================================================
-@Composable
-private fun SystemReadinessBanner(
-    permissionsGranted: Boolean,
-    bluetoothEnabled: Boolean,
-    wifiEnabled: Boolean,
-    onRequestPermissions: () -> Unit,
-    onEnableBluetooth: () -> Unit,
-    onEnableWifi: () -> Unit
-) {
-    val c = LocalDsColors.current
-    val missingItems = buildList {
-        if (!permissionsGranted) add("Permissions")
-        if (!bluetoothEnabled) add("Bluetooth")
-        if (!wifiEnabled) add("Wi-Fi")
-    }
-
-    Surface(
-        color = c.surfaceRaised,
-        shape = RoundedCornerShape(DsSpace.radius12),
-        border = BorderStroke(DsSpace.borderWidthDefault, c.textWarning.copy(alpha = 0.65f)),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(DsSpace.space12),
-            verticalArrangement = Arrangement.spacedBy(DsSpace.space8)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(DsSpace.space8)
-            ) {
-                Box(
+                // Rescan Radio Button
+                Surface(
+                    color = c.surfaceRaised,
+                    shape = CircleShape,
+                    border = BorderStroke(1.dp, c.borderSubtle),
                     modifier = Modifier
-                        .size(DsSpace.space8)
-                        .clip(CircleShape)
-                        .background(c.textWarning)
-                )
-                Text(
-                    text = "Turn on ${missingItems.joinToString(" & ")} for AirDrop P2P",
-                    style = DsType.titleSm,
-                    color = c.textPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-            Text(
-                text = "Bluetooth discovers nearby devices and 5 GHz Wi-Fi Direct transfers large files at full speed.",
-                style = DsType.bodySm,
-                color = c.textSecondary
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(DsSpace.space8),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                if (!permissionsGranted) {
-                    Surface(
-                        color = c.bgActionPrimary,
-                        shape = RoundedCornerShape(DsSpace.radiusControl),
-                        modifier = Modifier
-                            .height(DsSpace.sizeControlSm)
-                            .pressableScale(onClick = onRequestPermissions)
-                    ) {
-                        Box(
-                            modifier = Modifier.padding(horizontal = DsSpace.space12),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "Allow permissions",
-                                style = DsType.labelMd,
-                                fontWeight = FontWeight.SemiBold,
-                                color = c.textOnAction,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-                if (!bluetoothEnabled) {
-                    Surface(
-                        color = c.bgActionPrimary,
-                        shape = RoundedCornerShape(DsSpace.radiusControl),
-                        modifier = Modifier
-                            .height(DsSpace.sizeControlSm)
-                            .pressableScale(onClick = onEnableBluetooth)
-                    ) {
-                        Box(
-                            modifier = Modifier.padding(horizontal = DsSpace.space12),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "Turn on Bluetooth",
-                                style = DsType.labelMd,
-                                fontWeight = FontWeight.SemiBold,
-                                color = c.textOnAction,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-                if (!wifiEnabled) {
-                    Surface(
-                        color = c.bgNeutralSubtle,
-                        shape = RoundedCornerShape(DsSpace.radiusControl),
-                        border = BorderStroke(DsSpace.borderWidthDefault, c.borderAccent),
-                        modifier = Modifier
-                            .height(DsSpace.sizeControlSm)
-                            .pressableScale(onClick = onEnableWifi)
-                    ) {
-                        Box(
-                            modifier = Modifier.padding(horizontal = DsSpace.space12),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "Turn on Wi-Fi",
-                                style = DsType.labelMd,
-                                fontWeight = FontWeight.SemiBold,
-                                color = c.textAccent,
-                                maxLines = 1
-                            )
-                        }
+                        .size(40.dp)
+                        .pressableScale(onClick = onRescanClick)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        QuickVectorIcon(
+                            kind = QuickIconKind.REFRESH,
+                            tint = c.iconAccent,
+                            size = 18.dp
+                        )
                     }
                 }
             }
+            HorizontalDivider(color = c.borderSeparator, thickness = 1.dp)
         }
     }
 }
 
 // ============================================================================
-// Live Transfer Telemetry Card — Tabular numerals, clean single progress bar + Cancel
+// Connected / Connecting Live Bridge Card (Mockup 2 Left: Sender <-> Receiver + Items | Size | Speed)
 // ============================================================================
 @Composable
-private fun LiveTransferTelemetryCard(
-    tp: TransferProgress,
+private fun LiveConnectionBridgeCard(
+    localDeviceName: String,
+    progress: TransferProgress,
     onCancel: () -> Unit
 ) {
     val c = LocalDsColors.current
-    val animatedProgress by animateFloatAsState(
-        targetValue = (tp.percent / 100f).coerceIn(0f, 1f),
-        animationSpec = tween(durationMillis = DsMotion.durationShortMs, easing = LinearEasing),
+    val senderName = if (progress.isSending) localDeviceName else progress.peerName.ifEmpty { "Nearby Peer" }
+    val receiverName = if (progress.isSending) progress.peerName.ifEmpty { "Nearby Peer" } else localDeviceName
+    val animatedFraction by animateFloatAsState(
+        targetValue = (progress.percent / 100f).coerceIn(0f, 1f),
+        animationSpec = tween(250, easing = LinearOutSlowInEasing),
         label = "transferPct"
+    )
+    val pulseTransition = rememberInfiniteTransition(label = "bridgePulse")
+    val dashPhase by pulseTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 36f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "dashPhase"
     )
 
     Surface(
         color = c.surfaceRaised,
-        shape = RoundedCornerShape(DsSpace.radius12),
-        border = BorderStroke(DsSpace.borderWidthDefault, c.borderAccent),
-        modifier = Modifier.fillMaxWidth()
+        shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(1.dp, c.borderAccent.copy(alpha = 0.45f)),
+        shadowElevation = 4.dp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp)
     ) {
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(DsSpace.space12),
-            verticalArrangement = Arrangement.spacedBy(DsSpace.space8)
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // Header: Connecting… / Connected + Cancel X
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(DsSpace.space8)
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                DsVectorIcon(
-                    kind = if (tp.isSending) IconKind.Upload else IconKind.Download,
-                    tint = c.iconAccent,
-                    size = DsSpace.sizeIconSm
-                )
-                Text(
-                    text = middleTruncate(tp.label, 26),
-                    style = DsType.titleSm,
-                    color = c.textPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.weight(1f)
-                )
-                Text(
-                    text = AirDropNode.formatSpeed(tp.speedBytesPerSec),
-                    style = DsType.numericMd.merge(TabularNums),
-                    fontWeight = FontWeight.SemiBold,
-                    color = c.textAccent,
-                    maxLines = 1
-                )
-                Surface(
-                    color = c.bgNeutralSubtle,
-                    shape = RoundedCornerShape(DsSpace.radiusControl),
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderStrong),
-                    modifier = Modifier
-                        .height(DsSpace.sizeControlSm)
-                        .pressableScale(onClick = onCancel)
                 ) {
                     Box(
-                        modifier = Modifier.padding(horizontal = DsSpace.space12),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "Cancel",
-                            style = DsType.labelMd,
-                            fontWeight = FontWeight.SemiBold,
-                            color = c.textPrimary,
-                            maxLines = 1
-                        )
+                        modifier = Modifier
+                            .size(9.dp)
+                            .clip(CircleShape)
+                            .background(if (progress.isConnecting) c.bgActionPrimary else c.bgSuccessBold)
+                    )
+                    Text(
+                        text = if (progress.isConnecting) "Connecting\u2026" else "Connected",
+                        color = c.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp,
+                        maxLines = 1
+                    )
+                }
+                Surface(
+                    color = c.bgNeutralSubtle,
+                    shape = CircleShape,
+                    modifier = Modifier
+                        .size(32.dp)
+                        .pressableScale(onClick = onCancel)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        QuickVectorIcon(kind = QuickIconKind.CLOSE, tint = c.textSecondary, size = 14.dp)
                     }
                 }
             }
 
-            // Progress Track (6dp nested radius)
-            Box(
+            // Peer Bridge: Sender <-> Dashed Arc + Upload/Download Icon <-> Receiver
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(DsSpace.space6)
-                    .clip(RoundedCornerShape(DsSpace.radiusFull))
-                    .background(c.surfaceSunken)
+                    .padding(horizontal = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                PeerAvatarNode(
+                    title = senderName,
+                    badgeColor = c.bgAccentSubtle,
+                    textColor = c.textAccent,
+                    modifier = Modifier.width(92.dp)
+                )
+
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth(animatedProgress.coerceAtLeast(0.02f))
-                        .height(DsSpace.space6)
-                        .clip(RoundedCornerShape(DsSpace.radiusFull))
-                        .background(c.bgActionPrimary)
+                        .weight(1f)
+                        .height(52.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val arcColor = c.borderAccent
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val p = Path().apply {
+                            moveTo(8f, size.height * 0.65f)
+                            quadraticTo(
+                                size.width * 0.5f,
+                                0f,
+                                size.width - 8f,
+                                size.height * 0.65f
+                            )
+                        }
+                        drawPath(
+                            path = p,
+                            color = arcColor,
+                            style = Stroke(
+                                width = 2.dp.toPx(),
+                                cap = StrokeCap.Round,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), -dashPhase)
+                            )
+                        )
+                    }
+                    Surface(
+                        color = c.bgAccentSubtle,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, c.borderAccent.copy(alpha = 0.5f)),
+                        modifier = Modifier.size(34.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            QuickVectorIcon(
+                                kind = if (progress.isSending) QuickIconKind.UPLOAD else QuickIconKind.DOWNLOAD,
+                                tint = c.iconAccent,
+                                size = 17.dp
+                            )
+                        }
+                    }
+                }
+
+                PeerAvatarNode(
+                    title = receiverName,
+                    badgeColor = c.bgSuccessSubtle,
+                    textColor = c.textSuccess,
+                    modifier = Modifier.width(92.dp)
                 )
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+            // Live Phase Subtitle (never blind during handshake!)
+            Text(
+                text = progress.phase.ifEmpty {
+                    if (progress.isConnecting) "Establishing 5GHz P2P link\u2026"
+                    else if (progress.isSending) "Sending files"
+                    else "Receiving files"
+                },
+                color = if (progress.isConnecting) c.textAccent else c.textSecondary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            // 3-Column Indigo Summary Strip: Items | Size | Speed
+            Surface(
+                color = c.bgActionPrimary,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Text(
-                    text = "${AirDropNode.formatBytes(tp.doneBytes)} of ${AirDropNode.formatBytes(tp.totalBytes)}",
-                    style = DsType.bodySm.merge(TabularNums),
-                    color = c.textSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(DsSpace.space8)) {
-                    if (tp.etaSeconds > 0L) {
-                        Text(
-                            text = "${tp.etaSeconds}s left",
-                            style = DsType.bodySm.merge(TabularNums),
-                            color = c.textTertiary,
-                            maxLines = 1
-                        )
-                    }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 10.dp, horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    MetricColumn(
+                        label = "Items",
+                        value = "${progress.fileCount} ${if (progress.fileCount == 1) "file" else "files"}",
+                        textColor = c.textOnAction,
+                        modifier = Modifier.weight(0.85f)
+                    )
+                    Box(
+                        modifier = Modifier
+                            .width(1.dp)
+                            .height(26.dp)
+                            .background(c.textOnAction.copy(alpha = 0.25f))
+                    )
+                    MetricColumn(
+                        label = "Size",
+                        value = when {
+                            progress.isConnecting && progress.totalBytes > 0L -> AirDropNode.formatBytes(progress.totalBytes)
+                            progress.isConnecting -> "Preparing\u2026"
+                            else -> "${AirDropNode.formatBytes(progress.doneBytes)} / ${AirDropNode.formatBytes(progress.totalBytes)}"
+                        },
+                        textColor = c.textOnAction,
+                        modifier = Modifier.weight(1.4f)
+                    )
+                    Box(
+                        modifier = Modifier
+                            .width(1.dp)
+                            .height(26.dp)
+                            .background(c.textOnAction.copy(alpha = 0.25f))
+                    )
+                    MetricColumn(
+                        label = "Speed",
+                        value = if (progress.isConnecting) "Handshake\u2026" else AirDropNode.formatSpeed(progress.speedBytesPerSec),
+                        textColor = c.textOnAction,
+                        modifier = Modifier.weight(0.95f)
+                    )
+                }
+            }
+
+            // File Details + Progress Bar
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Text(
-                        text = "${tp.percent}%",
-                        style = DsType.bodySm.merge(TabularNums),
-                        fontWeight = FontWeight.SemiBold,
+                        text = middleTruncate(progress.label, 32),
                         color = c.textPrimary,
-                        maxLines = 1
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (progress.isConnecting) {
+                            "Connecting\u2026"
+                        } else if (progress.etaSeconds > 0L) {
+                            "${progress.percent}% · ${progress.etaSeconds}s left"
+                        } else {
+                            "${progress.percent}%"
+                        },
+                        color = c.textSecondary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        style = TextStyle(fontFeatureSettings = "tnum")
+                    )
+                }
+
+                if (progress.isConnecting) {
+                    LinearProgressIndicator(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(CircleShape),
+                        color = c.bgActionPrimary,
+                        trackColor = c.bgAccentSubtle
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        progress = { animatedFraction },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(CircleShape),
+                        color = c.bgActionPrimary,
+                        trackColor = c.bgAccentSubtle
                     )
                 }
             }
@@ -1162,836 +1285,1343 @@ private fun LiveTransferTelemetryCard(
     }
 }
 
-// ============================================================================
-// Tab 0: Nearby Radar & Discovered Devices (Quick Share / AirDrop Reference)
-// ============================================================================
 @Composable
-private fun NearbyRadarTab(
-    running: Boolean,
-    deviceName: String,
-    p2pStatus: String,
-    peers: List<AirDropPeer>,
-    onRescan: () -> Unit,
-    onSendFiles: (AirDropPeer) -> Unit,
-    onSendMedia: (AirDropPeer) -> Unit,
-    onSendTextOrLink: (AirDropPeer) -> Unit
+private fun PeerAvatarNode(
+    title: String,
+    badgeColor: Color,
+    textColor: Color,
+    modifier: Modifier = Modifier
 ) {
     val c = LocalDsColors.current
-    val transition = rememberInfiniteTransition(label = "radar")
-    val pulse by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(DsMotion.durationExtraMs * 3, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "pulse"
-    )
+    val initial = title.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "D"
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        Surface(
+            color = badgeColor,
+            shape = CircleShape,
+            border = BorderStroke(1.5.dp, textColor.copy(alpha = 0.35f)),
+            modifier = Modifier.size(48.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    text = initial,
+                    color = textColor,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 19.sp
+                )
+            }
+        }
+        Text(
+            text = title,
+            color = c.textPrimary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center
+        )
+    }
+}
 
+@Composable
+private fun MetricColumn(
+    label: String,
+    value: String,
+    textColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier.padding(horizontal = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Text(
+            text = label,
+            color = textColor.copy(alpha = 0.8f),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
+        Text(
+            text = value,
+            color = textColor,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = TextStyle(fontFeatureSettings = "tnum")
+        )
+    }
+}
+
+// ============================================================================
+// TAB 0: SEND — Staged Selection Queue + Categories + Storage Donut + Quick Actions
+// ============================================================================
+@Composable
+private fun SendHomeTab(
+    stagedItems: List<StagedFileItem>,
+    peers: List<AirDropPeer>,
+    selectedPeerId: String?,
+    transferActive: Boolean,
+    storage: StorageBreakdown,
+    recentSent: List<ReceivedItem>,
+    onSelectPeer: (String) -> Unit,
+    onRemoveStaged: (StagedFileItem) -> Unit,
+    onClearStaged: () -> Unit,
+    onSendStaged: () -> Unit,
+    onPickImages: () -> Unit,
+    onPickVideos: () -> Unit,
+    onPickDocs: () -> Unit,
+    onPickAudio: () -> Unit,
+    onStageLinkOrText: () -> Unit,
+    onPickAnyFiles: () -> Unit,
+    onSwitchToReceive: () -> Unit,
+    onSwitchToHistory: () -> Unit,
+    onRescan: () -> Unit
+) {
+    val c = LocalDsColors.current
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(DsSpace.space12),
-        contentPadding = PaddingValues(top = DsSpace.space12, bottom = DsSpace.space24)
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 1. Compact Radar Stage
+        // 1. Staged Selected Files Queue (shown whenever files/links are selected — never auto-sends!)
+        if (stagedItems.isNotEmpty()) {
+            item {
+                SelectedFilesStagingCard(
+                    stagedItems = stagedItems,
+                    peers = peers,
+                    selectedPeerId = selectedPeerId,
+                    transferActive = transferActive,
+                    onSelectPeer = onSelectPeer,
+                    onAddMore = onPickAnyFiles,
+                    onRemoveItem = onRemoveStaged,
+                    onClearAll = onClearStaged,
+                    onSendClick = onSendStaged,
+                    onRescan = onRescan
+                )
+            }
+        }
+
+        // 2. Categories 2x3 Grid (Mockup 2 Center: Images, Videos, Docs, Music, Link, Files)
         item {
             Surface(
                 color = c.surfaceRaised,
-                shape = RoundedCornerShape(DsSpace.radius12),
-                border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, c.borderSubtle),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(DsSpace.space16),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(DsSpace.space12)
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    // Header Line inside Radar Stage
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(DsSpace.space6),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(DsSpace.space6)
-                                    .clip(CircleShape)
-                                    .background(if (running) c.textSuccess else c.textTertiary)
-                            )
-                            Text(
-                                text = if (running) "P2P radar active" else "Radar paused",
-                                style = DsType.bodySm,
-                                color = c.textSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
                         Text(
-                            text = if (peers.size == 1) "1 device nearby" else "${peers.size} devices nearby",
-                            style = DsType.bodySm.merge(TabularNums),
-                            fontWeight = FontWeight.Medium,
-                            color = if (peers.isNotEmpty()) c.textSuccess else c.textTertiary,
-                            maxLines = 1
+                            text = "Categories",
+                            color = c.textPrimary,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp
+                        )
+                        Text(
+                            text = "Select files to review before sending",
+                            color = c.textTertiary,
+                            fontSize = 12.sp
                         )
                     }
 
-                    // Radar Ring Graphic (160dp height — compact, restrained, zero clutter)
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(DsSpace.space80 * 2),
-                        contentAlignment = Alignment.Center
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        val ringColor = c.borderSubtle
-                        val pulseColor = c.borderAccent
-                        val strokeThin = DsSpace.borderWidthDefault
-                        val strokeMed = DsSpace.borderWidthSelected
-                        Canvas(modifier = Modifier.size(DsSpace.space80 * 2)) {
-                            val maxR = size.minDimension / 2f
-                            for (i in 1..3) {
-                                drawCircle(
-                                    color = ringColor,
-                                    radius = maxR * (i / 3f),
-                                    style = Stroke(width = strokeThin.toPx())
-                                )
-                            }
-                            if (running) {
-                                drawCircle(
-                                    color = pulseColor.copy(alpha = (1f - pulse) * 0.45f),
-                                    radius = maxR * pulse,
-                                    style = Stroke(width = strokeMed.toPx())
-                                )
-                            }
-                        }
+                        CategoryCircleItem(
+                            label = "Images",
+                            badgeBg = Color(0xFF0EA5E9),
+                            icon = QuickIconKind.IMAGE,
+                            onClick = onPickImages,
+                            modifier = Modifier.weight(1f)
+                        )
+                        CategoryCircleItem(
+                            label = "Videos",
+                            badgeBg = Color(0xFFEC4899),
+                            icon = QuickIconKind.VIDEO,
+                            onClick = onPickVideos,
+                            modifier = Modifier.weight(1f)
+                        )
+                        CategoryCircleItem(
+                            label = "Docs",
+                            badgeBg = Color(0xFF16A34A),
+                            icon = QuickIconKind.DOC,
+                            onClick = onPickDocs,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
 
-                        // Center Self Node
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Box(
-                                modifier = Modifier
-                                    .size(DsSpace.sizeTargetMin)
-                                    .clip(CircleShape)
-                                    .background(c.bgAccentSubtle)
-                                    .border(DsSpace.borderWidthSelected, c.borderAccent, CircleShape),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                DsVectorIcon(kind = IconKind.Phone, tint = c.iconAccent, size = DsSpace.sizeIconMd)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        CategoryCircleItem(
+                            label = "Music",
+                            badgeBg = Color(0xFFF59E0B),
+                            icon = QuickIconKind.AUDIO,
+                            onClick = onPickAudio,
+                            modifier = Modifier.weight(1f)
+                        )
+                        CategoryCircleItem(
+                            label = "Link / Note",
+                            badgeBg = Color(0xFFEF4444),
+                            icon = QuickIconKind.LINK,
+                            onClick = onStageLinkOrText,
+                            modifier = Modifier.weight(1f)
+                        )
+                        CategoryCircleItem(
+                            label = "Files",
+                            badgeBg = Color(0xFF6366F1),
+                            icon = QuickIconKind.FOLDER,
+                            onClick = onPickAnyFiles,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+        }
+
+        // 3. Storage Ring Card (Mockup 1 & Mockup 2 Storage Card)
+        item {
+            StorageOverviewCard(storage = storage)
+        }
+
+        // 4. Primary Send / Receive Action Buttons (Mockup 2 Bottom Action Pair)
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Surface(
+                    color = c.bgActionPrimary,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(54.dp)
+                        .pressableScale(
+                            onClick = {
+                                if (stagedItems.isEmpty()) onPickAnyFiles() else onSendStaged()
                             }
-                            Spacer(Modifier.height(DsSpace.space4))
+                        )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        QuickVectorIcon(kind = QuickIconKind.SEND, tint = c.textOnAction, size = 18.dp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (stagedItems.isEmpty()) "Select Files" else "Send (${stagedItems.size})",
+                            color = c.textOnAction,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp,
+                            maxLines = 1
+                        )
+                    }
+                }
+
+                Surface(
+                    color = c.bgSuccessBold,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(54.dp)
+                        .pressableScale(onClick = onSwitchToReceive)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        QuickVectorIcon(kind = QuickIconKind.RECEIVE, tint = c.textOnSuccess, size = 18.dp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Receive",
+                            color = c.textOnSuccess,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+        }
+
+        // 5. Recent Sent Preview
+        if (recentSent.isNotEmpty()) {
+            item {
+                Surface(
+                    color = c.surfaceRaised,
+                    shape = RoundedCornerShape(20.dp),
+                    border = BorderStroke(1.dp, c.borderSubtle),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
                             Text(
-                                text = deviceName,
-                                style = DsType.bodySm,
-                                fontWeight = FontWeight.Medium,
+                                text = "Recently Sent",
                                 color = c.textPrimary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp
+                            )
+                            Text(
+                                text = "View all",
+                                color = c.textAccent,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.clickable(onClick = onSwitchToHistory)
                             )
                         }
-
-                        // Discovered Peers Plotted on Radar
-                        peers.take(3).forEachIndexed { idx, peer ->
-                            val angleRad = Math.toRadians(-45.0 + idx * 110.0)
-                            val radiusDp = DsSpace.space64
-                            Surface(
-                                color = c.surfaceOverlay,
-                                shape = RoundedCornerShape(DsSpace.radiusFull),
-                                border = BorderStroke(DsSpace.borderWidthDefault, c.borderSuccess),
-                                modifier = Modifier
-                                    .offset {
-                                        IntOffset(
-                                            x = (cos(angleRad) * radiusDp.toPx()).roundToInt(),
-                                            y = (sin(angleRad) * radiusDp.toPx()).roundToInt()
-                                        )
-                                    }
-                                    .pressableScale { onSendFiles(peer) }
+                        recentSent.forEach { sent ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = DsSpace.space8, vertical = DsSpace.space4),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(DsSpace.space4)
+                                Surface(
+                                    color = c.bgAccentSubtle,
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.size(36.dp)
                                 ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(DsSpace.space6)
-                                            .clip(CircleShape)
-                                            .background(c.textSuccess)
+                                    Box(contentAlignment = Alignment.Center) {
+                                        QuickVectorIcon(kind = QuickIconKind.UPLOAD, tint = c.iconAccent, size = 16.dp)
+                                    }
+                                }
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = middleTruncate(sent.title, 30),
+                                        color = c.textPrimary,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = peer.name.substringBefore(" (").take(16),
-                                        style = DsType.bodySm,
-                                        fontWeight = FontWeight.Medium,
-                                        color = c.textPrimary,
+                                        text = "To ${sent.peerName} · ${AirDropNode.formatBytes(sent.sizeBytes)}",
+                                        color = c.textSecondary,
+                                        fontSize = 11.sp,
+                                        style = TextStyle(fontFeatureSettings = "tnum"),
                                         maxLines = 1
                                     )
                                 }
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
 
-                    // Bottom Radio Status Bar inside Stage (8dp nested radius)
+@Composable
+private fun SelectedFilesStagingCard(
+    stagedItems: List<StagedFileItem>,
+    peers: List<AirDropPeer>,
+    selectedPeerId: String?,
+    transferActive: Boolean,
+    onSelectPeer: (String) -> Unit,
+    onAddMore: () -> Unit,
+    onRemoveItem: (StagedFileItem) -> Unit,
+    onClearAll: () -> Unit,
+    onSendClick: () -> Unit,
+    onRescan: () -> Unit
+) {
+    val c = LocalDsColors.current
+    val totalBytes = stagedItems.sumOf { it.sizeBytes }
+    val activePeer = peers.firstOrNull { it.id == selectedPeerId } ?: peers.firstOrNull()
+
+    Surface(
+        color = c.surfaceRaised,
+        shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(1.5.dp, c.borderAccent),
+        shadowElevation = 2.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // Header: N Files Selected + Add More + Clear
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "${stagedItems.size} ${if (stagedItems.size == 1) "file" else "files"} selected",
+                        color = c.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
+                    )
+                    Text(
+                        text = "Total ${AirDropNode.formatBytes(totalBytes)} · Ready to send",
+                        color = c.textSecondary,
+                        fontSize = 12.sp,
+                        style = TextStyle(fontFeatureSettings = "tnum")
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Surface(
+                        color = c.bgAccentSubtle,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.pressableScale(onClick = onAddMore)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            QuickVectorIcon(kind = QuickIconKind.PLUS, tint = c.textAccent, size = 13.dp)
+                            Text("Add", color = c.textAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                    Surface(
+                        color = c.bgNeutralSubtle,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.pressableScale(onClick = onClearAll)
+                    ) {
+                        Text(
+                            text = "Clear",
+                            color = c.textSecondary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                        )
+                    }
+                }
+            }
+
+            // File rows (scrollable up to 220dp when many files are selected)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 220.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                stagedItems.forEach { item ->
                     Surface(
                         color = c.surfaceSunken,
-                        shape = RoundedCornerShape(DsSpace.radius8),
-                        border = BorderStroke(DsSpace.borderWidthDefault, c.borderSeparator),
+                        shape = RoundedCornerShape(12.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = DsSpace.space12, vertical = DsSpace.space8),
+                                .padding(horizontal = 12.dp, vertical = 9.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(DsSpace.space8)
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Text(
-                                text = p2pStatus,
-                                style = DsType.bodySm.merge(TabularNums),
-                                color = c.textSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f)
-                            )
-                            Text(
-                                text = "Rescan",
-                                style = DsType.bodySm,
-                                fontWeight = FontWeight.SemiBold,
-                                color = c.textLink,
+                            val badgeTint = when (item.category) {
+                                "Image" -> Color(0xFF0EA5E9)
+                                "Video" -> Color(0xFFEC4899)
+                                "Doc" -> Color(0xFF16A34A)
+                                "Audio" -> Color(0xFFF59E0B)
+                                "Link" -> Color(0xFFEF4444)
+                                else -> Color(0xFF6366F1)
+                            }
+                            Surface(
+                                color = badgeTint.copy(alpha = 0.16f),
+                                shape = RoundedCornerShape(9.dp),
+                                modifier = Modifier.size(34.dp)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    QuickVectorIcon(
+                                        kind = when (item.category) {
+                                            "Image" -> QuickIconKind.IMAGE
+                                            "Video" -> QuickIconKind.VIDEO
+                                            "Doc" -> QuickIconKind.DOC
+                                            "Audio" -> QuickIconKind.AUDIO
+                                            "Link" -> QuickIconKind.LINK
+                                            else -> QuickIconKind.FOLDER
+                                        },
+                                        tint = badgeTint,
+                                        size = 16.dp
+                                    )
+                                }
+                            }
+
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = middleTruncate(item.name, 30),
+                                    color = c.textPrimary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "${item.category} · ${AirDropNode.formatBytes(item.sizeBytes)}",
+                                    color = c.textSecondary,
+                                    fontSize = 11.sp,
+                                    style = TextStyle(fontFeatureSettings = "tnum")
+                                )
+                            }
+
+                            Box(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(DsSpace.radius4))
-                                    .pressableScale(onClick = onRescan)
-                                    .padding(horizontal = DsSpace.space6, vertical = DsSpace.space2)
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .clickable { onRemoveItem(item) },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                QuickVectorIcon(kind = QuickIconKind.CLOSE, tint = c.textTertiary, size = 14.dp)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Target Peer Selector Strip
+            Surface(
+                color = c.surfaceSunken,
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, c.borderSubtle),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                if (activePeer != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                if (peers.size > 1) {
+                                    val idx = peers.indexOfFirst { it.id == activePeer.id }
+                                    val next = peers[(idx + 1) % peers.size]
+                                    onSelectPeer(next.id)
+                                }
+                            }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(9.dp)
+                                .clip(CircleShape)
+                                .background(c.bgSuccessBold)
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Destination: ${activePeer.name.substringBefore(" (PSM")}",
+                                color = c.textPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
+                            Text(
+                                text = "${activePeer.transport} · ${activePeer.rssi} dBm",
+                                color = c.textSecondary,
+                                fontSize = 11.sp,
+                                style = TextStyle(fontFeatureSettings = "tnum")
+                            )
+                        }
+                        SignalStrengthBars(rssi = activePeer.rssi)
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Scanning nearby Mac over BLE…",
+                            color = c.textSecondary,
+                            fontSize = 12.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            text = "Rescan",
+                            color = c.textAccent,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clickable(onClick = onRescan)
+                        )
+                    }
+                }
+            }
+
+            // Explicit Primary SEND Button
+            Button(
+                enabled = !transferActive,
+                onClick = onSendClick,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = c.bgActionPrimary,
+                    contentColor = c.textOnAction,
+                    disabledContainerColor = c.bgDisabled,
+                    disabledContentColor = c.textDisabled
+                ),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+            ) {
+                QuickVectorIcon(
+                    kind = QuickIconKind.SEND,
+                    tint = if (!transferActive) c.textOnAction else c.textDisabled,
+                    size = 18.dp
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (transferActive) {
+                        "Transfer in progress\u2026"
+                    } else {
+                        "Send ${stagedItems.size} ${if (stagedItems.size == 1) "File" else "Files"} (${AirDropNode.formatBytes(totalBytes)})"
+                    },
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    style = TextStyle(fontFeatureSettings = "tnum"),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CategoryCircleItem(
+    label: String,
+    badgeBg: Color,
+    icon: QuickIconKind,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val c = LocalDsColors.current
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .pressableScale(onClick = onClick)
+            .padding(vertical = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(7.dp)
+    ) {
+        Surface(
+            color = badgeBg,
+            shape = CircleShape,
+            shadowElevation = 2.dp,
+            modifier = Modifier.size(52.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                QuickVectorIcon(kind = icon, tint = Color.White, size = 22.dp)
+            }
+        }
+        Text(
+            text = label,
+            color = c.textPrimary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun StorageOverviewCard(storage: StorageBreakdown) {
+    val c = LocalDsColors.current
+    val usedFraction = (storage.usedBytes.toFloat() / storage.totalBytes.coerceAtLeast(1L).toFloat()).coerceIn(0.04f, 0.96f)
+    val freeGb = storage.freeBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+    val totalGb = storage.totalBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+
+    Surface(
+        color = c.surfaceRaised,
+        shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(1.dp, c.borderSubtle),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(18.dp)
+        ) {
+            // Segmented Storage Donut Ring (Mockup 1 Center)
+            Box(
+                modifier = Modifier.size(104.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                val trackColor = c.surfaceSunken
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val strokeW = 11.dp.toPx()
+                    val inset = strokeW / 2f + 2f
+                    val arcSize = Size(size.width - inset * 2, size.height - inset * 2)
+                    drawArc(
+                        color = trackColor,
+                        startAngle = 0f,
+                        sweepAngle = 360f,
+                        useCenter = false,
+                        topLeft = Offset(inset, inset),
+                        size = arcSize,
+                        style = Stroke(width = strokeW, cap = StrokeCap.Round)
+                    )
+                    val totalSweep = usedFraction * 330f
+                    val seg1 = totalSweep * 0.48f
+                    val seg2 = totalSweep * 0.30f
+                    val seg3 = totalSweep * 0.22f
+                    drawArc(
+                        color = Color(0xFF5360F5),
+                        startAngle = -90f,
+                        sweepAngle = seg1,
+                        useCenter = false,
+                        topLeft = Offset(inset, inset),
+                        size = arcSize,
+                        style = Stroke(width = strokeW, cap = StrokeCap.Butt)
+                    )
+                    drawArc(
+                        color = Color(0xFFEC4899),
+                        startAngle = -90f + seg1,
+                        sweepAngle = seg2,
+                        useCenter = false,
+                        topLeft = Offset(inset, inset),
+                        size = arcSize,
+                        style = Stroke(width = strokeW, cap = StrokeCap.Butt)
+                    )
+                    drawArc(
+                        color = Color(0xFF16A34A),
+                        startAngle = -90f + seg1 + seg2,
+                        sweepAngle = seg3,
+                        useCenter = false,
+                        topLeft = Offset(inset, inset),
+                        size = arcSize,
+                        style = Stroke(width = strokeW, cap = StrokeCap.Butt)
+                    )
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = String.format(Locale.US, "%.1f GB", freeGb),
+                        color = c.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        style = TextStyle(fontFeatureSettings = "tnum")
+                    )
+                    Text(
+                        text = "Available",
+                        color = c.textTertiary,
+                        fontSize = 10.sp
+                    )
+                }
+            }
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text(
+                    text = "Internal Storage",
+                    color = c.textPrimary,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp
+                )
+                Text(
+                    text = String.format(Locale.US, "%.1f GB free of %.0f GB", freeGb, totalGb),
+                    color = c.textSecondary,
+                    fontSize = 12.sp,
+                    style = TextStyle(fontFeatureSettings = "tnum")
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                StorageLegendDot(color = Color(0xFF5360F5), label = "Media & Videos")
+                StorageLegendDot(color = Color(0xFFEC4899), label = "Photos & Audio")
+                StorageLegendDot(color = Color(0xFF16A34A), label = "Documents & Apps")
+            }
+        }
+    }
+}
+
+@Composable
+private fun StorageLegendDot(color: Color, label: String) {
+    val c = LocalDsColors.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(color)
+        )
+        Text(text = label, color = c.textSecondary, fontSize = 11.sp, maxLines = 1)
+    }
+}
+
+// ============================================================================
+// TAB 1: RECEIVE — Concentric Pulse Radar ("Looking for Connections…") + Available Devices
+// ============================================================================
+@Composable
+private fun ReceiveRadarTab(
+    running: Boolean,
+    deviceName: String,
+    autoAccept: Boolean,
+    peers: List<AirDropPeer>,
+    p2pStatus: String,
+    recentReceived: List<ReceivedItem>,
+    onToggleAutoAccept: (Boolean) -> Unit,
+    onRescan: () -> Unit,
+    onStartSendToPeer: (AirDropPeer) -> Unit,
+    onOpenHistoryItem: (ReceivedItem) -> Unit,
+    onViewAllReceived: () -> Unit
+) {
+    val c = LocalDsColors.current
+    val pulseTransition = rememberInfiniteTransition(label = "receiveRadar")
+    val radarWave by pulseTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2400, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "radarWave"
+    )
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        // Scanning Header + Concentric Radar Card (Mockup 1 Right)
+        item {
+            Surface(
+                color = c.surfaceRaised,
+                shape = RoundedCornerShape(22.dp),
+                border = BorderStroke(1.dp, c.borderSubtle),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "Nearby Bluetooth & 5GHz Wi-Fi Direct",
+                        color = c.textSecondary,
+                        fontSize = 13.sp
+                    )
+                    Text(
+                        text = if (!running) {
+                            "Receiver Paused"
+                        } else if (peers.isEmpty()) {
+                            "Looking for Connections\u2026"
+                        } else {
+                            "${peers.size} ${if (peers.size == 1) "Device" else "Devices"} Nearby"
+                        },
+                        color = c.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 22.sp
+                    )
+
+                    // Concentric Periwinkle/Indigo Radar Visual
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(228.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        val accentColor = c.bgActionPrimary
+                        Canvas(modifier = Modifier.size(216.dp)) {
+                            val center = Offset(size.width / 2f, size.height / 2f)
+                            val maxR = size.minDimension / 2f
+                            drawCircle(color = accentColor.copy(alpha = 0.08f), radius = maxR, center = center)
+                            drawCircle(color = accentColor.copy(alpha = 0.14f), radius = maxR * 0.72f, center = center)
+                            drawCircle(color = accentColor.copy(alpha = 0.24f), radius = maxR * 0.46f, center = center)
+                            if (running) {
+                                val pulseR = maxR * (0.28f + 0.72f * radarWave)
+                                drawCircle(
+                                    color = accentColor.copy(alpha = (1f - radarWave) * 0.35f),
+                                    radius = pulseR,
+                                    center = center,
+                                    style = Stroke(width = 2.5.dp.toPx())
+                                )
+                            }
+                        }
+
+                        // Central Bluetooth / P2P Badge
+                        Surface(
+                            color = c.bgActionPrimary,
+                            shape = CircleShape,
+                            shadowElevation = 6.dp,
+                            modifier = Modifier
+                                .size(62.dp)
+                                .pressableScale(onClick = onRescan)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                QuickVectorIcon(kind = QuickIconKind.BLUETOOTH, tint = Color.White, size = 26.dp)
+                            }
+                        }
+
+                        // Orbiting Live Peer Avatar (when discovered)
+                        peers.firstOrNull()?.let { firstPeer ->
+                            val cleanTitle = firstPeer.name.substringBefore(" (PSM")
+                            Surface(
+                                color = c.surfaceRaised,
+                                shape = CircleShape,
+                                border = BorderStroke(2.dp, c.bgSuccessBold),
+                                shadowElevation = 4.dp,
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(end = 26.dp, top = 18.dp)
+                                    .pressableScale { onStartSendToPeer(firstPeer) }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(c.bgSuccessBold)
+                                    )
+                                    Text(
+                                        text = middleTruncate(cleanTitle, 16),
+                                        color = c.textPrimary,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Receive Approval Quick Toggle Strip
+                    Surface(
+                        color = c.surfaceSunken,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Visible as \"$deviceName\"",
+                                    color = c.textPrimary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = if (autoAccept) "Auto-accepting incoming files to Downloads/AirDrop" else "Ask before saving incoming files",
+                                    color = c.textSecondary,
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                FilterChipPill(
+                                    label = "Ask First",
+                                    selected = !autoAccept,
+                                    onClick = { onToggleAutoAccept(false) }
+                                )
+                                FilterChipPill(
+                                    label = "Auto",
+                                    selected = autoAccept,
+                                    onClick = { onToggleAutoAccept(true) }
+                                )
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 2. Section Heading
+        // Available Devices List (Mockup 1 Right Bottom)
         item {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = DsSpace.space4),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Nearby devices",
-                    style = DsType.titleSm,
-                    color = c.textPrimary
-                )
-                Text(
-                    text = "Tap a device to send",
-                    style = DsType.bodySm,
-                    color = c.textTertiary
-                )
-            }
+            Text(
+                text = "Available Devices",
+                color = c.textPrimary,
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp,
+                modifier = Modifier.padding(horizontal = 4.dp)
+            )
         }
 
-        // 3. Peer List or Empty State
         if (peers.isEmpty()) {
             item {
                 Surface(
                     color = c.surfaceRaised,
-                    shape = RoundedCornerShape(DsSpace.radius12),
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, c.borderSubtle),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(DsSpace.space16),
-                        verticalAlignment = Alignment.Top,
-                        horizontalArrangement = Arrangement.spacedBy(DsSpace.space12)
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(DsSpace.sizeControlMd)
-                                .clip(RoundedCornerShape(DsSpace.radius8))
-                                .background(c.surfaceSunken),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            DsVectorIcon(kind = IconKind.Laptop, tint = c.iconSubtle, size = DsSpace.sizeIconMd)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Waiting for nearby Mac…",
+                                color = c.textPrimary,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = p2pStatus,
+                                color = c.textSecondary,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
                         }
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(DsSpace.space4)
+                        OutlinedButton(
+                            onClick = onRescan,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, c.borderDefault)
                         ) {
-                            Text(
-                                text = "Looking for nearby devices\u2026",
-                                style = DsType.titleSm,
-                                color = c.textPrimary
-                            )
-                            Text(
-                                text = "Open AirDrop P2P on your Mac or another Android device with Bluetooth enabled. Only live devices within range appear here.",
-                                style = DsType.bodyMd,
-                                color = c.textSecondary
-                            )
+                            Text("Rescan", color = c.textAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
             }
         } else {
             items(peers, key = { it.id }) { peer ->
-                PeerDeviceCard(
-                    peer = peer,
-                    onSendFiles = { onSendFiles(peer) },
-                    onSendMedia = { onSendMedia(peer) },
-                    onSendTextOrLink = { onSendTextOrLink(peer) }
+                val cleanName = peer.name.substringBefore(" (PSM")
+                Surface(
+                    color = c.surfaceRaised,
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, c.borderSubtle),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Surface(
+                            color = c.bgAccentSubtle,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.size(46.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = cleanName.firstOrNull()?.uppercase() ?: "M",
+                                    color = c.textAccent,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 18.sp
+                                )
+                            }
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = cleanName,
+                                color = c.textPrimary,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "${peer.transport} · ${peer.rssi} dBm",
+                                color = c.textSecondary,
+                                fontSize = 12.sp,
+                                style = TextStyle(fontFeatureSettings = "tnum")
+                            )
+                        }
+                        Button(
+                            onClick = { onStartSendToPeer(peer) },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = c.bgActionPrimary,
+                                contentColor = c.textOnAction
+                            ),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                        ) {
+                            Text("Send Files", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recently Received Section
+        if (recentReceived.isNotEmpty()) {
+            item {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Recently Received",
+                        color = c.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
+                    )
+                    Text(
+                        text = "View all",
+                        color = c.textAccent,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clickable(onClick = onViewAllReceived)
+                    )
+                }
+            }
+            items(recentReceived, key = { "${it.timestampMs}-${it.title}" }) { rx ->
+                Surface(
+                    color = c.surfaceRaised,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, c.borderSubtle),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onOpenHistoryItem(rx) }
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Surface(
+                            color = c.bgSuccessSubtle,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.size(38.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                QuickVectorIcon(kind = QuickIconKind.DOWNLOAD, tint = c.textSuccess, size = 16.dp)
+                            }
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = middleTruncate(rx.title, 30),
+                                color = c.textPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "From ${rx.peerName} · ${AirDropNode.formatBytes(rx.sizeBytes)}",
+                                color = c.textSecondary,
+                                fontSize = 11.sp,
+                                style = TextStyle(fontFeatureSettings = "tnum")
+                            )
+                        }
+                        Text(
+                            text = "Open",
+                            color = c.textAccent,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// TAB 2: HISTORY — Search Bar + Filter Pills + Received / Sent File Cards
+// ============================================================================
+@Composable
+private fun TransfersHistoryScreen(
+    items: List<ReceivedItem>,
+    filter: Int,
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onFilterChange: (Int) -> Unit,
+    onOpenItem: (ReceivedItem) -> Unit,
+    onShareItem: (ReceivedItem) -> Unit,
+    onCopyText: (String) -> Unit,
+    onClearAll: () -> Unit
+) {
+    val c = LocalDsColors.current
+    val filtered = remember(items, filter, query) {
+        items.filter { item ->
+            val dirMatch = when (filter) {
+                1 -> !item.isOutgoing
+                2 -> item.isOutgoing
+                else -> true
+            }
+            val q = query.trim()
+            val qMatch = q.isEmpty() ||
+                item.title.contains(q, ignoreCase = true) ||
+                item.peerName.contains(q, ignoreCase = true) ||
+                item.pathOrUrl.contains(q, ignoreCase = true)
+            dirMatch && qMatch
+        }
+    }
+    val fmt = remember { SimpleDateFormat("MMM d, HH:mm", Locale.US) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        // Search Bar (Mockup 1 Center: "Search for a File...")
+        OutlinedTextField(
+            value = query,
+            onValueChange = onQueryChange,
+            singleLine = true,
+            placeholder = { Text("Search for a file or device…", color = c.textTertiary, fontSize = 13.sp) },
+            leadingIcon = {
+                QuickVectorIcon(kind = QuickIconKind.SEARCH, tint = c.iconSubtle, size = 17.dp)
+            },
+            trailingIcon = {
+                if (query.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .size(28.dp)
+                            .clip(CircleShape)
+                            .clickable { onQueryChange("") },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        QuickVectorIcon(kind = QuickIconKind.CLOSE, tint = c.iconSubtle, size = 13.dp)
+                    }
+                }
+            },
+            shape = RoundedCornerShape(14.dp),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChipPill("All (${items.size})", filter == 0) { onFilterChange(0) }
+                FilterChipPill("Received", filter == 1) { onFilterChange(1) }
+                FilterChipPill("Sent", filter == 2) { onFilterChange(2) }
+            }
+            if (items.isNotEmpty()) {
+                Text(
+                    text = "Clear",
+                    color = c.textDanger,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.clickable(onClick = onClearAll)
                 )
             }
         }
-    }
-}
 
-// ============================================================================
-// Peer Device Card — Overflow-proof, nested corners, 1 primary + 2 secondary actions
-// ============================================================================
-@Composable
-private fun PeerDeviceCard(
-    peer: AirDropPeer,
-    onSendFiles: () -> Unit,
-    onSendMedia: () -> Unit,
-    onSendTextOrLink: () -> Unit
-) {
-    val c = LocalDsColors.current
-    val cleanName = peer.name.substringBefore(" (")
-    val isMac = cleanName.contains("Mac", ignoreCase = true) || peer.name.contains("Mac", ignoreCase = true)
-
-    Surface(
-        color = c.surfaceRaised,
-        shape = RoundedCornerShape(DsSpace.radius12),
-        border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(DsSpace.space16),
-            verticalArrangement = Arrangement.spacedBy(DsSpace.space12)
-        ) {
-            // Top Row: Device Icon + Name/Transport (weight(1f)) + Signal Bars (flex-shrink: 0)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(DsSpace.space12)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(DsSpace.sizeControlMd)
-                        .clip(RoundedCornerShape(DsSpace.radius8))
-                        .background(c.bgAccentSubtle),
-                    contentAlignment = Alignment.Center
-                ) {
-                    DsVectorIcon(
-                        kind = if (isMac) IconKind.Laptop else IconKind.Phone,
-                        tint = c.iconAccent,
-                        size = DsSpace.sizeIconMd
-                    )
-                }
-
-                // weight(1f) guarantees long device names or transport strings NEVER push signal bars off-screen
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
-                ) {
-                    Text(
-                        text = cleanName,
-                        style = DsType.titleSm,
-                        color = c.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(DsSpace.space6)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(DsSpace.space6)
-                                .clip(CircleShape)
-                                .background(c.textSuccess)
-                        )
-                        Text(
-                            text = "${peer.transport} · ${peer.rssi} dBm",
-                            style = DsType.bodySm.merge(TabularNums),
-                            color = c.textSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
-
-                // Signal Bars Indicator (fixed 20dp width, never squished)
-                SignalBarsIndicator(rssi = peer.rssi, activeColor = c.textSuccess, inactiveColor = c.borderSubtle)
-            }
-
-            // Action Controls: 1 Primary CTA ("Send files") + 2 quiet secondary buttons ("Media", "Link")
-            // Follows OpenDesigner making.md §10: "One primary button for the one action the view exists for"
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(DsSpace.space8),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                // Primary Action Button
-                Surface(
-                    color = c.bgActionPrimary,
-                    shape = RoundedCornerShape(DsSpace.radiusControl),
-                    modifier = Modifier
-                        .weight(1.25f)
-                        .height(DsSpace.sizeControlMd)
-                        .pressableScale(onClick = onSendFiles)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(horizontal = DsSpace.space12),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        DsVectorIcon(kind = IconKind.File, tint = c.textOnAction, size = DsSpace.sizeIconSm)
-                        Spacer(Modifier.width(DsSpace.space6))
-                        Text(
-                            text = "Send files",
-                            style = DsType.labelLg,
-                            fontWeight = FontWeight.SemiBold,
-                            color = c.textOnAction,
-                            maxLines = 1
-                        )
-                    }
-                }
-
-                // Secondary Action: Media
-                Surface(
-                    color = c.bgNeutralSubtle,
-                    shape = RoundedCornerShape(DsSpace.radiusControl),
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                    modifier = Modifier
-                        .weight(0.9f)
-                        .height(DsSpace.sizeControlMd)
-                        .pressableScale(onClick = onSendMedia)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(horizontal = DsSpace.space8),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        DsVectorIcon(kind = IconKind.Image, tint = c.iconDefault, size = DsSpace.sizeIconSm)
-                        Spacer(Modifier.width(DsSpace.space6))
-                        Text(
-                            text = "Media",
-                            style = DsType.labelLg,
-                            color = c.textPrimary,
-                            maxLines = 1
-                        )
-                    }
-                }
-
-                // Secondary Action: Link / Text
-                Surface(
-                    color = c.bgNeutralSubtle,
-                    shape = RoundedCornerShape(DsSpace.radiusControl),
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                    modifier = Modifier
-                        .weight(0.85f)
-                        .height(DsSpace.sizeControlMd)
-                        .pressableScale(onClick = onSendTextOrLink)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(horizontal = DsSpace.space8),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        DsVectorIcon(kind = IconKind.Link, tint = c.iconDefault, size = DsSpace.sizeIconSm)
-                        Spacer(Modifier.width(DsSpace.space6))
-                        Text(
-                            text = "Link",
-                            style = DsType.labelLg,
-                            color = c.textPrimary,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SignalBarsIndicator(rssi: Int, activeColor: Color, inactiveColor: Color) {
-    val bars = when {
-        rssi >= -55 -> 4
-        rssi >= -68 -> 3
-        rssi >= -80 -> 2
-        else -> 1
-    }
-    Row(
-        verticalAlignment = Alignment.Bottom,
-        horizontalArrangement = Arrangement.spacedBy(DsSpace.space2),
-        modifier = Modifier
-            .width(DsSpace.space20)
-            .height(DsSpace.space16)
-    ) {
-        for (b in 1..4) {
+        if (filtered.isEmpty()) {
             Box(
                 modifier = Modifier
-                    .width(DsSpace.space4)
-                    .height(DsSpace.space4 * b)
-                    .clip(RoundedCornerShape(DsSpace.radius2))
-                    .background(if (b <= bars) activeColor else inactiveColor)
-            )
-        }
-    }
-}
-
-// ============================================================================
-// Tab 1: Transfer History — Clean 2-Card KPI Row + Overflow-Free Filter Bar
-// ============================================================================
-@Composable
-private fun TransfersHistoryTab(
-    items: List<ReceivedItem>,
-    filter: Int,
-    onFilterChange: (Int) -> Unit,
-    onOpenDownloads: () -> Unit,
-    onClearHistory: () -> Unit,
-    onOpenItem: (ReceivedItem) -> Unit,
-    onShareItem: (ReceivedItem) -> Unit
-) {
-    val c = LocalDsColors.current
-    val context = LocalContext.current
-    val filteredItems = remember(items, filter) {
-        when (filter) {
-            1 -> items.filter { !it.isOutgoing }
-            2 -> items.filter { it.isOutgoing }
-            else -> items
-        }
-    }
-    val receivedCount = remember(items) { items.count { !it.isOutgoing } }
-    val sentCount = remember(items) { items.count { it.isOutgoing } }
-    val totalReceivedBytes = remember(items) { items.filter { !it.isOutgoing }.sumOf { it.sizeBytes } }
-    val totalSentBytes = remember(items) { items.filter { it.isOutgoing }.sumOf { it.sizeBytes } }
-
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(DsSpace.space12),
-        contentPadding = PaddingValues(top = DsSpace.space12, bottom = DsSpace.space24)
-    ) {
-        // 1. Sibling KPI Summary Cards (Share top edge and height per OpenDesigner quality.md)
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(DsSpace.space12)
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentAlignment = Alignment.Center
             ) {
-                Surface(
-                    color = c.surfaceRaised,
-                    shape = RoundedCornerShape(DsSpace.radius12),
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(DsSpace.space12),
-                        verticalArrangement = Arrangement.spacedBy(DsSpace.space4)
-                    ) {
-                        Text(
-                            text = "Received",
-                            style = DsType.bodySm,
-                            color = c.textSecondary,
-                            maxLines = 1
-                        )
-                        Text(
-                            text = AirDropNode.formatBytes(totalReceivedBytes),
-                            style = DsType.numericLg.merge(TabularNums),
-                            color = c.textPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = if (receivedCount == 1) "1 file saved" else "$receivedCount files saved",
-                            style = DsType.bodySm.merge(TabularNums),
-                            color = c.textTertiary,
-                            maxLines = 1
-                        )
-                    }
-                }
-                Surface(
-                    color = c.surfaceRaised,
-                    shape = RoundedCornerShape(DsSpace.radius12),
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(DsSpace.space12),
-                        verticalArrangement = Arrangement.spacedBy(DsSpace.space4)
-                    ) {
-                        Text(
-                            text = "Sent",
-                            style = DsType.bodySm,
-                            color = c.textSecondary,
-                            maxLines = 1
-                        )
-                        Text(
-                            text = AirDropNode.formatBytes(totalSentBytes),
-                            style = DsType.numericLg.merge(TabularNums),
-                            color = c.textPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = if (sentCount == 1) "1 file sent" else "$sentCount files sent",
-                            style = DsType.bodySm.merge(TabularNums),
-                            color = c.textTertiary,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
-        }
-
-        // 2. Segmented Filter + Folder/Clear Bar (Overflow-proof: segmented control on left, compact actions on right)
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                // Segmented Control container (8dp outer radius, 6dp inner pills)
-                Surface(
-                    color = c.surfaceSunken,
-                    shape = RoundedCornerShape(DsSpace.radius8),
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderSeparator)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(DsSpace.space2),
-                        horizontalArrangement = Arrangement.spacedBy(DsSpace.space2)
-                    ) {
-                        listOf("All", "Received", "Sent").forEachIndexed { idx, title ->
-                            val active = filter == idx
-                            Surface(
-                                color = if (active) c.surfaceRaised else Color.Transparent,
-                                shape = RoundedCornerShape(DsSpace.radiusControl),
-                                modifier = Modifier.pressableScale { onFilterChange(idx) }
-                            ) {
-                                Text(
-                                    text = title,
-                                    style = DsType.labelMd,
-                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                                    color = if (active) c.textPrimary else c.textSecondary,
-                                    maxLines = 1,
-                                    modifier = Modifier.padding(horizontal = DsSpace.space12, vertical = DsSpace.space6)
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // Right Actions (Folder & Clear)
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(DsSpace.space6)
-                ) {
-                    Surface(
-                        color = c.surfaceRaised,
-                        shape = RoundedCornerShape(DsSpace.radiusControl),
-                        border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                        modifier = Modifier
-                            .height(DsSpace.sizeControlSm)
-                            .pressableScale(onClick = onOpenDownloads)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = DsSpace.space8),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(DsSpace.space4)
-                        ) {
-                            DsVectorIcon(kind = IconKind.Folder, tint = c.iconDefault, size = DsSpace.sizeIconSm)
-                            Text(
-                                text = "Folder",
-                                style = DsType.labelMd,
-                                color = c.textPrimary,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                    if (items.isNotEmpty()) {
-                        Surface(
-                            color = c.surfaceRaised,
-                            shape = RoundedCornerShape(DsSpace.radiusControl),
-                            border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                            modifier = Modifier
-                                .height(DsSpace.sizeControlSm)
-                                .pressableScale(onClick = onClearHistory)
-                        ) {
-                            Box(
-                                modifier = Modifier.padding(horizontal = DsSpace.space8),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = "Clear",
-                                    style = DsType.labelMd,
-                                    color = c.textSecondary,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. History List or Empty State
-        if (filteredItems.isEmpty()) {
-            item {
-                Surface(
-                    color = c.surfaceRaised,
-                    shape = RoundedCornerShape(DsSpace.radius12),
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(DsSpace.space24),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(DsSpace.space6)
-                    ) {
-                        DsVectorIcon(kind = IconKind.Folder, tint = c.iconSubtle, size = DsSpace.sizeIconLg)
-                        Text(
-                            text = "No transfers yet",
-                            style = DsType.titleSm,
-                            color = c.textPrimary
-                        )
-                        Text(
-                            text = "Files and links you send or receive appear here.",
-                            style = DsType.bodyMd,
-                            color = c.textSecondary,
-                            textAlign = TextAlign.Center
-                        )
-                    }
-                }
+                Text(
+                    text = if (items.isEmpty()) "No transfer history yet" else "No matching files found",
+                    color = c.textTertiary,
+                    fontSize = 14.sp
+                )
             }
         } else {
-            items(filteredItems, key = { "${it.timestampMs}_${it.title}" }) { item ->
-                val timeStr = remember(item.timestampMs) {
-                    SimpleDateFormat("HH:mm · MMM d", Locale.US).format(Date(item.timestampMs))
-                }
-                val iconKind = remember(item.title, item.isUrl) {
-                    when {
-                        item.isUrl -> IconKind.Link
-                        item.title.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "webp", "heic", "gif", "mp4", "mov", "mkv") -> IconKind.Image
-                        else -> IconKind.File
-                    }
-                }
-
-                Surface(
-                    color = c.surfaceRaised,
-                    shape = RoundedCornerShape(DsSpace.radius12),
-                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(DsSpace.space12),
-                        verticalArrangement = Arrangement.spacedBy(DsSpace.space8)
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(filtered, key = { "${it.timestampMs}-${it.title}-${it.isOutgoing}" }) { item ->
+                    Surface(
+                        color = c.surfaceRaised,
+                        shape = RoundedCornerShape(16.dp),
+                        border = BorderStroke(1.dp, c.borderSubtle),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(DsSpace.space12)
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(DsSpace.sizeControlMd)
-                                    .clip(RoundedCornerShape(DsSpace.radius8))
-                                    .background(c.surfaceSunken),
-                                contentAlignment = Alignment.Center
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                DsVectorIcon(kind = iconKind, tint = c.iconDefault, size = DsSpace.sizeIconSm)
-                            }
-
-                            Column(
-                                modifier = Modifier.weight(1f),
-                                verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
-                            ) {
-                                Text(
-                                    text = middleTruncate(item.title, 36),
-                                    style = DsType.titleSm,
-                                    color = c.textPrimary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = "${if (item.isOutgoing) "Sent to" else "From"} ${item.peerName.substringBefore(" (")} · ${AirDropNode.formatBytes(item.sizeBytes)} · $timeStr",
-                                    style = DsType.bodySm.merge(TabularNums),
-                                    color = c.textSecondary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-
-                        // Action Footer: Secondary left, Primary right (OpenDesigner making.md §10 preflight 41)
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(DsSpace.space12)) {
-                                Text(
-                                    text = "Copy path",
-                                    style = DsType.bodySm,
-                                    color = c.textSecondary,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(DsSpace.radius4))
-                                        .pressableScale {
-                                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                                            cm?.setPrimaryClip(ClipData.newPlainText("AirDrop", item.pathOrUrl))
-                                            Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
-                                        }
-                                        .padding(vertical = DsSpace.space4, horizontal = DsSpace.space4)
-                                )
-                                if (!item.isOutgoing || item.isUrl) {
+                                Surface(
+                                    color = if (item.isOutgoing) c.bgAccentSubtle else c.bgSuccessSubtle,
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.size(40.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        QuickVectorIcon(
+                                            kind = if (item.isOutgoing) QuickIconKind.UPLOAD else QuickIconKind.DOWNLOAD,
+                                            tint = if (item.isOutgoing) c.textAccent else c.textSuccess,
+                                            size = 18.dp
+                                        )
+                                    }
+                                }
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "Share",
-                                        style = DsType.bodySm,
+                                        text = middleTruncate(item.title, 32),
+                                        color = c.textPrimary,
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 14.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "${if (item.isOutgoing) "Sent to" else "From"} ${item.peerName} · ${AirDropNode.formatBytes(item.sizeBytes)} · ${fmt.format(Date(item.timestampMs))}",
                                         color = c.textSecondary,
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(DsSpace.radius4))
-                                            .pressableScale { onShareItem(item) }
-                                            .padding(vertical = DsSpace.space4, horizontal = DsSpace.space4)
+                                        fontSize = 11.sp,
+                                        style = TextStyle(fontFeatureSettings = "tnum"),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
                             }
 
                             if (!item.isOutgoing || item.isUrl) {
-                                Surface(
-                                    color = c.bgNeutralSubtle,
-                                    shape = RoundedCornerShape(DsSpace.radiusControl),
-                                    border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                                    modifier = Modifier
-                                        .height(DsSpace.sizeControlSm)
-                                        .pressableScale { onOpenItem(item) }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.End
                                 ) {
-                                    Box(
-                                        modifier = Modifier.padding(horizontal = DsSpace.space12),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Text(
-                                            text = if (item.isUrl) "Open link" else "Open file",
-                                            style = DsType.labelMd,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = c.textPrimary,
-                                            maxLines = 1
-                                        )
+                                    if (item.isUrl) {
+                                        TextButton(onClick = { onCopyText(item.pathOrUrl) }) {
+                                            Text("Copy Link", color = c.textSecondary, fontSize = 12.sp)
+                                        }
+                                    }
+                                    TextButton(onClick = { onShareItem(item) }) {
+                                        Text("Share", color = c.textSecondary, fontSize = 12.sp)
+                                    }
+                                    TextButton(onClick = { onOpenItem(item) }) {
+                                        Text("Open", color = c.textAccent, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                                     }
                                 }
                             }
@@ -2004,20 +2634,21 @@ private fun TransfersHistoryTab(
 }
 
 // ============================================================================
-// Tab 2: Settings & P2P Radio — Every Row Overflow-Protected with weight(1f)
+// TAB 3: SETTINGS — Theme Selector (Day / Dark / System) + Receive Mode + Radio
 // ============================================================================
 @Composable
-private fun SettingsAndP2pTab(
+private fun SettingsScreenTab(
     running: Boolean,
     deviceName: String,
-    serviceId: String,
+    themeMode: String,
     autoAccept: Boolean,
     p2pStatus: String,
     endpoints: List<String>,
     logs: List<String>,
     showLogs: Boolean,
+    onSelectThemeMode: (String) -> Unit,
     onToggleRunning: (Boolean) -> Unit,
-    onSelectDirectGet: (Boolean) -> Unit,
+    onSelectAutoAccept: (Boolean) -> Unit,
     onRenameDevice: () -> Unit,
     onOpenDownloads: () -> Unit,
     onRescanP2p: () -> Unit,
@@ -2027,95 +2658,193 @@ private fun SettingsAndP2pTab(
     val c = LocalDsColors.current
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(DsSpace.space16),
-        contentPadding = PaddingValues(top = DsSpace.space12, bottom = DsSpace.space24)
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 1. Receiving Preference Group
+        // 1. Theme / Appearance Card (Day, Dark, System)
         item {
             Surface(
                 color = c.surfaceRaised,
-                shape = RoundedCornerShape(DsSpace.radius12),
-                border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, c.borderSubtle),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
-                    modifier = Modifier.padding(DsSpace.space16),
-                    verticalArrangement = Arrangement.spacedBy(DsSpace.space12)
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(DsSpace.space2)) {
-                        Text(
-                            text = "Receiving files",
-                            style = DsType.titleSm,
-                            color = c.textPrimary
+                    Text(
+                        text = "Appearance",
+                        color = c.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        ThemeOptionButton(
+                            label = "Day",
+                            selected = themeMode == "light",
+                            icon = QuickIconKind.SUN,
+                            onClick = { onSelectThemeMode("light") },
+                            modifier = Modifier.weight(1f)
                         )
-                        Text(
-                            text = "Choose how incoming transfers from nearby devices are handled.",
-                            style = DsType.bodySm,
-                            color = c.textSecondary
+                        ThemeOptionButton(
+                            label = "Dark",
+                            selected = themeMode == "dark",
+                            icon = QuickIconKind.MOON,
+                            onClick = { onSelectThemeMode("dark") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        ThemeOptionButton(
+                            label = "System",
+                            selected = themeMode == "system",
+                            icon = null,
+                            onClick = { onSelectThemeMode("system") },
+                            modifier = Modifier.weight(1f)
                         )
                     }
+                }
+            }
+        }
 
-                    ReceiveModeOptionCard(
-                        title = "Auto-accept files (Direct Get)",
-                        subtitle = "Save incoming files directly to Downloads/AirDrop without a prompt.",
-                        badge = "Fastest",
-                        selected = autoAccept,
-                        onClick = { onSelectDirectGet(true) }
+        // 2. Receive Approval Mode
+        item {
+            Surface(
+                color = c.surfaceRaised,
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, c.borderSubtle),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "Incoming File Approval",
+                        color = c.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
                     )
-
-                    ReceiveModeOptionCard(
-                        title = "Ask every time",
-                        subtitle = "Show sender name, file list, and size before downloading.",
-                        badge = "Confirm",
-                        selected = !autoAccept,
-                        onClick = { onSelectDirectGet(false) }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        FilterChipPill(
+                            label = "Ask First",
+                            selected = !autoAccept,
+                            onClick = { onSelectAutoAccept(false) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        FilterChipPill(
+                            label = "Auto-Accept",
+                            selected = autoAccept,
+                            onClick = { onSelectAutoAccept(true) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Text(
+                        text = if (autoAccept) {
+                            "Incoming files save directly to Downloads/AirDrop without prompting."
+                        } else {
+                            "Each incoming transfer shows sender name, file list, and size before saving."
+                        },
+                        color = c.textSecondary,
+                        fontSize = 12.sp
                     )
                 }
             }
         }
 
-        // 2. Device Identity & Storage Group (Every left column has weight(1f)!)
+        // 3. Device Identity & Downloads
         item {
             Surface(
                 color = c.surfaceRaised,
-                shape = RoundedCornerShape(DsSpace.radius12),
-                border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, c.borderSubtle),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
-                    modifier = Modifier.padding(DsSpace.space16),
-                    verticalArrangement = Arrangement.spacedBy(DsSpace.space12)
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Text(
-                        text = "Device & storage",
-                        style = DsType.titleSm,
-                        color = c.textPrimary
-                    )
-
-                    // Row 1: Visibility Switch
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = DsSpace.sizeRowMd),
-                        horizontalArrangement = Arrangement.spacedBy(DsSpace.space12),
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
-                        ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Device Name", color = c.textSecondary, fontSize = 12.sp)
                             Text(
-                                text = if (running) "Visible to nearby devices" else "Hidden (radio off)",
-                                style = DsType.bodyMd,
-                                fontWeight = FontWeight.Medium,
+                                text = deviceName,
                                 color = c.textPrimary,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
+                        }
+                        OutlinedButton(
+                            onClick = onRenameDevice,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, c.borderDefault)
+                        ) {
+                            Text("Rename", color = c.textPrimary, fontSize = 12.sp)
+                        }
+                    }
+
+                    HorizontalDivider(color = c.borderSeparator)
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Save Location", color = c.textSecondary, fontSize = 12.sp)
+                            Text("Downloads/AirDrop", color = c.textPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                        }
+                        OutlinedButton(
+                            onClick = onOpenDownloads,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, c.borderDefault)
+                        ) {
+                            Text("Open Folder", color = c.textAccent, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. P2P Service & Diagnostics
+        item {
+            Surface(
+                color = c.surfaceRaised,
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, c.borderSubtle),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Broadcasts BLE L2CAP + 5GHz Wi-Fi Direct",
-                                style = DsType.bodySm,
+                                text = "Background P2P Service",
+                                color = c.textPrimary,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp
+                            )
+                            Text(
+                                text = p2pStatus,
                                 color = c.textSecondary,
+                                fontSize = 12.sp,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -2124,260 +2853,78 @@ private fun SettingsAndP2pTab(
                             checked = running,
                             onCheckedChange = onToggleRunning,
                             colors = SwitchDefaults.colors(
-                                checkedThumbColor = c.textOnAction,
+                                checkedThumbColor = Color.White,
                                 checkedTrackColor = c.bgActionPrimary
                             )
                         )
                     }
 
-                    HorizontalDivider(thickness = DsSpace.borderWidthDefault, color = c.borderSeparator)
-
-                    // Row 2: Device Name (weight(1f) prevents Rename button overflow)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = DsSpace.sizeRowMd),
-                        horizontalArrangement = Arrangement.spacedBy(DsSpace.space12),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
-                        ) {
-                            Text(
-                                text = "Device name",
-                                style = DsType.bodyMd,
-                                fontWeight = FontWeight.Medium,
-                                color = c.textPrimary,
-                                maxLines = 1
-                            )
-                            Text(
-                                text = "$deviceName · ID $serviceId",
-                                style = DsType.bodySm.merge(TabularNums),
-                                color = c.textSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        Surface(
-                            color = c.bgNeutralSubtle,
-                            shape = RoundedCornerShape(DsSpace.radiusControl),
-                            border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                            modifier = Modifier
-                                .height(DsSpace.sizeControlSm)
-                                .pressableScale(onClick = onRenameDevice)
-                        ) {
-                            Box(
-                                modifier = Modifier.padding(horizontal = DsSpace.space12),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text("Rename", style = DsType.labelMd, color = c.textPrimary, maxLines = 1)
-                            }
-                        }
-                    }
-
-                    HorizontalDivider(thickness = DsSpace.borderWidthDefault, color = c.borderSeparator)
-
-                    // Row 3: Save Location (weight(1f) + middleTruncate prevents Open button overflow!)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = DsSpace.sizeRowMd),
-                        horizontalArrangement = Arrangement.spacedBy(DsSpace.space12),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
-                        ) {
-                            Text(
-                                text = "Download folder",
-                                style = DsType.bodyMd,
-                                fontWeight = FontWeight.Medium,
-                                color = c.textPrimary,
-                                maxLines = 1
-                            )
-                            Text(
-                                text = middleTruncate("/storage/emulated/0/Download/AirDrop", 32),
-                                style = DsType.bodySm,
-                                color = c.textSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        Surface(
-                            color = c.bgNeutralSubtle,
-                            shape = RoundedCornerShape(DsSpace.radiusControl),
-                            border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                            modifier = Modifier
-                                .height(DsSpace.sizeControlSm)
-                                .pressableScale(onClick = onOpenDownloads)
-                        ) {
-                            Box(
-                                modifier = Modifier.padding(horizontal = DsSpace.space12),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text("Open", style = DsType.labelMd, color = c.textPrimary, maxLines = 1)
-                            }
-                        }
-                    }
-
-                    HorizontalDivider(thickness = DsSpace.borderWidthDefault, color = c.borderSeparator)
-
-                    // Row 4: End-to-End Encryption & Privacy
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = DsSpace.sizeRowMd),
-                        horizontalArrangement = Arrangement.spacedBy(DsSpace.space12),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
-                        ) {
-                            Text(
-                                text = "End-to-end encryption",
-                                style = DsType.bodyMd,
-                                fontWeight = FontWeight.Medium,
-                                color = c.textPrimary,
-                                maxLines = 1
-                            )
-                            Text(
-                                text = "TLS 1.3 (ECDSA P-256) + AES-256-GCM + Ephemeral WPA2",
-                                style = DsType.bodySm,
-                                color = c.textSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        Surface(
-                            color = c.bgSuccessSubtle,
-                            shape = RoundedCornerShape(DsSpace.radiusControl),
-                            border = BorderStroke(DsSpace.borderWidthDefault, c.borderSuccess.copy(alpha = 0.55f))
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .heightIn(min = DsSpace.sizeControlSm)
-                                    .padding(horizontal = DsSpace.space8, vertical = DsSpace.space4),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = "Active",
-                                    style = DsType.labelMd,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = c.textSuccess,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. P2P Radio Diagnostics & Live Protocol Log
-        item {
-            Surface(
-                color = c.surfaceRaised,
-                shape = RoundedCornerShape(DsSpace.radius12),
-                border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(DsSpace.space16),
-                    verticalArrangement = Arrangement.spacedBy(DsSpace.space12)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "P2P radio diagnostics",
-                            style = DsType.titleSm,
-                            color = c.textPrimary,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Surface(
-                            color = c.bgNeutralSubtle,
-                            shape = RoundedCornerShape(DsSpace.radiusControl),
-                            border = BorderStroke(DsSpace.borderWidthDefault, c.borderSubtle),
-                            modifier = Modifier
-                                .height(DsSpace.sizeControlSm)
-                                .pressableScale(onClick = onRescanP2p)
-                        ) {
-                            Box(
-                                modifier = Modifier.padding(horizontal = DsSpace.space12),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text("Restart radio", style = DsType.labelMd, color = c.textPrimary, maxLines = 1)
-                            }
-                        }
-                    }
-
-                    Text(
-                        text = p2pStatus,
-                        style = DsType.bodyMd.merge(TabularNums),
-                        color = c.textSuccess
-                    )
-
                     if (endpoints.isNotEmpty()) {
-                        Text(
-                            text = "Listeners: ${endpoints.joinToString(" · ")}",
-                            style = DsType.bodySm.merge(TabularNums),
-                            color = c.textSecondary,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        endpoints.forEach { ep ->
+                            Text(
+                                text = "• $ep",
+                                color = c.textTertiary,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
                     }
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Text(
-                            text = if (showLogs) "Hide protocol logs" else "Show protocol logs (${logs.size})",
-                            style = DsType.bodySm,
-                            fontWeight = FontWeight.Medium,
-                            color = c.textLink,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(DsSpace.radius4))
-                                .pressableScale(onClick = onToggleLogs)
-                                .padding(vertical = DsSpace.space4)
-                        )
-                        if (showLogs && logs.isNotEmpty()) {
-                            Text(
-                                text = "Clear",
-                                style = DsType.bodySm,
-                                color = c.textSecondary,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(DsSpace.radius4))
-                                    .pressableScale(onClick = onClearLogs)
-                                    .padding(vertical = DsSpace.space4, horizontal = DsSpace.space6)
-                            )
+                        OutlinedButton(
+                            onClick = onRescanP2p,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, c.borderDefault),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Refresh Radio", color = c.textPrimary, fontSize = 12.sp)
+                        }
+                        OutlinedButton(
+                            onClick = onToggleLogs,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, c.borderDefault),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(if (showLogs) "Hide Logs" else "Show Logs", color = c.textSecondary, fontSize = 12.sp)
                         }
                     }
 
                     if (showLogs) {
                         Surface(
                             color = c.surfaceSunken,
-                            shape = RoundedCornerShape(DsSpace.radius8),
-                            border = BorderStroke(DsSpace.borderWidthDefault, c.borderSeparator),
+                            shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Column(
-                                modifier = Modifier.padding(DsSpace.space8),
-                                verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                for (line in logs.takeLast(24)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("Activity Log", color = c.textSecondary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                     Text(
-                                        text = line,
-                                        style = DsType.codeSm.merge(TabularNums),
-                                        fontFamily = FontFamily.Monospace,
-                                        color = c.textSecondary
+                                        text = "Clear",
+                                        color = c.textAccent,
+                                        fontSize = 11.sp,
+                                        modifier = Modifier.clickable(onClick = onClearLogs)
                                     )
+                                }
+                                if (logs.isEmpty()) {
+                                    Text("No events logged yet.", color = c.textTertiary, fontSize = 11.sp)
+                                } else {
+                                    logs.takeLast(20).forEach { line ->
+                                        Text(
+                                            text = line,
+                                            color = c.textSecondary,
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -2389,177 +2936,165 @@ private fun SettingsAndP2pTab(
 }
 
 @Composable
-private fun ReceiveModeOptionCard(
-    title: String,
-    subtitle: String,
-    badge: String,
+private fun ThemeOptionButton(
+    label: String,
     selected: Boolean,
+    icon: QuickIconKind?,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val c = LocalDsColors.current
+    Surface(
+        color = if (selected) c.bgActionPrimary else c.surfaceSunken,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, if (selected) c.bgActionPrimary else c.borderSubtle),
+        modifier = modifier
+            .height(42.dp)
+            .pressableScale(onClick = onClick)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxSize(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            if (icon != null) {
+                QuickVectorIcon(
+                    kind = icon,
+                    tint = if (selected) c.textOnAction else c.textSecondary,
+                    size = 15.dp
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+            }
+            Text(
+                text = label,
+                color = if (selected) c.textOnAction else c.textPrimary,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 13.sp
+            )
+        }
+    }
+}
+
+@Composable
+private fun FilterChipPill(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
     val c = LocalDsColors.current
     Surface(
-        color = if (selected) c.bgAccentSubtle else c.surfaceSunken,
-        shape = RoundedCornerShape(DsSpace.radius8),
-        border = BorderStroke(
-            if (selected) DsSpace.borderWidthSelected else DsSpace.borderWidthDefault,
-            if (selected) c.borderAccent else c.borderSeparator
-        ),
+        color = if (selected) c.bgActionPrimary else c.surfaceRaised,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, if (selected) c.bgActionPrimary else c.borderSubtle),
+        modifier = modifier.pressableScale(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = label,
+                color = if (selected) c.textOnAction else c.textSecondary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
+private fun RadioReadinessCard(
+    btEnabled: Boolean,
+    wifiEnabled: Boolean,
+    permsGranted: Boolean,
+    onEnableBluetooth: () -> Unit,
+    onEnableWifi: () -> Unit,
+    onGrantPerms: () -> Unit
+) {
+    val c = LocalDsColors.current
+    Surface(
+        color = c.bgWarningSubtle,
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, c.borderWarning),
         modifier = Modifier
             .fillMaxWidth()
-            .pressableScale(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(DsSpace.space12),
-            verticalAlignment = Alignment.Top,
-            horizontalArrangement = Arrangement.spacedBy(DsSpace.space12)
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // Radio Circle (flex-shrink: 0, top-aligned with first line of text per break-ui)
+            Text(
+                text = when {
+                    !permsGranted -> "Bluetooth & Nearby Wi-Fi permissions required"
+                    !btEnabled -> "Bluetooth is off"
+                    else -> "Wi-Fi is off (needed for 5GHz speed)"
+                },
+                color = c.textWarning,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = when {
+                    !permsGranted -> "Grant"
+                    !btEnabled -> "Turn On"
+                    else -> "Enable"
+                },
+                color = c.textAccent,
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp,
+                modifier = Modifier.clickable {
+                    when {
+                        !permsGranted -> onGrantPerms()
+                        !btEnabled -> onEnableBluetooth()
+                        else -> onEnableWifi()
+                    }
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun SignalStrengthBars(rssi: Int) {
+    val c = LocalDsColors.current
+    val activeBars = when {
+        rssi >= -58 -> 4
+        rssi >= -68 -> 3
+        rssi >= -78 -> 2
+        else -> 1
+    }
+    Row(
+        verticalAlignment = Alignment.Bottom,
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        modifier = Modifier.height(16.dp)
+    ) {
+        for (i in 1..4) {
             Box(
                 modifier = Modifier
-                    .padding(top = DsSpace.space2)
-                    .size(DsSpace.sizeIconSm)
-                    .clip(CircleShape)
-                    .border(
-                        width = if (selected) DsSpace.borderWidthSelected else DsSpace.borderWidthDefault,
-                        color = if (selected) c.borderFocus else c.borderStrong,
-                        shape = CircleShape
-                    ),
-                contentAlignment = Alignment.Center
-            ) {
-                if (selected) {
-                    Box(
-                        modifier = Modifier
-                            .size(DsSpace.space8)
-                            .clip(CircleShape)
-                            .background(c.borderFocus)
-                    )
-                }
-            }
-
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(DsSpace.space8)
-                ) {
-                    Text(
-                        text = title,
-                        style = DsType.titleSm,
-                        color = c.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Surface(
-                        color = if (selected) c.bgActionPrimary else c.bgNeutralSubtle,
-                        shape = RoundedCornerShape(DsSpace.radius4)
-                    ) {
-                        Text(
-                            text = badge,
-                            style = DsType.labelSm,
-                            color = if (selected) c.textOnAction else c.textSecondary,
-                            maxLines = 1,
-                            modifier = Modifier.padding(horizontal = DsSpace.space6, vertical = DsSpace.space2)
-                        )
-                    }
-                }
-                Text(
-                    text = subtitle,
-                    style = DsType.bodySm,
-                    color = c.textSecondary
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun PendingShareBanner(
-    uris: List<Uri>,
-    url: String?,
-    peers: List<AirDropPeer>,
-    onSendToPeer: (AirDropPeer) -> Unit,
-    onDismiss: () -> Unit
-) {
-    val c = LocalDsColors.current
-    Surface(
-        color = c.surfaceRaised,
-        shape = RoundedCornerShape(DsSpace.radius12),
-        border = BorderStroke(DsSpace.borderWidthDefault, c.borderAccent),
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = DsSpace.space6)
-    ) {
-        Column(
-            modifier = Modifier.padding(DsSpace.space12),
-            verticalArrangement = Arrangement.spacedBy(DsSpace.space8)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = if (url != null) "Ready to share link" else "Ready to share ${uris.size} file(s)",
-                    style = DsType.titleSm,
-                    color = c.textPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                Text(
-                    text = "Dismiss",
-                    style = DsType.bodySm,
-                    color = c.textSecondary,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(DsSpace.radius4))
-                        .pressableScale(onClick = onDismiss)
-                        .padding(horizontal = DsSpace.space6, vertical = DsSpace.space4)
-                )
-            }
-            if (peers.isEmpty()) {
-                Text(
-                    text = "Searching for nearby devices\u2026",
-                    style = DsType.bodySm,
-                    color = c.textSecondary
-                )
-            } else {
-                peers.forEach { peer ->
-                    Button(
-                        onClick = { onSendToPeer(peer) },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = c.bgActionPrimary,
-                            contentColor = c.textOnAction
-                        ),
-                        shape = RoundedCornerShape(DsSpace.radiusControl),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = "Send to ${peer.name.substringBefore(" (")}",
-                            style = DsType.labelLg,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
-            }
+                    .width(3.dp)
+                    .height((4 * i).dp)
+                    .clip(RoundedCornerShape(1.5.dp))
+                    .background(if (i <= activeBars) c.bgSuccessBold else c.borderDefault)
+            )
         }
     }
 }
 
 // ============================================================================
-// Bottom Navigation Bar — Clean vertical Icon + 1-word label (Zero horizontal wrap)
-// Follows OpenDesigner making.md §12 "Lists and sidebars breathe"
+// Bottom Navigation Bar — 4 Separate Tabs: Send, Receive, History, Settings
 // ============================================================================
 @Composable
-private fun BottomTabNavigation(
-    selectedTab: Int,
+private fun QuickShareBottomBar(
+    activeTab: Int,
+    stagedCount: Int,
     peerCount: Int,
     historyCount: Int,
     onSelectTab: (Int) -> Unit
@@ -2571,306 +3106,269 @@ private fun BottomTabNavigation(
             .fillMaxWidth()
             .navigationBarsPadding()
     ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            HorizontalDivider(thickness = DsSpace.borderWidthDefault, color = c.borderSeparator)
+        Column {
+            HorizontalDivider(color = c.borderSeparator, thickness = 1.dp)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(DsSpace.sizeRowLg)
-                    .padding(horizontal = DsSpace.space8, vertical = DsSpace.space4),
-                horizontalArrangement = Arrangement.spacedBy(DsSpace.space8),
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceAround,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                val tabs = listOf(
-                    TabSpec("Nearby", IconKind.Radar, if (peerCount > 0) "$peerCount" else null, 0),
-                    TabSpec("History", IconKind.Folder, if (historyCount > 0) "$historyCount" else null, 1),
-                    TabSpec("Settings", IconKind.Sliders, null, 2)
+                BottomNavTabItem(
+                    label = "Send",
+                    icon = QuickIconKind.SEND,
+                    badge = if (stagedCount > 0) stagedCount.toString() else null,
+                    selected = activeTab == 0,
+                    onClick = { onSelectTab(0) },
+                    modifier = Modifier.weight(1f)
                 )
-                tabs.forEach { tab ->
-                    val active = selectedTab == tab.index
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(DsSpace.sizeRowMd)
-                            .clip(RoundedCornerShape(DsSpace.radius8))
-                            .background(if (active) c.bgAccentSubtle else Color.Transparent)
-                            .pressableScale { onSelectTab(tab.index) },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(DsSpace.space2)
-                        ) {
-                            Box(contentAlignment = Alignment.TopEnd) {
-                                Box(modifier = Modifier.padding(horizontal = DsSpace.space8, vertical = DsSpace.space2)) {
-                                    DsVectorIcon(
-                                        kind = tab.icon,
-                                        tint = if (active) c.iconAccent else c.iconSubtle,
-                                        size = DsSpace.sizeIconMd
-                                    )
-                                }
-                                if (tab.badge != null) {
-                                    Surface(
-                                        color = if (active) c.bgActionPrimary else c.bgNeutralSubtle,
-                                        shape = RoundedCornerShape(DsSpace.radiusFull)
-                                    ) {
-                                        Text(
-                                            text = tab.badge,
-                                            style = DsType.labelSm.merge(TabularNums),
-                                            color = if (active) c.textOnAction else c.textSecondary,
-                                            maxLines = 1,
-                                            modifier = Modifier.padding(horizontal = DsSpace.space4, vertical = DsSpace.space0)
-                                        )
-                                    }
-                                }
-                            }
-                            Text(
-                                text = tab.label,
-                                style = DsType.labelSm,
-                                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                                color = if (active) c.textAccent else c.textSecondary,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
+                BottomNavTabItem(
+                    label = "Receive",
+                    icon = QuickIconKind.RECEIVE,
+                    badge = if (peerCount > 0) peerCount.toString() else null,
+                    selected = activeTab == 1,
+                    onClick = { onSelectTab(1) },
+                    modifier = Modifier.weight(1f)
+                )
+                BottomNavTabItem(
+                    label = "History",
+                    icon = QuickIconKind.HISTORY,
+                    badge = if (historyCount > 0) historyCount.coerceAtMost(99).toString() else null,
+                    selected = activeTab == 2,
+                    onClick = { onSelectTab(2) },
+                    modifier = Modifier.weight(1f)
+                )
+                BottomNavTabItem(
+                    label = "Settings",
+                    icon = QuickIconKind.SETTINGS,
+                    badge = null,
+                    selected = activeTab == 3,
+                    onClick = { onSelectTab(3) },
+                    modifier = Modifier.weight(1f)
+                )
             }
         }
     }
 }
 
-private data class TabSpec(
-    val label: String,
-    val icon: IconKind,
-    val badge: String?,
-    val index: Int
-)
-
-// ============================================================================
-// Crisp Vector Icons Drawn on Canvas (OpenDesigner making.md §12: never text/emoji)
-// ============================================================================
-private enum class IconKind {
-    Radar, Laptop, Phone, File, Image, Link, Folder, Refresh, Sliders, Download, Upload
+@Composable
+private fun BottomNavTabItem(
+    label: String,
+    icon: QuickIconKind,
+    badge: String?,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val c = LocalDsColors.current
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .pressableScale(onClick = onClick)
+            .padding(vertical = 5.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        Box {
+            Surface(
+                color = if (selected) c.bgAccentSubtle else Color.Transparent,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.size(width = 48.dp, height = 28.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    QuickVectorIcon(
+                        kind = icon,
+                        tint = if (selected) c.iconAccent else c.iconSubtle,
+                        size = 18.dp
+                    )
+                }
+            }
+            if (badge != null) {
+                Surface(
+                    color = c.bgActionPrimary,
+                    shape = CircleShape,
+                    modifier = Modifier.align(Alignment.TopEnd)
+                ) {
+                    Text(
+                        text = badge,
+                        color = Color.White,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        style = TextStyle(fontFeatureSettings = "tnum"),
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                    )
+                }
+            }
+        }
+        Text(
+            text = label,
+            color = if (selected) c.textAccent else c.textSecondary,
+            fontSize = 11.sp,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+            maxLines = 1
+        )
+    }
 }
 
+// ============================================================================
+// Clean Custom Vector Icons (Zero external icon-pack bloat)
+// ============================================================================
 @Composable
-private fun DsVectorIcon(
-    kind: IconKind,
+private fun QuickVectorIcon(
+    kind: QuickIconKind,
     tint: Color,
-    size: Dp = DsSpace.sizeIconDefault
+    size: Dp
 ) {
-    val minStrokeDp = DsSpace.borderWidthSelected
     Canvas(modifier = Modifier.size(size)) {
         val w = this.size.width
         val h = this.size.height
-        val sw = (w * 0.09f).coerceAtLeast(minStrokeDp.toPx())
+        val sw = (w * 0.095f).coerceAtLeast(1.6.dp.toPx())
         val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
 
         when (kind) {
-            IconKind.Radar -> {
-                val c = Offset(w / 2f, h / 2f)
-                drawArc(
-                    color = tint,
-                    startAngle = 145f,
-                    sweepAngle = 250f,
-                    useCenter = false,
-                    topLeft = Offset(w * 0.12f, h * 0.12f),
-                    size = Size(w * 0.76f, h * 0.76f),
-                    style = stroke
-                )
-                drawArc(
-                    color = tint,
-                    startAngle = 145f,
-                    sweepAngle = 250f,
-                    useCenter = false,
-                    topLeft = Offset(w * 0.28f, h * 0.28f),
-                    size = Size(w * 0.44f, h * 0.44f),
-                    style = stroke
-                )
-                drawCircle(color = tint, radius = sw * 0.9f, center = c)
-            }
-            IconKind.Laptop -> {
-                drawRoundRect(
-                    color = tint,
-                    topLeft = Offset(w * 0.16f, h * 0.20f),
-                    size = Size(w * 0.68f, h * 0.48f),
-                    cornerRadius = CornerRadius(w * 0.06f, w * 0.06f),
-                    style = stroke
-                )
-                drawLine(
-                    color = tint,
-                    start = Offset(w * 0.08f, h * 0.78f),
-                    end = Offset(w * 0.92f, h * 0.78f),
-                    strokeWidth = sw,
-                    cap = StrokeCap.Round
-                )
-            }
-            IconKind.Phone -> {
-                drawRoundRect(
-                    color = tint,
-                    topLeft = Offset(w * 0.26f, h * 0.12f),
-                    size = Size(w * 0.48f, h * 0.76f),
-                    cornerRadius = CornerRadius(w * 0.09f, w * 0.09f),
-                    style = stroke
-                )
-                drawCircle(color = tint, radius = sw * 0.55f, center = Offset(w * 0.5f, h * 0.76f))
-            }
-            IconKind.File -> {
+            QuickIconKind.SEND -> {
                 val p = Path().apply {
-                    moveTo(w * 0.24f, h * 0.14f)
-                    lineTo(w * 0.58f, h * 0.14f)
-                    lineTo(w * 0.78f, h * 0.34f)
-                    lineTo(w * 0.78f, h * 0.86f)
-                    lineTo(w * 0.24f, h * 0.86f)
+                    moveTo(w * 0.14f, h * 0.48f)
+                    lineTo(w * 0.86f, h * 0.16f)
+                    lineTo(w * 0.56f, h * 0.86f)
+                    lineTo(w * 0.44f, h * 0.56f)
                     close()
                 }
-                drawPath(path = p, color = tint, style = stroke)
-                drawLine(
-                    color = tint,
-                    start = Offset(w * 0.36f, h * 0.54f),
-                    end = Offset(w * 0.66f, h * 0.54f),
-                    strokeWidth = sw,
-                    cap = StrokeCap.Round
-                )
-                drawLine(
-                    color = tint,
-                    start = Offset(w * 0.36f, h * 0.68f),
-                    end = Offset(w * 0.56f, h * 0.68f),
-                    strokeWidth = sw,
-                    cap = StrokeCap.Round
-                )
+                drawPath(p, color = tint, style = stroke)
             }
-            IconKind.Image -> {
-                drawRoundRect(
-                    color = tint,
-                    topLeft = Offset(w * 0.14f, h * 0.18f),
-                    size = Size(w * 0.72f, h * 0.64f),
-                    cornerRadius = CornerRadius(w * 0.08f, w * 0.08f),
-                    style = stroke
-                )
-                drawCircle(color = tint, radius = sw * 0.75f, center = Offset(w * 0.34f, h * 0.38f))
-                val m = Path().apply {
-                    moveTo(w * 0.20f, h * 0.76f)
-                    lineTo(w * 0.46f, h * 0.52f)
-                    lineTo(w * 0.62f, h * 0.66f)
-                    lineTo(w * 0.74f, h * 0.54f)
-                    lineTo(w * 0.84f, h * 0.76f)
+            QuickIconKind.RECEIVE, QuickIconKind.DOWNLOAD -> {
+                drawLine(tint, Offset(w * 0.5f, h * 0.16f), Offset(w * 0.5f, h * 0.66f), strokeWidth = sw, cap = StrokeCap.Round)
+                val arrow = Path().apply {
+                    moveTo(w * 0.28f, h * 0.46f)
+                    lineTo(w * 0.5f, h * 0.68f)
+                    lineTo(w * 0.72f, h * 0.46f)
                 }
-                drawPath(path = m, color = tint, style = stroke)
+                drawPath(arrow, color = tint, style = stroke)
+                drawLine(tint, Offset(w * 0.2f, h * 0.84f), Offset(w * 0.8f, h * 0.84f), strokeWidth = sw, cap = StrokeCap.Round)
             }
-            IconKind.Link -> {
-                drawArc(
-                    color = tint,
-                    startAngle = 120f,
-                    sweepAngle = 200f,
-                    useCenter = false,
-                    topLeft = Offset(w * 0.14f, h * 0.28f),
-                    size = Size(w * 0.44f, h * 0.44f),
-                    style = stroke
-                )
-                drawArc(
-                    color = tint,
-                    startAngle = -60f,
-                    sweepAngle = 200f,
-                    useCenter = false,
-                    topLeft = Offset(w * 0.42f, h * 0.28f),
-                    size = Size(w * 0.44f, h * 0.44f),
-                    style = stroke
-                )
-                drawLine(
-                    color = tint,
-                    start = Offset(w * 0.36f, h * 0.50f),
-                    end = Offset(w * 0.64f, h * 0.50f),
-                    strokeWidth = sw,
-                    cap = StrokeCap.Round
-                )
+            QuickIconKind.UPLOAD -> {
+                drawLine(tint, Offset(w * 0.5f, h * 0.68f), Offset(w * 0.5f, h * 0.2f), strokeWidth = sw, cap = StrokeCap.Round)
+                val arrow = Path().apply {
+                    moveTo(w * 0.28f, h * 0.42f)
+                    lineTo(w * 0.5f, h * 0.18f)
+                    lineTo(w * 0.72f, h * 0.42f)
+                }
+                drawPath(arrow, color = tint, style = stroke)
+                drawLine(tint, Offset(w * 0.2f, h * 0.84f), Offset(w * 0.8f, h * 0.84f), strokeWidth = sw, cap = StrokeCap.Round)
             }
-            IconKind.Folder -> {
-                val p = Path().apply {
-                    moveTo(w * 0.12f, h * 0.24f)
-                    lineTo(w * 0.40f, h * 0.24f)
-                    lineTo(w * 0.48f, h * 0.34f)
-                    lineTo(w * 0.88f, h * 0.34f)
-                    lineTo(w * 0.88f, h * 0.80f)
-                    lineTo(w * 0.12f, h * 0.80f)
+            QuickIconKind.HISTORY -> {
+                drawCircle(color = tint, radius = w * 0.38f, center = Offset(w * 0.5f, h * 0.5f), style = stroke)
+                val hands = Path().apply {
+                    moveTo(w * 0.5f, h * 0.28f)
+                    lineTo(w * 0.5f, h * 0.52f)
+                    lineTo(w * 0.66f, h * 0.62f)
+                }
+                drawPath(hands, color = tint, style = stroke)
+            }
+            QuickIconKind.SETTINGS -> {
+                drawCircle(color = tint, radius = w * 0.22f, center = Offset(w * 0.5f, h * 0.5f), style = stroke)
+                drawCircle(color = tint, radius = w * 0.38f, center = Offset(w * 0.5f, h * 0.5f), style = Stroke(width = sw * 0.75f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(sw * 1.4f, sw * 1.2f))))
+            }
+            QuickIconKind.IMAGE -> {
+                drawRoundRect(tint, Offset(w * 0.14f, h * 0.18f), Size(w * 0.72f, h * 0.64f), CornerRadius(w * 0.12f), style = stroke)
+                drawCircle(tint, radius = w * 0.08f, center = Offset(w * 0.34f, h * 0.38f))
+                val mtn = Path().apply {
+                    moveTo(w * 0.2f, h * 0.74f)
+                    lineTo(w * 0.46f, h * 0.48f)
+                    lineTo(w * 0.62f, h * 0.64f)
+                    lineTo(w * 0.74f, h * 0.52f)
+                    lineTo(w * 0.84f, h * 0.74f)
+                }
+                drawPath(mtn, color = tint, style = stroke)
+            }
+            QuickIconKind.VIDEO -> {
+                val tri = Path().apply {
+                    moveTo(w * 0.34f, h * 0.24f)
+                    lineTo(w * 0.78f, h * 0.5f)
+                    lineTo(w * 0.34f, h * 0.76f)
                     close()
                 }
-                drawPath(path = p, color = tint, style = stroke)
+                drawPath(tri, color = tint, style = stroke)
             }
-            IconKind.Refresh -> {
-                drawArc(
-                    color = tint,
-                    startAngle = -35f,
-                    sweepAngle = 285f,
-                    useCenter = false,
-                    topLeft = Offset(w * 0.18f, h * 0.18f),
-                    size = Size(w * 0.64f, h * 0.64f),
-                    style = stroke
-                )
-                val arrow = Path().apply {
-                    moveTo(w * 0.62f, h * 0.16f)
-                    lineTo(w * 0.82f, h * 0.22f)
-                    lineTo(w * 0.74f, h * 0.40f)
-                }
-                drawPath(path = arrow, color = tint, style = stroke)
+            QuickIconKind.DOC -> {
+                drawRoundRect(tint, Offset(w * 0.2f, h * 0.14f), Size(w * 0.6f, h * 0.72f), CornerRadius(w * 0.1f), style = stroke)
+                drawLine(tint, Offset(w * 0.32f, h * 0.38f), Offset(w * 0.68f, h * 0.38f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.32f, h * 0.54f), Offset(w * 0.68f, h * 0.54f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.32f, h * 0.7f), Offset(w * 0.54f, h * 0.7f), strokeWidth = sw, cap = StrokeCap.Round)
             }
-            IconKind.Sliders -> {
-                for (row in 0..2) {
-                    val y = h * (0.26f + row * 0.24f)
-                    drawLine(
-                        color = tint,
-                        start = Offset(w * 0.16f, y),
-                        end = Offset(w * 0.84f, y),
-                        strokeWidth = sw,
-                        cap = StrokeCap.Round
-                    )
-                    val knobX = if (row == 1) w * 0.64f else w * 0.36f
-                    drawCircle(color = tint, radius = sw * 1.15f, center = Offset(knobX, y))
-                }
+            QuickIconKind.AUDIO -> {
+                drawLine(tint, Offset(w * 0.42f, h * 0.7f), Offset(w * 0.42f, h * 0.22f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.42f, h * 0.22f), Offset(w * 0.76f, h * 0.16f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.76f, h * 0.16f), Offset(w * 0.76f, h * 0.62f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawCircle(tint, radius = w * 0.12f, center = Offset(w * 0.3f, h * 0.72f))
+                drawCircle(tint, radius = w * 0.12f, center = Offset(w * 0.64f, h * 0.64f))
             }
-            IconKind.Download -> {
-                drawLine(
-                    color = tint,
-                    start = Offset(w * 0.5f, h * 0.16f),
-                    end = Offset(w * 0.5f, h * 0.66f),
-                    strokeWidth = sw,
-                    cap = StrokeCap.Round
-                )
-                val arrow = Path().apply {
-                    moveTo(w * 0.32f, h * 0.50f)
-                    lineTo(w * 0.50f, h * 0.68f)
-                    lineTo(w * 0.68f, h * 0.50f)
-                }
-                drawPath(path = arrow, color = tint, style = stroke)
-                drawLine(
-                    color = tint,
-                    start = Offset(w * 0.22f, h * 0.84f),
-                    end = Offset(w * 0.78f, h * 0.84f),
-                    strokeWidth = sw,
-                    cap = StrokeCap.Round
-                )
+            QuickIconKind.LINK -> {
+                drawRoundRect(tint, Offset(w * 0.14f, h * 0.34f), Size(w * 0.42f, h * 0.32f), CornerRadius(w * 0.16f), style = stroke)
+                drawRoundRect(tint, Offset(w * 0.44f, h * 0.34f), Size(w * 0.42f, h * 0.32f), CornerRadius(w * 0.16f), style = stroke)
             }
-            IconKind.Upload -> {
-                drawLine(
-                    color = tint,
-                    start = Offset(w * 0.5f, h * 0.68f),
-                    end = Offset(w * 0.5f, h * 0.18f),
-                    strokeWidth = sw,
-                    cap = StrokeCap.Round
-                )
-                val arrow = Path().apply {
-                    moveTo(w * 0.32f, h * 0.36f)
-                    lineTo(w * 0.50f, h * 0.18f)
-                    lineTo(w * 0.68f, h * 0.36f)
+            QuickIconKind.FOLDER -> {
+                val p = Path().apply {
+                    moveTo(w * 0.14f, h * 0.26f)
+                    lineTo(w * 0.4f, h * 0.26f)
+                    lineTo(w * 0.48f, h * 0.36f)
+                    lineTo(w * 0.86f, h * 0.36f)
+                    lineTo(w * 0.86f, h * 0.78f)
+                    lineTo(w * 0.14f, h * 0.78f)
+                    close()
                 }
-                drawPath(path = arrow, color = tint, style = stroke)
-                drawLine(
-                    color = tint,
-                    start = Offset(w * 0.22f, h * 0.84f),
-                    end = Offset(w * 0.78f, h * 0.84f),
-                    strokeWidth = sw,
-                    cap = StrokeCap.Round
-                )
+                drawPath(p, color = tint, style = stroke)
+            }
+            QuickIconKind.SUN -> {
+                drawCircle(tint, radius = w * 0.22f, center = Offset(w * 0.5f, h * 0.5f), style = stroke)
+                drawLine(tint, Offset(w * 0.5f, h * 0.1f), Offset(w * 0.5f, h * 0.2f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.5f, h * 0.8f), Offset(w * 0.5f, h * 0.9f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.1f, h * 0.5f), Offset(w * 0.2f, h * 0.5f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.8f, h * 0.5f), Offset(w * 0.9f, h * 0.5f), strokeWidth = sw, cap = StrokeCap.Round)
+            }
+            QuickIconKind.MOON -> {
+                val crescent = Path().apply {
+                    moveTo(w * 0.66f, h * 0.18f)
+                    quadraticTo(w * 0.24f, h * 0.28f, w * 0.28f, h * 0.66f)
+                    quadraticTo(w * 0.36f, h * 0.88f, w * 0.78f, h * 0.74f)
+                    quadraticTo(w * 0.48f, h * 0.66f, w * 0.66f, h * 0.18f)
+                }
+                drawPath(crescent, color = tint, style = stroke)
+            }
+            QuickIconKind.REFRESH -> {
+                drawArc(tint, startAngle = -35f, sweepAngle = 290f, useCenter = false, topLeft = Offset(w * 0.18f, h * 0.18f), size = Size(w * 0.64f, h * 0.64f), style = stroke)
+            }
+            QuickIconKind.CHECK -> {
+                val p = Path().apply {
+                    moveTo(w * 0.2f, h * 0.52f)
+                    lineTo(w * 0.42f, h * 0.74f)
+                    lineTo(w * 0.82f, h * 0.28f)
+                }
+                drawPath(p, color = tint, style = stroke)
+            }
+            QuickIconKind.CLOSE -> {
+                drawLine(tint, Offset(w * 0.24f, h * 0.24f), Offset(w * 0.76f, h * 0.76f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.76f, h * 0.24f), Offset(w * 0.24f, h * 0.76f), strokeWidth = sw, cap = StrokeCap.Round)
+            }
+            QuickIconKind.PLUS -> {
+                drawLine(tint, Offset(w * 0.5f, h * 0.2f), Offset(w * 0.5f, h * 0.8f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.2f, h * 0.5f), Offset(w * 0.8f, h * 0.5f), strokeWidth = sw, cap = StrokeCap.Round)
+            }
+            QuickIconKind.SEARCH -> {
+                drawCircle(tint, radius = w * 0.28f, center = Offset(w * 0.44f, h * 0.44f), style = stroke)
+                drawLine(tint, Offset(w * 0.65f, h * 0.65f), Offset(w * 0.84f, h * 0.84f), strokeWidth = sw, cap = StrokeCap.Round)
+            }
+            QuickIconKind.BLUETOOTH -> {
+                val bt = Path().apply {
+                    moveTo(w * 0.32f, h * 0.3f)
+                    lineTo(w * 0.68f, h * 0.68f)
+                    lineTo(w * 0.5f, h * 0.86f)
+                    lineTo(w * 0.5f, h * 0.14f)
+                    lineTo(w * 0.68f, h * 0.32f)
+                    lineTo(w * 0.32f, h * 0.7f)
+                }
+                drawPath(bt, color = tint, style = stroke)
             }
         }
     }

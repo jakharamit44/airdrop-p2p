@@ -150,7 +150,7 @@ def load_settings():
 def current_mac_name():
     return load_settings().get("deviceName") or DEFAULT_MAC_NAME
 
-def write_progress(active: bool, direction: str = "", file_name: str = "", done_bytes: int = 0, total_bytes: int = 0, speed_bps: int = 0, eta_sec: int = 0, pct: int = 0, file_count: int = 1):
+def write_progress(active: bool, direction: str = "", file_name: str = "", done_bytes: int = 0, total_bytes: int = 0, speed_bps: int = 0, eta_sec: int = 0, pct: int = 0, file_count: int = 1, phase: str = "", peer_name: str = "", is_connecting: bool = False):
     pf = STATE_DIR / "transfer_progress.json"
     tmp = STATE_DIR / "transfer_progress.json.tmp"
     try:
@@ -168,6 +168,9 @@ def write_progress(active: bool, direction: str = "", file_name: str = "", done_
             "speedBps": int(speed_bps),
             "etaSeconds": int(eta_sec),
             "percent": int(pct),
+            "phase": phase,
+            "peerName": peer_name,
+            "isConnecting": bool(is_connecting),
             "updatedAt": time.time(),
         }
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -585,15 +588,46 @@ class StreamDecompressor:
                     self.buf.extend(self.decompressor.decompress(bpart))
 
     def read(self, n):
+        if n <= 0:
+            return b""
+        # Zero-copy fast path for stored DVZip blocks (eliminates intermediate self.buf copies & memmoves)
+        if self.mode == "dvzip" and not self.buf and not self.eof:
+            if self.dvzip_rem == 0:
+                hdr4 = self.raw.read_exact(4)
+                if len(hdr4) < 4:
+                    if self.decompressor:
+                        self.buf.extend(self.decompressor.flush())
+                        self.decompressor = None
+                    self.eof = True
+                else:
+                    v = struct.unpack(">I", hdr4)[0]
+                    if v == 0:
+                        if self.decompressor:
+                            self.buf.extend(self.decompressor.flush())
+                            self.decompressor = None
+                        self.eof = True
+                    else:
+                        self.dvzip_stored = bool(v & 0x80000000)
+                        self.dvzip_rem = v & 0x7FFFFFFF
+                        self.decompressor = None if self.dvzip_stored else zlib.decompressobj()
+            if not self.eof and self.dvzip_stored and self.dvzip_rem > 0:
+                want = min(n, self.dvzip_rem)
+                chunk = self.raw.read(want)
+                if not chunk:
+                    self.eof = True
+                    return b""
+                self.dvzip_rem -= len(chunk)
+                return chunk
+
         while len(self.buf) < n and not self.eof:
             if self.mode == "raw":
-                chunk = self.raw.read(max(65536, n - len(self.buf)))
+                chunk = self.raw.read(max(262144, n - len(self.buf)))
                 if not chunk:
                     self.eof = True
                     break
                 self.buf.extend(chunk)
             elif self.mode == "gzip":
-                chunk = self.raw.read(65536)
+                chunk = self.raw.read(262144)
                 if not chunk:
                     if self.decompressor:
                         self.buf.extend(self.decompressor.flush())
@@ -602,8 +636,8 @@ class StreamDecompressor:
                 self.buf.extend(self.decompressor.decompress(chunk))
             elif self.mode == "dvzip":
                 if self.dvzip_rem > 0:
-                    want = min(65536, self.dvzip_rem)
-                    chunk = self.raw.read_exact(want)
+                    want = min(1048576 if self.dvzip_stored else 65536, self.dvzip_rem)
+                    chunk = self.raw.read(want) if self.dvzip_stored else self.raw.read_exact(want)
                     if not chunk:
                         self.eof = True
                         break
@@ -709,10 +743,10 @@ def extract_cpio_stream(stream, dest_dir: Path):
                         idx += 1
                     part_target = target.with_name(target.name + ".part")
                     try:
-                        with part_target.open("wb", buffering=1048576) as out_f:
+                        with part_target.open("wb", buffering=2097152) as out_f:
                             rem = filesize
                             while rem > 0:
-                                c = stream.read(min(262144, rem))
+                                c = stream.read(min(1048576, rem))
                                 if not c:
                                     break
                                 out_f.write(c)
@@ -754,7 +788,7 @@ def extract_cpio_stream(stream, dest_dir: Path):
     return saved
 
 
-def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = False, file_label: str = "Incoming File", expected_total: int = 0, file_count: int = 1):
+def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = False, file_label: str = "Incoming File", expected_total: int = 0, file_count: int = 1, peer_name: str = "Android Peer"):
     t0 = time.time()
     last_emit = [0.0]
     last_term_log = [0.0]
@@ -762,6 +796,9 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
     done = [0]
     cancel_file = STATE_DIR / "cancel_transfer.flag"
     rx_lock = STATE_DIR / "rx_in_progress.lock"
+
+    if track_progress:
+        write_progress(True, "Receiving", file_label, 0, max(1, expected_total), 0, 0, 0, file_count, phase="Receiving files", peer_name=peer_name, is_connecting=False)
 
     def on_bytes_read(n):
         done[0] += n
@@ -782,7 +819,7 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
                 spd = int(done[0] / el)
                 eta = int(max(0, tot - done[0]) / max(1, spd))
                 pct = min(99, int((done[0] * 100) / tot))
-                write_progress(True, "Receiving", file_label, min(done[0], tot), tot, spd, eta, pct, file_count)
+                write_progress(True, "Receiving", file_label, min(done[0], tot), tot, spd, eta, pct, file_count, phase="Receiving files", peer_name=peer_name, is_connecting=False)
                 if now - last_term_log[0] >= 2.0 or done[0] >= tot:
                     last_term_log[0] = now
                     mb_done = done[0] / (1024 * 1024)
@@ -846,7 +883,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
 
     try:
         conn.settimeout(30.0)
-        f = conn.makefile("rb", buffering=262144)
+        f = conn.makefile("rb", buffering=1048576)
         while True:
             req_line = read_line(f)
             if not req_line:
@@ -890,6 +927,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
             if method == "POST" and path == "/Discover":
                 if not is_p2p_proxy and peer_ip.startswith("192.168.49."):
                     record_active_peer(f"p2p-{peer_ip}", active_peer_name, "5GHz Wi-Fi Direct P2P", f"{peer_ip}:8771", -48, 0)
+                    write_progress(True, "Receiving", "Incoming transfer", 0, 0, 0, 0, 0, 1, phase="Handshaking over 5GHz Wi-Fi Direct…", peer_name=active_peer_name, is_connecting=True)
                 resp = plistlib.dumps({
                     "ReceiverComputerName": active_peer_name if is_p2p_proxy else current_mac_name(),
                     "ReceiverModelName": "iPhone16,2" if is_p2p_proxy else "MacBookPro18,2",
@@ -920,8 +958,11 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     except Exception:
                         pass
                     touch_rx_lock()
+                    ask_phase = "Starting incoming stream…" if load_settings().get("autoAccept", False) else f"Waiting for approval from {current_mac_name()}…"
+                    write_progress(True, "Receiving", last_label, 0, last_total, 0, 0, 0, last_count, phase=ask_phase, peer_name=last_sender, is_connecting=True)
                     conn.settimeout(60.0)
                     if not wait_for_user_accept(last_sender, fnames if fnames else [str(x) for x in items], last_total):
+                        write_progress(False)
                         print(f"[P2P-Receiver] Declined transfer from {last_sender}")
                         send_resp(conn, 403, "Forbidden", b"")
                         break
@@ -969,7 +1010,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     except Exception:
                         pass
                     touch_rx_lock()
-                    saved, rx_len = stream_upload_to_dir(f, headers, DOWNLOADS, track_progress=True, file_label=last_label, expected_total=exp_tot, file_count=last_count)
+                    saved, rx_len = stream_upload_to_dir(f, headers, DOWNLOADS, track_progress=True, file_label=last_label, expected_total=exp_tot, file_count=last_count, peer_name=last_sender)
                     print(f"[{role}] {method} {path} from {addr} ({rx_len} B)")
                     for p in saved:
                         sz = p.stat().st_size
@@ -1013,6 +1054,20 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(CERT_FILE, KEY_FILE)
+try:
+    if hasattr(ctx, "set_ciphersuites"):
+        ctx.set_ciphersuites("TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+except Exception:
+    pass
+
+def set_high_throughput_sockbufs(s):
+    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        for sz in (4194304, 2097152, 1048576):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, opt, sz)
+                break
+            except Exception:
+                continue
 
 def is_authorized_peer_ip(peer_ip: str) -> bool:
     if peer_ip.startswith("192.168.49.") or peer_ip.startswith("127.") or peer_ip in ("::1", "fe80::1"):
@@ -1031,8 +1086,9 @@ def serve_port(bind_port: int, is_p2p_proxy: bool):
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    set_high_throughput_sockbufs(sock)
     sock.bind(("::", bind_port))
-    sock.listen(16)
+    sock.listen(32)
     label = "Finder AirDrop Proxy" if is_p2p_proxy else f"5GHz Wi-Fi Direct P2P Receiver ('{current_mac_name()}')"
     print(f"[+] {label} listening on *:{bind_port}")
     while True:
@@ -1047,10 +1103,7 @@ def serve_port(bind_port: int, is_p2p_proxy: bool):
             raw.settimeout(15.0)
             raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            try:
-                raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
-            except Exception:
-                pass
+            set_high_throughput_sockbufs(raw)
             tls = ctx.wrap_socket(raw, server_side=True)
             threading.Thread(target=handle_client, args=(tls, addr, is_p2p_proxy), daemon=True).start()
         except Exception:
@@ -1169,7 +1222,7 @@ from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("AIRDROP_P2P_STATE_DIR", Path.home() / ".airdrop-p2p"))
 
-def write_progress(active: bool, direction: str = "", file_name: str = "", done_bytes: int = 0, total_bytes: int = 0, speed_bps: int = 0, eta_sec: int = 0, pct: int = 0, file_count: int = 1):
+def write_progress(active: bool, direction: str = "", file_name: str = "", done_bytes: int = 0, total_bytes: int = 0, speed_bps: int = 0, eta_sec: int = 0, pct: int = 0, file_count: int = 1, phase: str = "", peer_name: str = "", is_connecting: bool = False):
     pf = STATE_DIR / "transfer_progress.json"
     tmp = STATE_DIR / "transfer_progress.json.tmp"
     try:
@@ -1187,6 +1240,9 @@ def write_progress(active: bool, direction: str = "", file_name: str = "", done_
             "speedBps": int(speed_bps),
             "etaSeconds": int(eta_sec),
             "percent": int(pct),
+            "phase": phase,
+            "peerName": peer_name,
+            "isConnecting": bool(is_connecting),
             "updatedAt": time.time(),
         }
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -1245,10 +1301,19 @@ try:
     else:
         host, port = discover_android()
 
+    first_label = files[0].name if files else (urls[0] if urls else "Outgoing transfer")
+    fcount_init = max(1, len(files))
+    write_progress(True, "Sending", first_label, 0, total_bytes, 0, 0, 0, fcount_init, phase="Opening 5GHz TLS channel…", peer_name="Android Device", is_connecting=True)
+
     print(f"[+] Connecting to Android peer over 5GHz Wi-Fi at {host}:{port}...")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    try:
+        if hasattr(ctx, "set_ciphersuites"):
+            ctx.set_ciphersuites("TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+    except Exception:
+        pass
 
     def read_http_response(f):
         status_line = f.readline().decode("iso-8859-1").strip()
@@ -1269,9 +1334,25 @@ try:
     max_attempts = 14 if peer_override else 1
     for attempt in range(max_attempts):
         try:
-            raw = socket.create_connection((host, port), timeout=1.5)
+            cand = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            cand.settimeout(1.5)
+            cand.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            cand.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+                for sz in (4194304, 2097152, 1048576):
+                    try:
+                        cand.setsockopt(socket.SOL_SOCKET, opt, sz)
+                        break
+                    except Exception:
+                        continue
+            cand.connect((host, port))
+            raw = cand
             break
         except Exception as e:
+            try:
+                cand.close()
+            except Exception:
+                pass
             last_conn_err = e
             if attempt + 1 < max_attempts:
                 time.sleep(0.35)
@@ -1282,12 +1363,13 @@ try:
         raw.settimeout(300.0)
         with ctx.wrap_socket(raw, server_hostname=host) as s:
             s.settimeout(300.0)
-            f = s.makefile("rb")
+            f = s.makefile("rb", buffering=262144)
             disc = plistlib.dumps({"DeviceSupportFlags": 111611}, fmt=plistlib.FMT_BINARY)
             s.sendall(f"POST /Discover HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {len(disc)}\r\nConnection: keep-alive\r\n\r\n".encode() + disc)
             st, body = read_http_response(f)
             peer_name = plistlib.loads(body).get("ReceiverComputerName", "Android Device") if body else "Android Device"
             print(f"[+] Discovered receiver: {peer_name} ({st})")
+            write_progress(True, "Sending", first_label, 0, total_bytes, 0, 0, 0, fcount_init, phase=f"Waiting for {peer_name} to accept…", peer_name=peer_name, is_connecting=True)
 
             sender_name = "MacBook Pro"
             try:
@@ -1337,7 +1419,7 @@ try:
                 last_emit = 0.0
                 off = 0
                 cancel_file = STATE_DIR / "cancel_transfer.flag"
-                write_progress(True, "Sending", label, 0, tot, 0, 0, 0, fcount)
+                write_progress(True, "Sending", label, 0, tot, 0, 0, 0, fcount, phase="Sending files", peer_name=peer_name, is_connecting=False)
 
                 def send_dvzip_block(raw_block: bytes):
                     if not raw_block:
@@ -1345,8 +1427,9 @@ try:
                     if cancel_file.exists():
                         write_progress(False)
                         sys.exit("[-] Transfer cancelled by user")
-                    pkt = struct.pack(">I", 0x80000000 | len(raw_block)) + raw_block
-                    s.sendall(f"{len(pkt):x}\r\n".encode("ascii") + pkt + b"\r\n")
+                    hdr4 = struct.pack(">I", 0x80000000 | len(raw_block))
+                    pkt_len = 4 + len(raw_block)
+                    s.sendall(f"{pkt_len:x}\r\n".encode("ascii") + hdr4 + raw_block + b"\r\n")
 
                 def make_odc_hdr(ino: int, mode: int, name: str, fsize: int) -> bytes:
                     nb = name.encode("utf-8") + b"\x00"
@@ -1358,21 +1441,21 @@ try:
                     fsize = p.stat().st_size
                     send_dvzip_block(make_odc_hdr(ino, 0o100644, "./" + p.name, fsize))
                     ino += 1
-                    with p.open("rb") as pf:
+                    with p.open("rb", buffering=2097152) as pf:
                         while True:
-                            chunk = pf.read(262144)
+                            chunk = pf.read(1048576)
                             if not chunk:
                                 break
                             send_dvzip_block(chunk)
                             off += len(chunk)
                             now = time.time()
-                            if now - last_emit >= 0.08 or off >= tot:
+                            if now - last_emit >= 0.25 or off >= tot:
                                 last_emit = now
                                 el = max(0.08, now - tx_start)
                                 spd = int(off / el)
                                 eta = int(max(0, tot - off) / max(1, spd))
                                 pct = min(99, int((off * 100) / max(1, tot)))
-                                write_progress(True, "Sending", label, min(off, tot), tot, spd, eta, pct, fcount)
+                                write_progress(True, "Sending", label, min(off, tot), tot, spd, eta, pct, fcount, phase="Sending files", peer_name=peer_name, is_connecting=False)
                 send_dvzip_block(make_odc_hdr(0, 0, "TRAILER!!!", 0))
                 s.sendall(b"0\r\n\r\n")
                 write_progress(False)

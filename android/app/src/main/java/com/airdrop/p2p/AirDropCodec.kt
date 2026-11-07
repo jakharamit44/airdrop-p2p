@@ -24,8 +24,17 @@ import java.util.zip.Inflater
 object AirDropCodec {
 
     const val DVZIP_BLOCK_BYTES = 65536
+    const val DVZIP_STORED_BLOCK_BYTES = 1_048_576
     const val DVZIP_STORED = 0x80000000.toInt()
     const val DEVICE_SUPPORT_FLAGS = 111611L
+
+    private val PRECOMPRESSED_EXTENSIONS = setOf(
+        "mkv", "mp4", "mov", "avi", "webm", "m4v", "ts",
+        "jpg", "jpeg", "png", "webp", "heic", "heif", "gif",
+        "mp3", "m4a", "aac", "flac", "ogg", "opus",
+        "zip", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar",
+        "apk", "aab", "ipa", "dmg", "pkg", "pdf", "docx", "xlsx", "pptx"
+    )
 
     val MEDIA_CAPABILITIES_BYTES: ByteArray =
         """{"SupportsAdjustmentBaseResources":true,"Version":3,"Codecs":{"hvc1":{"Profiles":{"VTIsHDRAllowedOnDevice":true,"VTSupportedProfiles":[1,2,3,4],"VTDoViIsHardwareAccelerated":true,"VTDoViSupportedLevels":["01","02","03","04","05","06","07","08","09"],"VTPerProfileSupport":{"3":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"1":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"4":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"2":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186}},"VTDoViSupportedProfiles":["05","08"]}},"CodecSupport":{"VTIsHDRAllowedOnDevice":true,"VTCodecSupportDict":{"apcs":{"VTIsHardwareAccelerated":true},"hvc1":{"VTIsHDRAllowedOnDevice":true,"VTPerProfileSupport":{"3":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"1":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"4":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"2":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186}},"VTSupportedProfiles":[1,2,3,4]},"apcn":{"VTIsHardwareAccelerated":true},"apch":{"VTIsHardwareAccelerated":true},"apco":{"VTIsHardwareAccelerated":true},"ap4x":{"VTIsHardwareAccelerated":true},"ap4h":{"VTIsHardwareAccelerated":true}}}},"ContainerFormats":{"public.heif-standard":{"HeifSubtypes":["public.avci","public.avif","public.heic","public.heics","public.heif"]}},"Vendor":{"com.apple":{"LivePhotoFormatVersion":"1","AssetBundleFormatVersion":"1"}}}"""
@@ -354,9 +363,13 @@ object AirDropCodec {
         onProgress: ((Long) -> Unit)? = null
     ) {
         val totalSize = entries.sumOf { it.size }
-        val useStoredBlocks = totalSize >= 1_048_576L
+        val allPrecompressed = entries.isNotEmpty() && entries.all {
+            it.name.substringAfterLast('.', "").lowercase(java.util.Locale.US) in PRECOMPRESSED_EXTENSIONS
+        }
+        val useStoredBlocks = totalSize >= 1_048_576L || allPrecompressed
+        val smallBufCap = if (useStoredBlocks) 4096 else DVZIP_BLOCK_BYTES
         val dvzipOut = object : OutputStream() {
-            private val blockBuf = ByteArray(DVZIP_BLOCK_BYTES)
+            private val blockBuf = ByteArray(smallBufCap)
             private var blockLen = 0
             private val compBuf = if (useStoredBlocks) ByteArray(0) else ByteArray(DVZIP_BLOCK_BYTES + 1024)
             private val hdrBytes = ByteArray(4)
@@ -372,20 +385,33 @@ object AirDropCodec {
 
             override fun write(b: Int) {
                 blockBuf[blockLen++] = b.toByte()
-                if (blockLen == DVZIP_BLOCK_BYTES) emitBlock()
+                if (blockLen == smallBufCap) emitBlock()
             }
 
             override fun write(b: ByteArray, off: Int, len: Int) {
+                if (useStoredBlocks && len >= smallBufCap) {
+                    emitBlock()
+                    var offset = off
+                    var remaining = len
+                    while (remaining > 0) {
+                        val chunk = minOf(remaining, DVZIP_STORED_BLOCK_BYTES)
+                        writeHdr(DVZIP_STORED or chunk)
+                        rawOut.write(b, offset, chunk)
+                        offset += chunk
+                        remaining -= chunk
+                    }
+                    return
+                }
                 var offset = off
                 var remaining = len
                 while (remaining > 0) {
-                    val room = DVZIP_BLOCK_BYTES - blockLen
+                    val room = smallBufCap - blockLen
                     val take = minOf(remaining, room)
                     System.arraycopy(b, offset, blockBuf, blockLen, take)
                     blockLen += take
                     offset += take
                     remaining -= take
-                    if (blockLen == DVZIP_BLOCK_BYTES) emitBlock()
+                    if (blockLen == smallBufCap) emitBlock()
                 }
             }
 
@@ -456,7 +482,7 @@ object AirDropCodec {
             dvzipOut.write(0)
         }
 
-        val buf = ByteArray(262144)
+        val buf = ByteArray(if (useStoredBlocks) DVZIP_STORED_BLOCK_BYTES else 262144)
         var ino = 1
         var cumulativeRead = 0L
         for (entry in entries) {
@@ -501,7 +527,7 @@ object AirDropCodec {
         destDir.mkdirs()
         val cpioStream = openDvzipOrGzipStream(rawIn)
         val saved = ArrayList<File>()
-        val ioBuf = ByteArray(262144)
+        val ioBuf = ByteArray(DVZIP_STORED_BLOCK_BYTES)
 
         fun readExact(inp: InputStream, dst: ByteArray, len: Int = dst.size): Int {
             var off = 0
@@ -583,7 +609,7 @@ object AirDropCodec {
                 val partFile = File(destDir, "${outFile.name}.part")
                 var writeSuccess = false
                 try {
-                    BufferedOutputStream(FileOutputStream(partFile), 262144).use { fos ->
+                    BufferedOutputStream(FileOutputStream(partFile), DVZIP_STORED_BLOCK_BYTES).use { fos ->
                         var left = fileSize
                         while (left > 0) {
                             val want = minOf(ioBuf.size.toLong(), left).toInt()
@@ -624,17 +650,23 @@ object AirDropCodec {
     }
 
     private fun openDvzipOrGzipStream(rawIn: InputStream): InputStream {
-        val prefix = ByteArray(2)
+        val prefix = ByteArray(6)
         var got = 0
-        while (got < 2) {
-            val n = rawIn.read(prefix, got, 2 - got)
+        while (got < 6) {
+            val n = rawIn.read(prefix, got, 6 - got)
             if (n <= 0) break
             got += n
         }
         if (got == 0) return ByteArrayInputStream(ByteArray(0))
         val combined = java.io.SequenceInputStream(ByteArrayInputStream(prefix, 0, got), rawIn)
-        if (got == 2 && prefix[0] == 0x1f.toByte() && prefix[1] == 0x8b.toByte()) {
-            return GZIPInputStream(combined)
+        if (got >= 2 && prefix[0] == 0x1f.toByte() && prefix[1] == 0x8b.toByte()) {
+            return GZIPInputStream(combined, 65536)
+        }
+        if (got == 6) {
+            val magic6 = String(prefix, 0, 6, StandardCharsets.US_ASCII)
+            if (magic6 == "070707" || magic6 == "070701" || magic6 == "070702") {
+                return combined
+            }
         }
         return object : InputStream() {
             private var storedLeft = 0

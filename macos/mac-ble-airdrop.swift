@@ -178,7 +178,10 @@ func writeProgressJson(
     totalBytes: Int64 = 0,
     speedBps: Int64 = 0,
     etaSeconds: Int64 = 0,
-    percent: Int = 0
+    percent: Int = 0,
+    phase: String = "",
+    peerName: String = "",
+    isConnecting: Bool = false
 ) {
     let pf = STATE_DIR.appendingPathComponent("transfer_progress.json")
     let tmp = STATE_DIR.appendingPathComponent("transfer_progress.json.tmp")
@@ -196,6 +199,9 @@ func writeProgressJson(
         "speedBps": speedBps,
         "etaSeconds": etaSeconds,
         "percent": percent,
+        "phase": phase,
+        "peerName": peerName,
+        "isConnecting": isConnecting,
         "updatedAt": Date().timeIntervalSince1970
     ]
     if let data = try? JSONSerialization.data(withJSONObject: dict, options: []) {
@@ -333,7 +339,7 @@ func safeMacNotification(message: String, title: String) {
     try? notify.run()
 }
 
-func loadMacSettings() -> (autoAccept: Bool, visible: Bool, deviceName: String) {
+func loadMacSettings() -> (autoAccept: Bool, visible: Bool, deviceName: String, themeMode: String) {
     let defaultName = Host.current().localizedName ?? "MacBook Pro"
     let sf = STATE_DIR.appendingPathComponent("settings.json")
     if let d = try? Data(contentsOf: sf),
@@ -341,17 +347,21 @@ func loadMacSettings() -> (autoAccept: Bool, visible: Bool, deviceName: String) 
         let auto = (obj["autoAccept"] as? Bool) ?? false
         let vis = (obj["visible"] as? Bool) ?? true
         let name = (obj["deviceName"] as? String) ?? defaultName
-        return (auto, vis, name.isEmpty ? defaultName : name)
+        let rawTheme = (obj["themeMode"] as? String) ?? "system"
+        let theme = ["light", "dark", "system"].contains(rawTheme) ? rawTheme : "system"
+        return (auto, vis, name.isEmpty ? defaultName : name, theme)
     }
-    return (false, true, defaultName)
+    return (false, true, defaultName, "system")
 }
 
-func saveMacSettings(autoAccept: Bool, visible: Bool, deviceName: String) {
+func saveMacSettings(autoAccept: Bool, visible: Bool, deviceName: String, themeMode: String? = nil) {
+    let resolvedTheme = themeMode ?? loadMacSettings().themeMode
     let sf = STATE_DIR.appendingPathComponent("settings.json")
     let dict: [String: Any] = [
         "autoAccept": autoAccept,
         "visible": visible,
-        "deviceName": deviceName
+        "deviceName": deviceName,
+        "themeMode": resolvedTheme
     ]
     if let d = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
         try? d.write(to: sf, options: [.atomic])
@@ -805,6 +815,17 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
     }
 
     saveCurrentWifiSsid()
+    let incomingPeerName = loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Nearby Device"
+    writeProgressJson(
+        active: true,
+        direction: "Receiving",
+        fileName: "Incoming transfer",
+        fileCount: 1,
+        percent: 0,
+        phase: "Joining 5 GHz Wi-Fi Direct (\(ssid))…",
+        peerName: incomingPeerName,
+        isConnecting: true
+    )
     print("[BLE-Daemon] Incoming WP2P 5GHz Wi-Fi Direct request: joining \(ssid)...")
     fflush(stdout)
 
@@ -826,11 +847,22 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
     }
 
     if macP2pIp.isEmpty {
+        writeProgressJson(active: false)
         restoreMacInternetWifi(ssid: ssid)
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
     }
 
+    writeProgressJson(
+        active: true,
+        direction: "Receiving",
+        fileName: "Incoming transfer",
+        fileCount: 1,
+        percent: 0,
+        phase: "Waiting for sender handshake (\(macP2pIp))…",
+        peerName: incomingPeerName,
+        isConnecting: true
+    )
     print("[BLE-Daemon] Joined \(ssid) at \(macP2pIp), signaling peer...")
     fflush(stdout)
     if !writeAll(out, data: Data("OK \(macP2pIp)\n".utf8)) {
@@ -847,10 +879,17 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
     var transferDetected = false
     while Date() < startDeadline {
         let detected = autoreleasepool { () -> Bool in
-            FileManager.default.fileExists(atPath: askFile.path) ||
-            FileManager.default.fileExists(atPath: txFile.path) ||
-            FileManager.default.fileExists(atPath: rxLock.path) ||
-            hasActiveTcpReceiverConnection()
+            if FileManager.default.fileExists(atPath: askFile.path) ||
+               FileManager.default.fileExists(atPath: rxLock.path) ||
+               hasActiveTcpReceiverConnection() {
+                return true
+            }
+            if let data = try? Data(contentsOf: txFile),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               (obj["isConnecting"] as? Bool) == false {
+                return true
+            }
+            return false
         }
         if detected {
             transferDetected = true
@@ -862,6 +901,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
     if !transferDetected {
         print("[BLE-Daemon] Peer did not initiate HTTPS transfer within 30s — restoring Wi-Fi")
         fflush(stdout)
+        writeProgressJson(active: false)
         restoreMacInternetWifi(ssid: ssid)
         return
     }
@@ -1708,7 +1748,27 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     let urls: [String]
     let totalRawBytes: Int
     let frameData: Data
+    let displayLabel: String
+    let itemCount: Int
+    var peerLabel: String
     var startedOpen = false
+
+    private func reportSenderConnecting(_ phase: String) {
+        writeProgressJson(
+            active: true,
+            direction: "Sending",
+            fileName: displayLabel,
+            fileCount: itemCount,
+            doneBytes: 0,
+            totalBytes: Int64(max(1, totalRawBytes)),
+            speedBps: 0,
+            etaSeconds: 0,
+            percent: 0,
+            phase: phase,
+            peerName: peerLabel,
+            isConnecting: true
+        )
+    }
 
     init(files: [URL], urls: [String] = []) throws {
         clearCancelFlag()
@@ -1716,6 +1776,10 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         self.files = files
         self.urls = urls
         self.totalRawBytes = files.reduce(0) { $0 + ((try? FileManager.default.attributesOfItem(atPath: $1.path)[.size] as? Int) ?? 0) }
+        self.itemCount = max(1, files.count + urls.count)
+        let firstLabel = files.first?.lastPathComponent ?? (urls.first ?? "Transfer")
+        self.displayLabel = self.itemCount > 1 ? "\(firstLabel) + \(self.itemCount - 1) more" : firstLabel
+        self.peerLabel = loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Nearby Device"
         if self.totalRawBytes >= 65_536 && !files.isEmpty {
             self.frameData = Data()
         } else {
@@ -1741,6 +1805,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
             self.frameData = frame
         }
         super.init()
+        reportSenderConnecting("Scanning for nearby device via Bluetooth LE…")
         cm = CBCentralManager(delegate: self, queue: nil)
     }
 
@@ -1748,6 +1813,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         if central.state == .poweredOn {
             let knownPeers = loadActivePeersFromDisk(maxAge: 30.0)
             if let first = knownPeers.first {
+                peerLabel = first.name
                 if first.psm > 0 {
                     targetPsm = CBL2CAPPSM(first.psm)
                 }
@@ -1756,6 +1822,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                     if let p = retrieved.first {
                         targetPeripheral = p
                         p.delegate = self
+                        reportSenderConnecting("Connecting to \(first.name) via Bluetooth LE…")
                         print("[BLE-Send] Connecting directly to active peer \(first.name) (\(uuid), PSM \(targetPsm))...")
                         fflush(stdout)
                         central.connect(p, options: nil)
@@ -1791,6 +1858,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         if targetPeripheral == nil {
             targetPeripheral = peripheral
             peripheral.delegate = self
+            reportSenderConnecting("Connecting to \(peerLabel) via Bluetooth LE…")
             print("[BLE-Send] Found nearby peer (\(peripheral.identifier), RSSI \(RSSI), PSM \(targetPsm)), connecting...")
             fflush(stdout)
             central.stopScan()
@@ -1801,10 +1869,12 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         if targetPsm > 0 && !startedOpen {
             startedOpen = true
+            reportSenderConnecting("Opening Bluetooth L2CAP channel…")
             print("[BLE-Send] Connected! Opening L2CAP channel PSM \(targetPsm)...")
             fflush(stdout)
             peripheral.openL2CAPChannel(targetPsm)
         } else {
+            reportSenderConnecting("Discovering Bluetooth L2CAP service…")
             peripheral.discoverServices([P2P_SERVICE_UUID])
         }
     }
@@ -1829,6 +1899,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
             if psm > 0 {
                 startedOpen = true
                 targetPsm = CBL2CAPPSM(psm)
+                reportSenderConnecting("Opening Bluetooth L2CAP channel…")
                 print("[BLE-Send] Read GATT PSM \(targetPsm), opening L2CAP channel...")
                 fflush(stdout)
                 peripheral.openL2CAPChannel(targetPsm)
@@ -1838,6 +1909,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         guard let ch = channel, error == nil else {
+            writeProgressJson(active: false)
             print("[BLE-Send] L2CAP open failed: \(String(describing: error))")
             exit(1)
         }
@@ -1845,6 +1917,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
 
         DispatchQueue.global(qos: .userInitiated).async {
             guard let inp = ch.inputStream, let out = ch.outputStream else {
+                writeProgressJson(active: false)
                 print("[BLE-Send] Failed to acquire L2CAP channel streams")
                 exit(1)
             }
@@ -1853,6 +1926,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
 
             // 5GHz Wi-Fi Direct P2P Negotiation for large files
             if self.totalRawBytes >= 65_536 && !self.files.isEmpty {
+                self.reportSenderConnecting("Requesting 5 GHz Wi-Fi Direct group…")
                 print("[BLE-Send] Negotiating 5GHz Wi-Fi Direct P2P over BLE L2CAP...")
                 fflush(stdout)
                 if writeAll(out, data: Data("WP2P".utf8)) {
@@ -1870,6 +1944,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                             let ssid = parts[0], pass = parts[1], host = parts[2], port = parts[3]
                             _ = pauseCloudflareWarpIfNeeded()
                             saveCurrentWifiSsid()
+                            self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
                             print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(port))...")
                             fflush(stdout)
 
@@ -1893,6 +1968,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                                 }
                             }
 
+                            self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
                             let txProc = Process()
                             txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
                             txProc.arguments = ["send", "--peer", "\(host):\(port)"] + self.files.map { $0.path } + self.urls
@@ -1902,6 +1978,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
 
                             if isTransferCancelled() {
                                 clearCancelFlag()
+                                writeProgressJson(active: false)
                                 inp.close()
                                 out.close()
                                 try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
@@ -1910,6 +1987,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                             }
 
                             if txProc.terminationStatus == 0 {
+                                writeProgressJson(active: false)
                                 inp.close()
                                 out.close()
                                 try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
@@ -1917,6 +1995,7 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                                 exit(0)
                             }
                             if txProc.terminationStatus == 43 {
+                                writeProgressJson(active: false)
                                 inp.close()
                                 out.close()
                                 try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
@@ -1930,7 +2009,11 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
 
             var payloadFrame = self.frameData
             if payloadFrame.isEmpty && !self.files.isEmpty {
-                guard let (gzData, fileDicts) = try? buildDvzipCpio(files: self.files) else { exit(1) }
+                self.reportSenderConnecting("Preparing fallback Bluetooth LE archive…")
+                guard let (gzData, fileDicts) = try? buildDvzipCpio(files: self.files) else {
+                    writeProgressJson(active: false)
+                    exit(1)
+                }
                 let metaDict: [String: Any] = [
                     "SenderComputerName": loadMacSettings().deviceName,
                     "SenderModelName": "MacBookPro18,2",
@@ -1938,7 +2021,10 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                     "Items": self.urls as [Any],
                     "Files": fileDicts
                 ]
-                guard let metaData = try? PropertyListSerialization.data(fromPropertyList: metaDict, format: .binary, options: 0) else { exit(1) }
+                guard let metaData = try? PropertyListSerialization.data(fromPropertyList: metaDict, format: .binary, options: 0) else {
+                    writeProgressJson(active: false)
+                    exit(1)
+                }
                 let encMeta = encryptBlePayload(metaData)
                 let encArch = gzData.isEmpty ? Data() : encryptBlePayload(gzData)
                 var frame = Data("ADRE".utf8)
@@ -1963,23 +2049,24 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
             )
             let ackData = readExact(inp, count: 2)
             let ackStr = ackData.flatMap { String(data: $0, encoding: .ascii) } ?? ""
+            writeProgressJson(active: false)
             inp.close()
             out.close()
             try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
             if ok && ackStr == "OK" {
-                let peerLabel = loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Android Device"
+                let resolvedPeer = loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? self.peerLabel
                 for f in self.files {
                     let sz = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? Int64) ?? 0
-                    appendReceivedLog(kind: "FILE", value: f.path, sizeBytes: sz, direction: "sent", peerName: peerLabel)
+                    appendReceivedLog(kind: "FILE", value: f.path, sizeBytes: sz, direction: "sent", peerName: resolvedPeer)
                 }
                 for u in self.urls {
-                    appendReceivedLog(kind: "URL", value: u, sizeBytes: Int64(u.utf8.count), direction: "sent", peerName: peerLabel)
+                    appendReceivedLog(kind: "URL", value: u, sizeBytes: Int64(u.utf8.count), direction: "sent", peerName: resolvedPeer)
                 }
                 let sound = Process()
                 sound.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
                 sound.arguments = ["/System/Library/Sounds/Glass.aiff"]
                 try? sound.run()
-                print("[BLE-Send] Delivered to \(peerLabel) via Direct Bluetooth LE L2CAP!")
+                print("[BLE-Send] Delivered to \(resolvedPeer) via Direct Bluetooth LE L2CAP!")
                 exit(0)
             } else {
                 print("[BLE-Send] Transfer incomplete (ok=\(ok), ack=\(String(describing: ackData)))")
@@ -1990,8 +2077,168 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
 }
 
 // ============================================================================
-// macOS Native SwiftUI State & Production 3-Tab Window UI (Zero Macro Plugins)
+// macOS Native SwiftUI State & QuickShare 4-Tab Day/Dark UI
 // ============================================================================
+
+func middleTruncateMacName(_ raw: String, maxChars: Int = 36) -> String {
+    if raw.count <= maxChars { return raw }
+    let ns = raw as NSString
+    let ext = ns.pathExtension
+    if !ext.isEmpty && ext.count <= 8 {
+        let suffix = ".\(ext)"
+        let keep = maxChars - suffix.count - 1
+        if keep >= 8 {
+            let headCount = (keep + 1) / 2
+            let tailCount = keep - headCount
+            let base = ns.deletingPathExtension
+            let head = String(base.prefix(headCount))
+            let tail = String(base.suffix(max(1, tailCount)))
+            return "\(head)…\(tail)\(suffix)"
+        }
+    }
+    let headCount = (maxChars - 1) / 2
+    let tailCount = maxChars - 1 - headCount
+    return "\(raw.prefix(headCount))…\(raw.suffix(tailCount))"
+}
+
+func currentMacGreeting() -> String {
+    let hour = Calendar.current.component(.hour, from: Date())
+    if hour >= 5 && hour < 12 { return "Good Morning" }
+    if hour >= 12 && hour < 17 { return "Good Afternoon" }
+    return "Good Evening"
+}
+
+func inferMacCategory(pathOrUrl: String, isUrl: Bool) -> String {
+    if isUrl { return "LINK" }
+    let ext = URL(fileURLWithPath: pathOrUrl).pathExtension.lowercased()
+    switch ext {
+    case "jpg", "jpeg", "png", "webp", "heic", "gif", "svg", "bmp", "tiff":
+        return "IMG"
+    case "mp4", "mov", "mkv", "webm", "avi", "m4v":
+        return "VID"
+    case "mp3", "wav", "m4a", "flac", "aac", "ogg", "opus":
+        return "AUD"
+    case "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "csv", "rtf", "pages", "numbers", "key":
+        return "DOC"
+    default:
+        return "FILE"
+    }
+}
+
+struct MacThemePalette: Equatable {
+    let isDark: Bool
+    let bgCanvas: Color
+    let bgSurface: Color
+    let bgSubtle: Color
+    let bgMuted: Color
+    let border: Color
+    let textPrimary: Color
+    let textSecondary: Color
+    let textMuted: Color
+    let indigo: Color
+    let indigoHover: Color
+    let indigoSubtle: Color
+    let emerald: Color
+    let emeraldSubtle: Color
+    let amber: Color
+    let amberSubtle: Color
+    let danger: Color
+    let dangerSubtle: Color
+    let nsCanvasRed: CGFloat
+    let nsCanvasGreen: CGFloat
+    let nsCanvasBlue: CGFloat
+
+    static let light = MacThemePalette(
+        isDark: false,
+        bgCanvas: Color(red: 0.953, green: 0.961, blue: 0.988),      // #F3F5FC
+        bgSurface: Color.white,                                       // #FFFFFF
+        bgSubtle: Color(red: 0.922, green: 0.941, blue: 0.980),       // #EBF0FA
+        bgMuted: Color(red: 0.871, green: 0.898, blue: 0.957),        // #DEE5F4
+        border: Color(red: 0.839, green: 0.875, blue: 0.933),         // #D6DFEE
+        textPrimary: Color(red: 0.067, green: 0.094, blue: 0.153),    // #111827 (16.8:1)
+        textSecondary: Color(red: 0.278, green: 0.333, blue: 0.412),  // #475569 (7.1:1)
+        textMuted: Color(red: 0.392, green: 0.455, blue: 0.545),      // #64748B (4.6:1)
+        indigo: Color(red: 0.325, green: 0.376, blue: 0.961),         // #5360F5
+        indigoHover: Color(red: 0.263, green: 0.310, blue: 0.878),    // #434FE0
+        indigoSubtle: Color(red: 0.933, green: 0.941, blue: 1.000),   // #EEF0FF
+        emerald: Color(red: 0.086, green: 0.639, blue: 0.290),        // #16A34A
+        emeraldSubtle: Color(red: 0.863, green: 0.988, blue: 0.906),  // #DCFCE7
+        amber: Color(red: 0.851, green: 0.467, blue: 0.024),          // #D97706
+        amberSubtle: Color(red: 0.996, green: 0.953, blue: 0.780),    // #FEF3C7
+        danger: Color(red: 0.863, green: 0.149, blue: 0.149),         // #DC2626
+        dangerSubtle: Color(red: 0.996, green: 0.886, blue: 0.886),   // #FEE2E2
+        nsCanvasRed: 0.953,
+        nsCanvasGreen: 0.961,
+        nsCanvasBlue: 0.988
+    )
+
+    static let dark = MacThemePalette(
+        isDark: true,
+        bgCanvas: Color(red: 0.051, green: 0.063, blue: 0.094),       // #0D1018
+        bgSurface: Color(red: 0.086, green: 0.106, blue: 0.153),      // #161B27
+        bgSubtle: Color(red: 0.118, green: 0.145, blue: 0.212),       // #1E2536
+        bgMuted: Color(red: 0.157, green: 0.192, blue: 0.278),        // #283147
+        border: Color(red: 0.157, green: 0.196, blue: 0.275),         // #283246
+        textPrimary: Color(red: 0.973, green: 0.980, blue: 0.988),    // #F8FAFC
+        textSecondary: Color(red: 0.580, green: 0.639, blue: 0.722),  // #94A3B8
+        textMuted: Color(red: 0.486, green: 0.545, blue: 0.631),      // #7C8BA1
+        indigo: Color(red: 0.365, green: 0.416, blue: 0.973),         // #5D6AF8
+        indigoHover: Color(red: 0.463, green: 0.510, blue: 1.000),    // #7682FF
+        indigoSubtle: Color(red: 0.122, green: 0.145, blue: 0.278),   // #1F2547
+        emerald: Color(red: 0.133, green: 0.773, blue: 0.369),        // #22C55E
+        emeraldSubtle: Color(red: 0.075, green: 0.184, blue: 0.137),  // #132F23
+        amber: Color(red: 0.961, green: 0.620, blue: 0.043),          // #F59E0B
+        amberSubtle: Color(red: 0.200, green: 0.145, blue: 0.063),    // #332510
+        danger: Color(red: 0.937, green: 0.267, blue: 0.267),         // #EF4444
+        dangerSubtle: Color(red: 0.212, green: 0.098, blue: 0.114),   // #36191D
+        nsCanvasRed: 0.051,
+        nsCanvasGreen: 0.063,
+        nsCanvasBlue: 0.094
+    )
+}
+
+struct MacScaleButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1.0)
+            .opacity(configuration.isPressed ? 0.92 : 1.0)
+            .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.78), value: configuration.isPressed)
+    }
+}
+
+struct MacStagedItem: Identifiable, Equatable {
+    let id: String
+    let pathOrUrl: String
+    let name: String
+    let sizeBytes: Int64
+    let isUrl: Bool
+    let category: String
+}
+
+struct MacStorageSummary: Equatable {
+    let totalBytes: Int64
+    let freeBytes: Int64
+
+    var usedBytes: Int64 { max(0, totalBytes - freeBytes) }
+    var usedFraction: Double {
+        guard totalBytes > 0 else { return 0 }
+        return min(1.0, max(0.0, Double(usedBytes) / Double(totalBytes)))
+    }
+
+    static func queryLocalDisk() -> MacStorageSummary {
+        let home = NSHomeDirectory()
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: home) {
+            let total = (attrs[.systemSize] as? NSNumber)?.int64Value ?? 0
+            let free = (attrs[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
+            if total > 0 {
+                return MacStorageSummary(totalBytes: total, freeBytes: max(0, free))
+            }
+        }
+        return MacStorageSummary(totalBytes: 512 * 1024 * 1024 * 1024, freeBytes: 128 * 1024 * 1024 * 1024)
+    }
+}
 
 struct MacHistoryEntry: Identifiable, Hashable {
     let id: String
@@ -2016,6 +2263,9 @@ struct MacLiveProgress: Equatable {
     let speedBps: Int64
     let etaSeconds: Int64
     let percent: Int
+    let phase: String
+    let peerName: String
+    let isConnecting: Bool
 }
 
 struct MacPendingAsk: Equatable {
@@ -2026,18 +2276,24 @@ struct MacPendingAsk: Equatable {
 }
 
 final class MacAirDropViewModel: ObservableObject {
-    @Published var selectedTab: Int = 0 // 0 = Nearby & Send, 1 = Transfers, 2 = Receive & P2P
+    @Published var selectedTab: Int = 0 // 0 = Send, 1 = Receive, 2 = History, 3 = Settings
+    @Published var stagedItems: [MacStagedItem] = []
+    @Published var showLinkComposer: Bool = false
     @Published var historyFilter: Int = 0 // 0 = All, 1 = Received, 2 = Sent
+    @Published var historySearch: String = ""
+    @Published var themeMode: String = "system" // "light", "dark", "system"
+    @Published var systemIsDark: Bool = true
+    @Published var storage: MacStorageSummary = MacStorageSummary.queryLocalDisk()
     @Published var receiverRunning: Bool = false
     @Published var mdnsRunning: Bool = false
     @Published var awdlProxyRunning: Bool = false
     @Published var bleRunning: Bool = true
     @Published var autoAccept: Bool = false
-    @Published var macDeviceName: String = Host.current().localizedName ?? "Amit’s MacBook Pro"
+    @Published var macDeviceName: String = Host.current().localizedName ?? "MacBook Pro"
     @Published var editingDeviceName: String = ""
     @Published var activePeers: [MacDiscoveredPeer] = []
-    @Published var peerStatusSummary: String = "0 Active Devices • Scanning BLE + 5GHz P2P..."
-    @Published var transferStatus: String = "5GHz Wi-Fi Direct + BLE L2CAP Ready — No shared router required"
+    @Published var peerStatusSummary: String = "0 Nearby Devices • Scanning BLE + 5 GHz Wi-Fi Direct"
+    @Published var transferStatus: String = "Select files to review, then click Send"
     @Published var isTransferring: Bool = false
     @Published var liveProgress: MacLiveProgress? = nil
     @Published var pendingAsk: MacPendingAsk? = nil
@@ -2045,20 +2301,43 @@ final class MacAirDropViewModel: ObservableObject {
     @Published var isDropTargeted: Bool = false
     @Published var showLogs: Bool = false
     @Published var pulse: Bool = false
+    @Published var bridgePhaseTick: Bool = false
     @Published var historyEntries: [MacHistoryEntry] = []
     @Published var logs: [String] = []
     @Published var bluetoothAuthorized: Bool = true
     @Published var bluetoothPoweredOn: Bool = true
     @Published var wifiPoweredOn: Bool = true
+
+    var onThemeChanged: ((MacThemePalette) -> Void)?
+    var onRequestFrontWindow: (() -> Void)?
+
     private var activeSendProcess: Process? = nil
     private var fastTimer: Timer?
     private var tickCount: Int = 0
+
+    var effectiveIsDark: Bool {
+        switch themeMode {
+        case "light": return false
+        case "dark": return true
+        default: return systemIsDark
+        }
+    }
+
+    var palette: MacThemePalette {
+        effectiveIsDark ? .dark : .light
+    }
+
+    var totalStagedBytes: Int64 {
+        stagedItems.reduce(Int64(0)) { $0 + $1.sizeBytes }
+    }
 
     init() {
         let s = loadMacSettings()
         self.autoAccept = s.autoAccept
         self.macDeviceName = s.deviceName
         self.editingDeviceName = s.deviceName
+        self.themeMode = s.themeMode
+        self.systemIsDark = Self.detectSystemDark()
         refreshSlow()
         refreshFast()
         fastTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
@@ -2068,7 +2347,30 @@ final class MacAirDropViewModel: ObservableObject {
             if self.tickCount % 7 == 0 {
                 self.refreshSlow()
             }
+            if self.tickCount % 50 == 0 {
+                let latestDisk = MacStorageSummary.queryLocalDisk()
+                if self.storage != latestDisk {
+                    self.storage = latestDisk
+                }
+            }
         }
+    }
+
+    static func detectSystemDark() -> Bool {
+        let match = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
+        return match == .darkAqua
+    }
+
+    func setThemeMode(_ mode: String) {
+        let normalized = ["light", "dark", "system"].contains(mode) ? mode : "system"
+        themeMode = normalized
+        systemIsDark = Self.detectSystemDark()
+        saveMacSettings(autoAccept: autoAccept, visible: receiverRunning, deviceName: macDeviceName, themeMode: normalized)
+        onThemeChanged?(palette)
+    }
+
+    func toggleDayDarkQuick() {
+        setThemeMode(effectiveIsDark ? "light" : "dark")
     }
 
     private func isPidAlive(_ file: String) -> Bool {
@@ -2079,6 +2381,14 @@ final class MacAirDropViewModel: ObservableObject {
     }
 
     func refreshFast() {
+        if themeMode == "system" {
+            let sysDark = Self.detectSystemDark()
+            if systemIsDark != sysDark {
+                systemIsDark = sysDark
+                onThemeChanged?(palette)
+            }
+        }
+
         // 0. Poll live active peers with strict 10-second TTL
         let livePeers = loadActivePeersFromDisk(maxAge: PEER_LIVE_TTL_SECONDS)
         if activePeers != livePeers {
@@ -2086,55 +2396,66 @@ final class MacAirDropViewModel: ObservableObject {
         }
         let statusLine: String
         if let first = livePeers.first {
-            statusLine = "Active: \(first.name) • \(first.transport) (\(first.rssi) dBm)"
+            statusLine = "\(first.name) • \(first.transport) (\(first.rssi) dBm)"
         } else {
-            statusLine = "0 Active Devices • Scanning BLE + 5GHz Wi-Fi Direct..."
+            statusLine = "0 Nearby Devices • Scanning BLE + 5 GHz Wi-Fi Direct"
         }
         if peerStatusSummary != statusLine {
             peerStatusSummary = statusLine
         }
 
-        // 1. Poll real-time transfer progress JSON
+        // 1. Poll real-time transfer progress JSON (22s freshness covers 12s Wi-Fi Direct join)
         let pf = STATE_DIR.appendingPathComponent("transfer_progress.json")
         if let d = try? Data(contentsOf: pf),
            let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
            (obj["active"] as? Bool) == true {
             let updatedAt = (obj["updatedAt"] as? Double) ?? Date().timeIntervalSince1970
-            if Date().timeIntervalSince1970 - updatedAt < 8.0 {
+            if Date().timeIntervalSince1970 - updatedAt < 22.0 {
+                let rawPhase = (obj["phase"] as? String) ?? ""
+                let rawPeer = (obj["peerName"] as? String) ?? ""
+                let connectingFlag = (obj["isConnecting"] as? Bool) ?? false
+                let dir = (obj["direction"] as? String) ?? "Transferring"
+                let pct = (obj["percent"] as? Int) ?? 0
+                let spd = (obj["speedBps"] as? NSNumber)?.int64Value ?? 0
                 let prog = MacLiveProgress(
-                    direction: (obj["direction"] as? String) ?? "Transferring",
+                    direction: dir,
                     fileName: (obj["fileName"] as? String) ?? "File",
-                    fileCount: (obj["fileCount"] as? Int) ?? 1,
+                    fileCount: max(1, (obj["fileCount"] as? Int) ?? 1),
                     doneBytes: (obj["doneBytes"] as? NSNumber)?.int64Value ?? 0,
-                    totalBytes: (obj["totalBytes"] as? NSNumber)?.int64Value ?? 1,
-                    speedBps: (obj["speedBps"] as? NSNumber)?.int64Value ?? 0,
+                    totalBytes: (obj["totalBytes"] as? NSNumber)?.int64Value ?? 0,
+                    speedBps: spd,
                     etaSeconds: (obj["etaSeconds"] as? NSNumber)?.int64Value ?? 0,
-                    percent: (obj["percent"] as? Int) ?? 0
+                    percent: pct,
+                    phase: rawPhase.isEmpty
+                        ? (connectingFlag ? "Connecting…" : (dir.lowercased().contains("send") ? "Sending files" : "Receiving files"))
+                        : rawPhase,
+                    peerName: rawPeer.isEmpty ? (livePeers.first?.name ?? "Nearby Device") : rawPeer,
+                    isConnecting: connectingFlag
                 )
                 if liveProgress != prog {
                     liveProgress = prog
                 }
-            } else if liveProgress != nil {
+            } else if !isTransferring && liveProgress != nil {
                 liveProgress = nil
             }
-        } else if liveProgress != nil {
+        } else if !isTransferring && liveProgress != nil {
             liveProgress = nil
         }
 
-        // 2. Poll pending Ask prompt JSON (when Ask Every Time is enabled)
+        // 2. Poll pending Ask prompt JSON
         let af = STATE_DIR.appendingPathComponent("pending_ask.json")
         if let d = try? Data(contentsOf: af),
            let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
            let id = obj["id"] as? String {
             let ask = MacPendingAsk(
                 id: id,
-                senderName: (obj["senderName"] as? String) ?? "Android Peer",
+                senderName: (obj["senderName"] as? String) ?? "Nearby Device",
                 fileNames: (obj["fileNames"] as? [String]) ?? ["Incoming File"],
                 totalBytes: (obj["totalBytes"] as? NSNumber)?.int64Value ?? 0
             )
             if pendingAsk != ask {
                 pendingAsk = ask
-                NSApp.activate(ignoringOtherApps: true)
+                onRequestFrontWindow?()
             }
         } else if pendingAsk != nil {
             pendingAsk = nil
@@ -2153,14 +2474,14 @@ final class MacAirDropViewModel: ObservableObject {
 
     func setReceiveMode(directGet: Bool) {
         autoAccept = directGet
-        saveMacSettings(autoAccept: directGet, visible: receiverRunning, deviceName: macDeviceName)
+        saveMacSettings(autoAccept: directGet, visible: receiverRunning, deviceName: macDeviceName, themeMode: themeMode)
     }
 
     func saveDeviceName() {
         let clean = editingDeviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
         macDeviceName = clean
-        saveMacSettings(autoAccept: autoAccept, visible: receiverRunning, deviceName: clean)
+        saveMacSettings(autoAccept: autoAccept, visible: receiverRunning, deviceName: clean, themeMode: themeMode)
     }
 
     func refreshSlow() {
@@ -2169,23 +2490,20 @@ final class MacAirDropViewModel: ObservableObject {
         awdlProxyRunning = isPidAlive("awdl-mdns.pid")
         bleRunning = true
 
-        // Check Bluetooth authorization and power state
         let auth = CBManager.authorization
         bluetoothAuthorized = (auth != .denied && auth != .restricted)
         if let cmState = BleAirDropDaemon.shared?.cm.state {
             bluetoothPoweredOn = (cmState != .poweredOff)
         }
 
-        // Check Wi-Fi power state in-process via CoreWLAN (avoids spawning networksetup every 1.4s)
         let wifiOn = CWWiFiClient.shared().interface(withName: "en0")?.powerOn() ?? true
         if wifiPoweredOn != wifiOn {
             wifiPoweredOn = wifiOn
         }
 
-        // Load received & sent history log
         let rxFile = STATE_DIR.appendingPathComponent("received.log")
         if let rxRaw = try? String(contentsOf: rxFile, encoding: .utf8) {
-            let parsed: [MacHistoryEntry] = rxRaw.split(separator: "\n").suffix(60).reversed().compactMap { line in
+            let parsed: [MacHistoryEntry] = rxRaw.split(separator: "\n").suffix(80).reversed().compactMap { line in
                 let parts = line.split(separator: "\t").map(String.init)
                 guard parts.count >= 3 else { return nil }
                 let ts = TimeInterval(parts[0]) ?? Date().timeIntervalSince1970
@@ -2193,7 +2511,7 @@ final class MacAirDropViewModel: ObservableObject {
                 let val = parts[2]
                 let sz: Int64 = parts.count >= 4 ? (Int64(parts[3]) ?? 0) : ((try? FileManager.default.attributesOfItem(atPath: val)[.size] as? Int64) ?? 0)
                 let isOut = parts.count >= 5 ? (parts[4] == "sent") : false
-                let peer = parts.count >= 6 ? parts[5] : "Nearby Peer"
+                let peer = parts.count >= 6 ? parts[5] : "Nearby Device"
                 return MacHistoryEntry(
                     id: "\(parts[0])-\(val)-\(isOut)",
                     timestamp: Date(timeIntervalSince1970: ts),
@@ -2211,7 +2529,6 @@ final class MacAirDropViewModel: ObservableObject {
             historyEntries = []
         }
 
-        // Load logs
         var combined: [String] = []
         for f in ["daemon.log", "ble-daemon.log"] {
             let lf = STATE_DIR.appendingPathComponent(f)
@@ -2226,7 +2543,7 @@ final class MacAirDropViewModel: ObservableObject {
     }
 
     func rescanNow() {
-        transferStatus = "Scanning BLE + 5GHz Wi-Fi Direct for active devices..."
+        transferStatus = "Scanning BLE + 5 GHz Wi-Fi Direct for nearby devices…"
         BleAirDropDaemon.shared?.rescanNow()
         if !receiverRunning {
             DispatchQueue.global(qos: .userInitiated).async {
@@ -2243,19 +2560,19 @@ final class MacAirDropViewModel: ObservableObject {
             refreshFast()
             refreshSlow()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
             self.refreshFast()
             if self.activePeers.isEmpty {
-                self.transferStatus = "Radar Active — Searching for Nearby Devices..."
+                self.transferStatus = "Listening for nearby devices…"
             } else {
-                self.transferStatus = "Found \(self.activePeers.count) active peer(s) ready for transfer"
+                self.transferStatus = "\(self.activePeers.count) device(s) nearby and ready"
             }
         }
     }
 
     func toggleDaemons(_ turnOn: Bool) {
-        transferStatus = turnOn ? "Starting P2P AirDrop services..." : "Pausing P2P AirDrop services..."
-        saveMacSettings(autoAccept: autoAccept, visible: turnOn, deviceName: macDeviceName)
+        transferStatus = turnOn ? "Starting P2P radio…" : "Pausing P2P radio…"
+        saveMacSettings(autoAccept: autoAccept, visible: turnOn, deviceName: macDeviceName, themeMode: themeMode)
         if turnOn {
             BleAirDropDaemon.shared?.rescanNow()
         }
@@ -2279,8 +2596,8 @@ final class MacAirDropViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self.refreshSlow()
                 self.transferStatus = turnOn
-                    ? "P2P Radio Active (5GHz Wi-Fi Direct • BLE L2CAP • HTTPS :8772)"
-                    : "AirDrop Radio Paused"
+                    ? "Radio active (5 GHz Wi-Fi Direct • BLE L2CAP)"
+                    : "Radio paused"
             }
         }
     }
@@ -2295,7 +2612,7 @@ final class MacAirDropViewModel: ObservableObject {
         try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
         isTransferring = false
         liveProgress = nil
-        transferStatus = "Transfer stopped by user"
+        transferStatus = "Transfer cancelled"
         DispatchQueue.global(qos: .userInitiated).async {
             let killProc = Process()
             killProc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
@@ -2332,13 +2649,183 @@ final class MacAirDropViewModel: ObservableObject {
         }
     }
 
-    func sendItems(_ args: [String]) {
-        guard !args.isEmpty, !isTransferring else { return }
+    // ========================================================================
+    // Staged File Queue (Never Auto-Sends Until User Clicks Send)
+    // ========================================================================
+    func stagePathsOrUrls(_ rawItems: [String]) {
+        var updated = stagedItems
+        var addedCount = 0
+        for raw in rawItems {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if updated.contains(where: { $0.pathOrUrl == trimmed }) { continue }
+            let isUrl = trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://")
+            if !isUrl {
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: trimmed, isDirectory: &isDir), !isDir.boolValue else {
+                    continue
+                }
+            }
+            let size: Int64 = isUrl
+                ? Int64(trimmed.utf8.count)
+                : ((try? FileManager.default.attributesOfItem(atPath: trimmed)[.size] as? Int64) ?? 0)
+            let dispName = isUrl ? trimmed : URL(fileURLWithPath: trimmed).lastPathComponent
+            let cat = inferMacCategory(pathOrUrl: trimmed, isUrl: isUrl)
+            updated.append(MacStagedItem(
+                id: UUID().uuidString,
+                pathOrUrl: trimmed,
+                name: dispName,
+                sizeBytes: size,
+                isUrl: isUrl,
+                category: cat
+            ))
+            addedCount += 1
+        }
+        stagedItems = updated
+        selectedTab = 0
+        onRequestFrontWindow?()
+        if addedCount > 0 {
+            transferStatus = "\(updated.count) item(s) selected (\(formatByteSize(totalStagedBytes))) — click Send to start"
+        }
+    }
+
+    func removeStagedItem(_ id: String) {
+        stagedItems.removeAll { $0.id == id }
+        if stagedItems.isEmpty {
+            transferStatus = "Queue cleared"
+        }
+    }
+
+    func clearStagedItems() {
+        stagedItems.removeAll()
+        transferStatus = "Queue cleared"
+    }
+
+    func chooseFilesForCategory(title: String, types: [UTType]) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.title = "Select \(title)"
+        panel.prompt = "Add to Queue"
+        if !types.isEmpty {
+            panel.allowedContentTypes = types
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK {
+            stagePathsOrUrls(panel.urls.map { $0.path })
+        }
+    }
+
+    func stageFinderSelection() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let script = """
+            tell application "Finder"
+                set selList to selection as list
+                set outPaths to ""
+                repeat with anItem in selList
+                    try
+                        set p to POSIX path of (anItem as alias)
+                        set outPaths to outPaths & p & linefeed
+                    end try
+                end repeat
+                return outPaths
+            end tell
+            """
+            let (_, out) = runProcessCapture("/usr/bin/osascript", ["-e", script])
+            let paths = out
+                .split(separator: "\n")
+                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if paths.isEmpty {
+                    self.transferStatus = "No file selected in Finder"
+                    self.onRequestFrontWindow?()
+                } else {
+                    self.stagePathsOrUrls(paths)
+                }
+            }
+        }
+    }
+
+    func stageClipboard() {
+        if let fileUrls = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !fileUrls.isEmpty {
+            stagePathsOrUrls(fileUrls.map { $0.path })
+            return
+        }
+        guard let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !clip.isEmpty else {
+            transferStatus = "Clipboard is empty"
+            return
+        }
+        if clip.hasPrefix("http://") || clip.hasPrefix("https://") {
+            stagePathsOrUrls([clip])
+        } else {
+            let stamp = Int(Date().timeIntervalSince1970)
+            let tmpFile = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("Clipboard-\(stamp).txt")
+            try? clip.data(using: .utf8)?.write(to: tmpFile)
+            stagePathsOrUrls([tmpFile.path])
+        }
+    }
+
+    func stageUrlOrNoteInput() {
+        let trimmed = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        urlInput = ""
+        showLinkComposer = false
+        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") {
+            stagePathsOrUrls([trimmed])
+        } else {
+            let stamp = Int(Date().timeIntervalSince1970)
+            let tmpFile = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("Note-\(stamp).txt")
+            try? trimmed.data(using: .utf8)?.write(to: tmpFile)
+            stagePathsOrUrls([tmpFile.path])
+        }
+    }
+
+    func sendStagedItems() {
+        guard !stagedItems.isEmpty, !isTransferring else { return }
+        let itemsToSend = stagedItems
+        let args = itemsToSend.map { $0.pathOrUrl }
+        let totalBytes = max(1, itemsToSend.reduce(Int64(0)) { $0 + $1.sizeBytes })
+        let count = itemsToSend.count
+        let firstName = itemsToSend[0].name
+        let summaryLabel = count > 1 ? "\(firstName) + \(count - 1) more" : firstName
+        let targetName = activePeers.first?.name ?? "Nearby Device"
+
         clearCancelFlag()
-        let targetName = activePeers.first?.name ?? "Nearby Peer"
         isTransferring = true
-        let label = args.map { $0.hasPrefix("http") ? $0 : URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")
-        transferStatus = "Sending \(label) to \(targetName) over 5GHz P2P..."
+        let initialConnecting = MacLiveProgress(
+            direction: "Sending",
+            fileName: summaryLabel,
+            fileCount: count,
+            doneBytes: 0,
+            totalBytes: totalBytes,
+            speedBps: 0,
+            etaSeconds: 0,
+            percent: 0,
+            phase: "Connecting to \(targetName) via Bluetooth LE…",
+            peerName: targetName,
+            isConnecting: true
+        )
+        liveProgress = initialConnecting
+        writeProgressJson(
+            active: true,
+            direction: "Sending",
+            fileName: summaryLabel,
+            fileCount: count,
+            doneBytes: 0,
+            totalBytes: totalBytes,
+            speedBps: 0,
+            etaSeconds: 0,
+            percent: 0,
+            phase: "Connecting to \(targetName) via Bluetooth LE…",
+            peerName: targetName,
+            isConnecting: true
+        )
+        transferStatus = "Connecting to \(targetName)…"
         try? Data("1".utf8).write(to: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
         BleAirDropDaemon.shared?.cancelActivePing()
 
@@ -2355,6 +2842,7 @@ final class MacAirDropViewModel: ObservableObject {
             try? p.run()
             p.waitUntilExit()
             try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+            writeProgressJson(active: false)
             restoreMacInternetWifi()
             let wasCancelled = isTransferCancelled()
             clearCancelFlag()
@@ -2366,190 +2854,159 @@ final class MacAirDropViewModel: ObservableObject {
                 self.isTransferring = false
                 self.liveProgress = nil
                 if wasCancelled {
-                    self.transferStatus = "Transfer stopped by user"
+                    self.transferStatus = "Transfer cancelled"
+                } else if ok {
+                    self.stagedItems.removeAll()
+                    self.transferStatus = "Sent \(summaryLabel) to \(targetName)"
                 } else {
-                    self.transferStatus = ok
-                        ? "Delivered \(label) to \(targetName)!"
-                        : "Transfer failed: \(lastLine.isEmpty ? "Ensure AirDrop P2P app is open on target device" : lastLine)"
+                    self.transferStatus = "Transfer failed: \(lastLine.isEmpty ? "Open AirDrop P2P on the receiving device and try again" : lastLine)"
                 }
                 self.refreshSlow()
             }
         }
     }
-
-    func chooseAndSendFiles() {
-        let targetName = activePeers.first?.name ?? "Nearby Device"
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = true
-        panel.prompt = "Quick Share to \(targetName)"
-        NSApp.activate(ignoringOtherApps: true)
-        if panel.runModal() == .OK {
-            let paths = panel.urls.map { $0.path }
-            sendItems(paths)
-        }
-    }
-
-    func sendFinderSelection() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
-            p.arguments = ["send"]
-            try? p.run()
-        }
-    }
-
-    func sendClipboardTextOrUrl() {
-        guard let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !clip.isEmpty else {
-            transferStatus = "Clipboard is empty"
-            return
-        }
-        if clip.hasPrefix("http://") || clip.hasPrefix("https://") {
-            sendItems([clip])
-        } else {
-            let stamp = Int(Date().timeIntervalSince1970)
-            let tmpFile = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("Clipboard-\(stamp).txt")
-            try? clip.data(using: .utf8)?.write(to: tmpFile)
-            sendItems([tmpFile.path])
-        }
-    }
 }
-
-// Color Tokens matching Android Obsidian Glass UI
-private let MacObsidianBg = Color(red: 0.03, green: 0.04, blue: 0.07)
-private let MacGlassCard = Color(red: 0.07, green: 0.09, blue: 0.14)
-private let MacGlassElevated = Color(red: 0.09, green: 0.13, blue: 0.20)
-private let MacGlassBorder = Color.white.opacity(0.11)
-private let MacCyan = Color(red: 0.05, green: 0.65, blue: 0.91)
-private let MacCyanBright = Color(red: 0.22, green: 0.74, blue: 0.97)
-private let MacIndigo = Color(red: 0.39, green: 0.40, blue: 0.95)
-private let MacEmerald = Color(red: 0.06, green: 0.73, blue: 0.51)
-private let MacAmber = Color(red: 0.96, green: 0.62, blue: 0.04)
 
 struct MacAirDropMainView: View {
     @ObservedObject var vm: MacAirDropViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var p: MacThemePalette { vm.palette }
 
     var body: some View {
         ZStack {
-            MacObsidianBg.ignoresSafeArea()
+            p.bgCanvas.ignoresSafeArea()
 
             VStack(spacing: 0) {
-                // 1. Top Brand & Status Header Bar
                 topHeaderBar
                     .padding(.horizontal, 18)
                     .padding(.top, 14)
                     .padding(.bottom, 10)
 
-                // 1b. System Readiness Banner (Permissions + Bluetooth & Wi-Fi Power Prompts)
                 if !vm.bluetoothAuthorized || !vm.bluetoothPoweredOn || !vm.wifiPoweredOn {
                     systemReadinessBanner
                         .padding(.horizontal, 18)
                         .padding(.bottom, 10)
                 }
 
-                // 2. Real-Time Active Transfer Telemetry Banner
                 if let prog = vm.liveProgress {
-                    liveTelemetryCard(prog)
+                    liveConnectionBridgeCard(prog)
                         .padding(.horizontal, 18)
                         .padding(.bottom, 10)
                 } else if vm.isTransferring {
-                    preparingTransferCard
-                        .padding(.horizontal, 18)
-                        .padding(.bottom, 10)
+                    liveConnectionBridgeCard(MacLiveProgress(
+                        direction: "Sending",
+                        fileName: vm.stagedItems.first?.name ?? "Transfer",
+                        fileCount: max(1, vm.stagedItems.count),
+                        doneBytes: 0,
+                        totalBytes: max(1, vm.totalStagedBytes),
+                        speedBps: 0,
+                        etaSeconds: 0,
+                        percent: 0,
+                        phase: vm.transferStatus,
+                        peerName: vm.activePeers.first?.name ?? "Nearby Device",
+                        isConnecting: true
+                    ))
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 10)
                 }
 
-                // 3. Active Tab Content
                 ScrollView {
                     VStack(spacing: 14) {
-                        if vm.selectedTab == 0 {
-                            nearbyRadarTab
-                        } else if vm.selectedTab == 1 {
-                            transfersHistoryTab
-                        } else {
-                            receiveAndP2pTab
+                        switch vm.selectedTab {
+                        case 0:
+                            sendTabContent
+                        case 1:
+                            receiveRadarTabContent
+                        case 2:
+                            historyTabContent
+                        default:
+                            settingsTabContent
                         }
                     }
                     .padding(.horizontal, 18)
                     .padding(.vertical, 8)
                 }
 
-                // 4. Bottom 3-Tab Segmented Navigation Bar
                 bottomTabBar
             }
 
-            // 5. Incoming Transfer Accept / Decline Modal Overlay (When Direct Get = OFF)
             if let ask = vm.pendingAsk {
-                Color.black.opacity(0.65)
+                Color.black.opacity(p.isDark ? 0.65 : 0.35)
                     .ignoresSafeArea()
                 incomingAskModal(ask)
                     .padding(28)
             }
         }
-        .frame(minWidth: 540, idealWidth: 560, minHeight: 650, idealHeight: 680)
-        .preferredColorScheme(.dark)
+        .frame(minWidth: 550, idealWidth: 570, minHeight: 680, idealHeight: 720)
+        .preferredColorScheme(p.isDark ? .dark : .light)
     }
 
+    // ========================================================================
+    // Top Header Bar (Greeting + Radio Status + Day/Dark Toggle + Scan)
+    // ========================================================================
     private var topHeaderBar: some View {
         HStack(spacing: 12) {
             ZStack {
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(LinearGradient(
-                        colors: [Color(red: 0.06, green: 0.12, blue: 0.24), Color(red: 0.04, green: 0.06, blue: 0.12)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ))
+                Circle()
+                    .fill(p.indigoSubtle)
                     .frame(width: 42, height: 42)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(MacCyan.opacity(0.5), lineWidth: 1)
-                    )
+                    .overlay(Circle().stroke(p.indigo.opacity(0.28), lineWidth: 1))
                 Image(systemName: "dot.radiowaves.left.and.right")
-                    .font(.system(size: 20, weight: .bold))
-                    .foregroundColor(MacCyanBright)
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(p.indigo)
             }
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 7) {
-                    Text("AirDrop P2P")
-                        .font(.system(size: 17, weight: .heavy))
-                        .foregroundColor(.white)
-                    Circle()
-                        .fill(vm.receiverRunning ? MacEmerald : MacAmber)
-                        .frame(width: 7, height: 7)
-                    Text(vm.receiverRunning ? "P2P ONLINE" : "PAUSED")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(vm.receiverRunning ? MacEmerald : MacAmber)
+                    Text(currentMacGreeting())
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundColor(p.textPrimary)
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(vm.receiverRunning ? p.emerald : p.amber)
+                            .frame(width: 6, height: 6)
+                        Text(vm.receiverRunning ? "Ready" : "Paused")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(vm.receiverRunning ? p.emerald : p.amber)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule()
+                            .fill(vm.receiverRunning ? p.emeraldSubtle : p.amberSubtle)
+                    )
                 }
-                Text("\(vm.macDeviceName) • 5GHz Wi-Fi Direct + BLE L2CAP")
+                Text("\(vm.macDeviceName) • Send & receive files directly")
                     .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+                    .foregroundColor(p.textSecondary)
+                    .lineLimit(1)
             }
 
             Spacer()
 
-            // Quick Receive Mode Pill
-            Button(action: { vm.setReceiveMode(directGet: !vm.autoAccept) }) {
+            // 1-Tap Day / Dark Theme Toggle
+            Button(action: { vm.toggleDayDarkQuick() }) {
                 HStack(spacing: 5) {
-                    Circle()
-                        .fill(vm.autoAccept ? MacEmerald : MacAmber)
-                        .frame(width: 6, height: 6)
-                    Text(vm.autoAccept ? "Direct Get" : "Ask First")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(vm.autoAccept ? MacEmerald : MacAmber)
+                    Image(systemName: p.isDark ? "sun.max.fill" : "moon.stars.fill")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(p.isDark ? p.amber : p.indigo)
+                    Text(p.isDark ? "Day" : "Dark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(p.textPrimary)
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(
                     Capsule()
-                        .fill((vm.autoAccept ? MacEmerald : MacAmber).opacity(0.15))
-                        .overlay(Capsule().stroke((vm.autoAccept ? MacEmerald : MacAmber).opacity(0.45), lineWidth: 1))
+                        .fill(p.bgSurface)
+                        .overlay(Capsule().stroke(p.border, lineWidth: 1))
                 )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(MacScaleButtonStyle())
+            .help("Switch between Day and Dark appearance")
 
-            // Rescan Button
+            // Scan Button
             Button(action: { vm.rescanNow() }) {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.clockwise")
@@ -2557,16 +3014,16 @@ struct MacAirDropMainView: View {
                     Text("Scan")
                         .font(.system(size: 11, weight: .semibold))
                 }
-                .foregroundColor(MacCyanBright)
+                .foregroundColor(p.indigo)
                 .padding(.horizontal, 11)
                 .padding(.vertical, 6)
                 .background(
                     Capsule()
-                        .fill(MacGlassElevated)
-                        .overlay(Capsule().stroke(MacGlassBorder, lineWidth: 1))
+                        .fill(p.indigoSubtle)
+                        .overlay(Capsule().stroke(p.indigo.opacity(0.30), lineWidth: 1))
                 )
             }
-            .buttonStyle(.plain)
+            .buttonStyle(MacScaleButtonStyle())
         }
     }
 
@@ -2575,522 +3032,1033 @@ struct MacAirDropMainView: View {
         if !vm.bluetoothAuthorized { missing.append("Bluetooth Permission") }
         if !vm.bluetoothPoweredOn { missing.append("Bluetooth") }
         if !vm.wifiPoweredOn { missing.append("Wi-Fi") }
-        let titleText = "Turn on \(missing.joined(separator: " & ")) for AirDrop P2P"
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Circle()
-                    .fill(MacAmber)
+                    .fill(p.amber)
                     .frame(width: 8, height: 8)
-                Text(titleText)
+                Text("Turn on \(missing.joined(separator: " & "))")
                     .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(.white)
+                    .foregroundColor(p.textPrimary)
                 Spacer()
             }
             Text("Bluetooth discovers nearby devices and 5 GHz Wi-Fi Direct transfers large files at full speed.")
                 .font(.system(size: 11))
-                .foregroundColor(.secondary)
+                .foregroundColor(p.textSecondary)
             HStack(spacing: 8) {
                 if !vm.bluetoothAuthorized {
-                    Button("Allow Bluetooth Permission") {
-                        vm.openBluetoothPrivacySettings()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(MacAmber)
-                    .controlSize(.small)
+                    Button("Allow Bluetooth") { vm.openBluetoothPrivacySettings() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(p.amber)
+                        .controlSize(.small)
                 }
                 if !vm.bluetoothPoweredOn {
-                    Button("Turn On Bluetooth") {
-                        vm.openBluetoothSettings()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(MacCyan)
-                    .controlSize(.small)
+                    Button("Turn On Bluetooth") { vm.openBluetoothSettings() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(p.indigo)
+                        .controlSize(.small)
                 }
                 if !vm.wifiPoweredOn {
-                    Button("Turn On Wi-Fi") {
-                        vm.enableMacWifi()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(MacCyan)
-                    .controlSize(.small)
+                    Button("Turn On Wi-Fi") { vm.enableMacWifi() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(p.indigo)
+                        .controlSize(.small)
                 }
                 Spacer()
             }
         }
         .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 14)
-                .fill(MacGlassElevated)
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(MacAmber.opacity(0.65), lineWidth: 1))
+            RoundedRectangle(cornerRadius: 16)
+                .fill(p.bgSurface)
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(p.amber.opacity(0.6), lineWidth: 1))
         )
     }
 
-    private func liveTelemetryCard(_ prog: MacLiveProgress) -> some View {
+    // ========================================================================
+    // Live Connecting… / Connected Peer Bridge Card (Mockup 2 Left)
+    // ========================================================================
+    private func liveConnectionBridgeCard(_ prog: MacLiveProgress) -> some View {
         let isSending = prog.direction.lowercased().contains("send")
-        return VStack(alignment: .leading, spacing: 8) {
+        let senderLabel = isSending ? vm.macDeviceName : prog.peerName
+        let receiverLabel = isSending ? prog.peerName : vm.macDeviceName
+        let statusTitle = prog.isConnecting ? "Connecting…" : "Connected"
+        let sizeSummary: String = {
+            if prog.totalBytes > 0 && prog.doneBytes > 0 {
+                return "\(formatByteSize(prog.doneBytes)) / \(formatByteSize(prog.totalBytes))"
+            } else if prog.totalBytes > 0 {
+                return formatByteSize(prog.totalBytes)
+            }
+            return "Preparing"
+        }()
+        let speedSummary: String = {
+            if prog.isConnecting || prog.speedBps <= 0 {
+                return prog.isConnecting ? "Handshake" : "Starting…"
+            }
+            return formatTransferSpeed(prog.speedBps)
+        }()
+
+        return VStack(spacing: 12) {
+            // Top bar: Status + File + Cancel X
             HStack(spacing: 8) {
-                Text(prog.direction.uppercased())
-                    .font(.system(size: 9, weight: .heavy))
-                    .foregroundColor(isSending ? MacCyanBright : MacEmerald)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill((isSending ? MacCyan : MacEmerald).opacity(0.2))
-                    )
-                Text(prog.fileName)
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(.white)
+                if prog.isConnecting {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Circle()
+                        .fill(p.emerald)
+                        .frame(width: 9, height: 9)
+                }
+                Text(statusTitle)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(p.textPrimary)
+                Text("• \(middleTruncateMacName(prog.fileName, maxChars: 28))")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(p.textSecondary)
                     .lineLimit(1)
                 Spacer()
-                Text(formatTransferSpeed(prog.speedBps))
-                    .font(.system(size: 12, weight: .heavy).monospacedDigit())
-                    .foregroundColor(MacCyanBright)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 3)
-                    .background(
-                        Capsule()
-                            .fill(MacObsidianBg.opacity(0.8))
-                            .overlay(Capsule().stroke(MacGlassBorder, lineWidth: 1))
-                    )
                 Button(action: { vm.cancelActiveTransfer() }) {
-                    Text("Cancel")
+                    Image(systemName: "xmark")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(
-                            Capsule()
-                                .fill(Color.red.opacity(0.28))
-                                .overlay(Capsule().stroke(Color.red.opacity(0.65), lineWidth: 1))
-                        )
+                        .foregroundColor(p.textSecondary)
+                        .frame(width: 26, height: 26)
+                        .background(Circle().fill(p.bgSubtle))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(MacScaleButtonStyle())
+                .help("Cancel transfer")
             }
 
+            // Sender <-- Dashed Arc + Direction Icon --> Receiver
+            HStack(spacing: 14) {
+                VStack(spacing: 5) {
+                    ZStack {
+                        Circle()
+                            .fill(p.indigoSubtle)
+                            .frame(width: 48, height: 48)
+                            .overlay(Circle().stroke(p.indigo.opacity(0.45), lineWidth: 1.5))
+                        Image(systemName: isSending ? "laptopcomputer" : "iphone.gen3")
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(p.indigo)
+                    }
+                    Text(middleTruncateMacName(senderLabel, maxChars: 16))
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(p.textPrimary)
+                        .lineLimit(1)
+                }
+                .frame(width: 110)
+
+                ZStack {
+                    Path { path in
+                        path.move(to: CGPoint(x: 8, y: 26))
+                        path.addQuadCurve(to: CGPoint(x: 172, y: 26), control: CGPoint(x: 90, y: -4))
+                    }
+                    .stroke(
+                        p.indigo.opacity(0.55),
+                        style: StrokeStyle(
+                            lineWidth: 1.8,
+                            lineCap: .round,
+                            dash: [5, 5],
+                            dashPhase: vm.bridgePhaseTick ? -20 : 0
+                        )
+                    )
+                    .frame(width: 180, height: 34)
+
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(p.bgSurface)
+                            .frame(width: 34, height: 34)
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(p.indigo.opacity(0.45), lineWidth: 1.2))
+                        Image(systemName: isSending ? "arrow.up.doc.fill" : "arrow.down.doc.fill")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundColor(isSending ? p.indigo : p.emerald)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+
+                VStack(spacing: 5) {
+                    ZStack {
+                        Circle()
+                            .fill(p.emeraldSubtle)
+                            .frame(width: 48, height: 48)
+                            .overlay(Circle().stroke(p.emerald.opacity(0.45), lineWidth: 1.5))
+                        Image(systemName: isSending ? "iphone.gen3" : "laptopcomputer")
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(p.emerald)
+                    }
+                    Text(middleTruncateMacName(receiverLabel, maxChars: 16))
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(p.textPrimary)
+                        .lineLimit(1)
+                }
+                .frame(width: 110)
+            }
+            .onAppear {
+                guard !reduceMotion else { return }
+                withAnimation(.linear(duration: 1.1).repeatForever(autoreverses: false)) {
+                    vm.bridgePhaseTick = true
+                }
+            }
+
+            // Live step-by-step phase text (eliminates blind connecting gap)
+            Text(prog.phase)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(prog.isConnecting ? p.indigo : p.textSecondary)
+                .lineLimit(1)
+
+            // 3-Column Indigo Summary Strip: Items | Size | Speed
+            HStack(spacing: 0) {
+                bridgeMetricColumn(title: "Items", value: "\(prog.fileCount) \(prog.fileCount == 1 ? "file" : "files")")
+                Rectangle().fill(Color.white.opacity(0.22)).frame(width: 1, height: 28)
+                bridgeMetricColumn(title: "Size", value: sizeSummary)
+                Rectangle().fill(Color.white.opacity(0.22)).frame(width: 1, height: 28)
+                bridgeMetricColumn(title: "Speed", value: speedSummary)
+            }
+            .padding(.vertical, 9)
+            .background(RoundedRectangle(cornerRadius: 12).fill(p.indigo))
+
+            // Progress Bar
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule()
-                        .fill(MacObsidianBg)
-                        .frame(height: 8)
-                    Capsule()
-                        .fill(LinearGradient(
-                            colors: [MacCyan, MacCyanBright, MacEmerald],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        ))
-                        .frame(width: max(12, geo.size.width * CGFloat(prog.percent) / 100.0), height: 8)
+                        .fill(p.bgSubtle)
+                        .frame(height: 7)
+                    if prog.isConnecting {
+                        Capsule()
+                            .fill(p.indigo.opacity(0.75))
+                            .frame(width: max(48, geo.size.width * 0.28), height: 7)
+                            .offset(x: vm.pulse ? geo.size.width * 0.68 : 4)
+                    } else {
+                        Capsule()
+                            .fill(isSending ? p.indigo : p.emerald)
+                            .frame(width: max(10, geo.size.width * CGFloat(min(100, max(0, prog.percent))) / 100.0), height: 7)
+                    }
                 }
             }
-            .frame(height: 8)
+            .frame(height: 7)
 
-            HStack {
-                Text("\(formatByteSize(prog.doneBytes)) / \(formatByteSize(prog.totalBytes))")
-                    .font(.system(size: 11, weight: .medium).monospacedDigit())
-                    .foregroundColor(.secondary)
-                Spacer()
-                if prog.etaSeconds > 0 {
-                    Text("~\(prog.etaSeconds)s left")
-                        .font(.system(size: 11).monospacedDigit())
-                        .foregroundColor(.secondary)
+            if !prog.isConnecting {
+                HStack {
+                    Text(prog.direction)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(p.textSecondary)
+                    Spacer()
+                    if prog.etaSeconds > 0 {
+                        Text("~\(prog.etaSeconds)s remaining")
+                            .font(.system(size: 11).monospacedDigit())
+                            .foregroundColor(p.textSecondary)
+                    }
+                    Text("\(prog.percent)%")
+                        .font(.system(size: 11, weight: .bold).monospacedDigit())
+                        .foregroundColor(p.textPrimary)
                 }
-                Text("\(prog.percent)%")
-                    .font(.system(size: 11, weight: .heavy).monospacedDigit())
-                    .foregroundColor(.white)
             }
         }
-        .padding(14)
+        .padding(15)
         .background(
-            RoundedRectangle(cornerRadius: 16)
-                .fill(MacGlassElevated)
-                .overlay(RoundedRectangle(cornerRadius: 16).stroke(MacCyan.opacity(0.55), lineWidth: 1))
+            RoundedRectangle(cornerRadius: 20)
+                .fill(p.bgSurface)
+                .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.indigo.opacity(0.45), lineWidth: 1.2))
+                .shadow(color: Color.black.opacity(p.isDark ? 0.28 : 0.06), radius: 12, x: 0, y: 4)
         )
     }
 
-    private var preparingTransferCard: some View {
-        HStack(spacing: 12) {
-            ProgressView()
-                .controlSize(.small)
-            Text(vm.transferStatus)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(MacCyanBright)
+    private func bridgeMetricColumn(title: String, value: String) -> some View {
+        VStack(spacing: 2) {
+            Text(title)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(Color.white.opacity(0.82))
+            Text(value)
+                .font(.system(size: 12, weight: .bold).monospacedDigit())
+                .foregroundColor(.white)
                 .lineLimit(1)
-            Spacer()
-            Button(action: { vm.cancelActiveTransfer() }) {
-                Text("Cancel")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(
-                        Capsule()
-                            .fill(Color.red.opacity(0.28))
-                            .overlay(Capsule().stroke(Color.red.opacity(0.65), lineWidth: 1))
-                    )
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // ========================================================================
+    // TAB 0: Send (Staged Queue + 2x3 Categories + Storage Donut + Dual CTAs)
+    // ========================================================================
+    private var sendTabContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // 1. Staged Files Queue Card (Appears Whenever Files Are Selected)
+            if !vm.stagedItems.isEmpty {
+                stagedFilesQueueCard
             }
-            .buttonStyle(.plain)
+
+            // 2. Categories 2x3 Circular Grid (Mockup 2 Center)
+            categoriesGridCard
+
+            // 3. Inline Link / Note Composer (when toggled)
+            if vm.showLinkComposer {
+                inlineLinkComposerCard
+            }
+
+            // 4. Storage Overview Donut Ring Card (Mockup 1 Center)
+            storageOverviewCard
+
+            // 5. Bottom Dual Action Buttons (Send / Select Files + Receive)
+            HStack(spacing: 12) {
+                Button(action: {
+                    if vm.stagedItems.isEmpty {
+                        vm.chooseFilesForCategory(title: "Files", types: [])
+                    } else {
+                        vm.sendStagedItems()
+                    }
+                }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "paperplane.fill")
+                            .font(.system(size: 14, weight: .bold))
+                        Text(vm.stagedItems.isEmpty ? "Select Files" : "Send (\(vm.stagedItems.count))")
+                            .font(.system(size: 14, weight: .bold))
+                    }
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 13)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(p.indigo)
+                    )
+                }
+                .buttonStyle(MacScaleButtonStyle())
+                .disabled(vm.isTransferring)
+
+                Button(action: { vm.selectedTab = 1 }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.system(size: 15, weight: .bold))
+                        Text("Receive")
+                            .font(.system(size: 14, weight: .bold))
+                    }
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 13)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(p.emerald)
+                    )
+                }
+                .buttonStyle(MacScaleButtonStyle())
+            }
+
+            // 6. Recently Sent Preview
+            let recentSent = vm.historyEntries.filter { $0.isOutgoing }.prefix(3)
+            if !recentSent.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Recently Sent")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundColor(p.textPrimary)
+                        Spacer()
+                        Button("View all") {
+                            vm.historyFilter = 2
+                            vm.selectedTab = 2
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(p.indigo)
+                        .buttonStyle(.plain)
+                    }
+                    ForEach(Array(recentSent)) { item in
+                        compactHistoryRow(item)
+                    }
+                }
+            }
+        }
+        .onDrop(of: [.fileURL, .url, .plainText], isTargeted: $vm.isDropTargeted) { providers in
+            handleDropToStage(providers)
+        }
+    }
+
+    private var stagedFilesQueueCard: some View {
+        let peerName = vm.activePeers.first?.name
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(p.indigoSubtle)
+                        .frame(width: 28, height: 28)
+                    Text("\(vm.stagedItems.count)")
+                        .font(.system(size: 12, weight: .heavy).monospacedDigit())
+                        .foregroundColor(p.indigo)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(vm.stagedItems.count == 1 ? "1 File Selected" : "\(vm.stagedItems.count) Files Selected")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(p.textPrimary)
+                    Text("Total size: \(formatByteSize(vm.totalStagedBytes)) • Review before sending")
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundColor(p.textSecondary)
+                }
+                Spacer()
+                Button(action: { vm.chooseFilesForCategory(title: "More Files", types: []) }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("Add")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .foregroundColor(p.indigo)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(p.indigoSubtle))
+                }
+                .buttonStyle(MacScaleButtonStyle())
+
+                Button(action: { vm.clearStagedItems() }) {
+                    Text("Clear")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(p.danger)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(p.dangerSubtle))
+                }
+                .buttonStyle(MacScaleButtonStyle())
+            }
+
+            // Destination Peer Bar
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(peerName != nil ? p.emerald : p.amber)
+                    .frame(width: 7, height: 7)
+                Text(peerName != nil ? "Destination: \(peerName!)" : "Scanning for nearby receiving device…")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(p.textPrimary)
+                Spacer()
+                if let peer = vm.activePeers.first {
+                    Text("\(peer.rssi) dBm")
+                        .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                        .foregroundColor(p.emerald)
+                } else {
+                    Button("Scan") { vm.rescanNow() }
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(p.indigo)
+                        .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 10).fill(p.bgSubtle))
+
+            // Staged File Rows
+            VStack(spacing: 6) {
+                ForEach(vm.stagedItems.prefix(8)) { item in
+                    let badge = macCategoryStyle(item.category)
+                    HStack(spacing: 10) {
+                        Text(item.category)
+                            .font(.system(size: 9, weight: .heavy))
+                            .foregroundColor(badge)
+                            .frame(width: 36, height: 24)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(badge.opacity(0.15)))
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(middleTruncateMacName(item.name, maxChars: 38))
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(p.textPrimary)
+                                .lineLimit(1)
+                            Text(formatByteSize(item.sizeBytes))
+                                .font(.system(size: 10).monospacedDigit())
+                                .foregroundColor(p.textSecondary)
+                        }
+                        Spacer()
+                        Button(action: { vm.removeStagedItem(item.id) }) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(p.textSecondary)
+                                .frame(width: 22, height: 22)
+                                .background(Circle().fill(p.bgSubtle))
+                        }
+                        .buttonStyle(MacScaleButtonStyle())
+                        .help("Remove from queue")
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(p.bgCanvas.opacity(p.isDark ? 0.55 : 0.75))
+                    )
+                }
+                if vm.stagedItems.count > 8 {
+                    Text("+ \(vm.stagedItems.count - 8) additional file(s)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(p.textSecondary)
+                }
+            }
+
+            // Explicit Primary Send Button
+            Button(action: { vm.sendStagedItems() }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "paperplane.fill")
+                        .font(.system(size: 13, weight: .bold))
+                    Text("Send \(vm.stagedItems.count) \(vm.stagedItems.count == 1 ? "File" : "Files") (\(formatByteSize(vm.totalStagedBytes)))")
+                        .font(.system(size: 13, weight: .bold).monospacedDigit())
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 11)
+                .background(RoundedRectangle(cornerRadius: 12).fill(p.indigo))
+            }
+            .buttonStyle(MacScaleButtonStyle())
+            .disabled(vm.isTransferring)
+        }
+        .padding(15)
+        .background(
+            RoundedRectangle(cornerRadius: 20)
+                .fill(p.bgSurface)
+                .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.indigo.opacity(0.50), lineWidth: 1.4))
+                .shadow(color: Color.black.opacity(p.isDark ? 0.24 : 0.05), radius: 10, x: 0, y: 3)
+        )
+    }
+
+    private var categoriesGridCard: some View {
+        let columns = [
+            GridItem(.flexible(), spacing: 12),
+            GridItem(.flexible(), spacing: 12),
+            GridItem(.flexible(), spacing: 12)
+        ]
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Categories")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(p.textPrimary)
+                Spacer()
+                Text(vm.isDropTargeted ? "Drop files to add to queue" : "Drag & drop or pick by type")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(vm.isDropTargeted ? p.indigo : p.textSecondary)
+            }
+
+            LazyVGrid(columns: columns, spacing: 14) {
+                categoryCircleButton(
+                    title: "Images",
+                    icon: "photo.fill",
+                    tint: Color(red: 0.145, green: 0.388, blue: 0.922)
+                ) {
+                    vm.chooseFilesForCategory(title: "Images", types: [.image])
+                }
+                categoryCircleButton(
+                    title: "Videos",
+                    icon: "play.rectangle.fill",
+                    tint: Color(red: 0.859, green: 0.153, blue: 0.467)
+                ) {
+                    vm.chooseFilesForCategory(title: "Videos", types: [.movie, .video, .mpeg4Movie, .quickTimeMovie])
+                }
+                categoryCircleButton(
+                    title: "Docs",
+                    icon: "doc.text.fill",
+                    tint: Color(red: 0.086, green: 0.639, blue: 0.290)
+                ) {
+                    vm.chooseFilesForCategory(title: "Documents", types: [.pdf, .plainText, .rtf, .spreadsheet, .presentation, .data])
+                }
+                categoryCircleButton(
+                    title: "Music",
+                    icon: "music.note",
+                    tint: Color(red: 0.851, green: 0.467, blue: 0.024)
+                ) {
+                    vm.chooseFilesForCategory(title: "Audio", types: [.audio, .mp3])
+                }
+                categoryCircleButton(
+                    title: "Link / Note",
+                    icon: "link",
+                    tint: Color(red: 0.863, green: 0.149, blue: 0.149)
+                ) {
+                    vm.showLinkComposer.toggle()
+                }
+                categoryCircleButton(
+                    title: "Files",
+                    icon: "folder.fill",
+                    tint: Color(red: 0.388, green: 0.400, blue: 0.945)
+                ) {
+                    vm.chooseFilesForCategory(title: "Files", types: [])
+                }
+            }
+
+            // Quick Mac Shortcuts Row: Finder Selection + Clipboard
+            HStack(spacing: 8) {
+                Button(action: { vm.stageFinderSelection() }) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "macwindow.badge.plus")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("Add Finder Selection")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .foregroundColor(p.textPrimary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 7)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(p.bgSubtle)
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(p.border, lineWidth: 1))
+                    )
+                }
+                .buttonStyle(MacScaleButtonStyle())
+
+                Button(action: { vm.stageClipboard() }) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "doc.on.clipboard")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("Add Clipboard")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .foregroundColor(p.textPrimary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 7)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(p.bgSubtle)
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(p.border, lineWidth: 1))
+                    )
+                }
+                .buttonStyle(MacScaleButtonStyle())
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 20)
+                .fill(vm.isDropTargeted ? p.indigoSubtle : p.bgSurface)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20)
+                        .stroke(vm.isDropTargeted ? p.indigo : p.border, lineWidth: vm.isDropTargeted ? 2 : 1)
+                )
+        )
+    }
+
+    private func categoryCircleButton(title: String, icon: String, tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 7) {
+                ZStack {
+                    Circle()
+                        .fill(tint)
+                        .frame(width: 50, height: 50)
+                        .shadow(color: tint.opacity(p.isDark ? 0.35 : 0.22), radius: 6, x: 0, y: 3)
+                    Image(systemName: icon)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(.white)
+                }
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(p.textPrimary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(MacScaleButtonStyle())
+    }
+
+    private var inlineLinkComposerCard: some View {
+        HStack(spacing: 8) {
+            TextField("Paste URL or type a quick note to stage…", text: $vm.urlInput)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { vm.stageUrlOrNoteInput() }
+            Button("Stage") {
+                vm.stageUrlOrNoteInput()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(p.indigo)
+            .disabled(vm.urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 14)
-                .fill(MacGlassElevated)
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(MacCyan.opacity(0.45), lineWidth: 1))
+            RoundedRectangle(cornerRadius: 16)
+                .fill(p.bgSurface)
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(p.border, lineWidth: 1))
         )
     }
 
-    // ========================================================================
-    // TAB 1: Nearby & Send (Live Active Peer Radar + Drag & Drop + Action Cards)
-    // ========================================================================
-    private var nearbyRadarTab: some View {
-        VStack(spacing: 14) {
-            // Interactive Radar & Drop Zone Card
+    private var storageOverviewCard: some View {
+        let used = vm.storage.usedFraction
+        let segApps = used * 0.42
+        let segMedia = used * 0.36
+        let segDocs = used * 0.22
+
+        return HStack(spacing: 20) {
+            // Segmented Donut Ring
             ZStack {
-                RoundedRectangle(cornerRadius: 22)
-                    .fill(vm.isDropTargeted ? MacCyan.opacity(0.14) : MacGlassCard)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 22)
-                            .strokeBorder(
-                                vm.isDropTargeted ? MacCyanBright : MacGlassBorder,
-                                style: StrokeStyle(lineWidth: vm.isDropTargeted ? 2 : 1)
-                            )
-                    )
+                Circle()
+                    .stroke(p.bgMuted, lineWidth: 13)
+                    .frame(width: 108, height: 108)
 
-                VStack(spacing: 12) {
-                    HStack {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(MacCyanBright)
-                                .frame(width: 7, height: 7)
-                            Text("P2P Radar Active • Live 10s Heartbeat")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer()
-                        Text("\(vm.activePeers.count) Active Device\(vm.activePeers.count == 1 ? "" : "s")")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(vm.activePeers.isEmpty ? .secondary : MacEmerald)
-                    }
+                Circle()
+                    .trim(from: 0, to: CGFloat(segApps))
+                    .stroke(p.emerald, style: StrokeStyle(lineWidth: 13, lineCap: .butt))
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: 108, height: 108)
 
-                    ZStack {
-                        ForEach(1..<4) { ring in
-                            Circle()
-                                .stroke(MacCyan.opacity(0.18 / Double(ring)), lineWidth: 1.4)
-                                .frame(width: CGFloat(ring) * 56, height: CGFloat(ring) * 56)
-                                .scaleEffect(vm.pulse ? 1.04 : 0.96)
-                        }
+                Circle()
+                    .trim(from: CGFloat(segApps), to: CGFloat(segApps + segMedia))
+                    .stroke(p.indigo, style: StrokeStyle(lineWidth: 13, lineCap: .butt))
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: 108, height: 108)
 
-                        // Center Mac Node
-                        VStack(spacing: 4) {
-                            ZStack {
-                                Circle()
-                                    .fill(LinearGradient(
-                                        colors: [MacCyan, MacIndigo],
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
-                                    ))
-                                    .frame(width: 54, height: 54)
-                                    .shadow(color: MacCyan.opacity(0.35), radius: 10)
-                                Image(systemName: "laptopcomputer")
-                                    .font(.system(size: 22, weight: .semibold))
-                                    .foregroundColor(.white)
-                            }
-                            Text(vm.macDeviceName)
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundColor(.white)
-                        }
+                Circle()
+                    .trim(from: CGFloat(segApps + segMedia), to: CGFloat(segApps + segMedia + segDocs))
+                    .stroke(p.amber, style: StrokeStyle(lineWidth: 13, lineCap: .butt))
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: 108, height: 108)
 
-                        // Orbiting Live Active Peer Pills (ONLY rendered when real peers are actively broadcasting!)
-                        ForEach(Array(vm.activePeers.prefix(3).enumerated()), id: \.element.id) { idx, peer in
-                            let angle = (-45.0 + Double(idx) * 110.0) * .pi / 180.0
-                            let r: CGFloat = 88.0
-                            Button(action: { vm.chooseAndSendFiles() }) {
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(MacEmerald)
-                                        .frame(width: 8, height: 8)
-                                    Image(systemName: "iphone.gen3")
-                                        .font(.system(size: 12, weight: .bold))
-                                        .foregroundColor(MacCyanBright)
-                                    Text(peer.name)
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundColor(.white)
-                                        .lineLimit(1)
-                                }
-                                .padding(.horizontal, 11)
-                                .padding(.vertical, 6)
-                                .background(
-                                    Capsule()
-                                        .fill(MacGlassElevated)
-                                        .overlay(Capsule().stroke(MacEmerald.opacity(0.65), lineWidth: 1))
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .offset(x: CGFloat(cos(angle)) * r, y: CGFloat(sin(angle)) * r * 0.65)
-                        }
-                    }
-                    .frame(height: 175)
-                    .onAppear {
-                        withAnimation(.easeInOut(duration: 2.0).repeatForever(autoreverses: true)) {
-                            vm.pulse = true
-                        }
-                    }
-
-                    Text(vm.transferStatus)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                }
-                .padding(16)
-            }
-            .onDrop(of: [.fileURL, .url, .plainText], isTargeted: $vm.isDropTargeted) { providers in
-                handleDrop(providers)
-            }
-
-            // Discovered Active Peers Section (Zero Hardcoded / Fake Devices!)
-            if vm.activePeers.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 10) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("No Active Devices Nearby")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundColor(.white)
-                        Spacer()
-                        Text("LIVE SCANNING")
-                            .font(.system(size: 9, weight: .heavy))
-                            .foregroundColor(MacCyanBright)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 3)
-                            .background(RoundedRectangle(cornerRadius: 5).fill(MacCyan.opacity(0.18)))
-                    }
-                    Text("Only real, actively broadcasting devices appear here (10-second live heartbeat). Open the AirDrop P2P app on your Android phone with Bluetooth enabled to start transferring.")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                }
-                .padding(16)
-                .background(
-                    RoundedRectangle(cornerRadius: 20)
-                        .fill(MacGlassCard)
-                        .overlay(RoundedRectangle(cornerRadius: 20).stroke(MacGlassBorder, lineWidth: 1))
-                )
-            } else {
-                ForEach(vm.activePeers) { peer in
-                    activePeerCard(peer)
+                VStack(spacing: 1) {
+                    Text(formatByteSize(vm.storage.freeBytes))
+                        .font(.system(size: 13, weight: .heavy).monospacedDigit())
+                        .foregroundColor(p.textPrimary)
+                    Text("Available")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(p.textSecondary)
                 }
             }
+            .padding(.leading, 4)
 
-            // Quick Receive Mode Card on Home Tab
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(vm.autoAccept ? "Direct Get Mode (Auto-Accept)" : "Ask Every Time Mode (Confirm Incoming)")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundColor(.white)
-                    Text(vm.autoAccept
-                         ? "Incoming files from nearby devices save directly to ~/Downloads without asking"
-                         : "Shows an Accept / Decline confirmation dialog with file size before saving")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Macintosh HD")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(p.textPrimary)
+                Text("\(formatByteSize(vm.storage.freeBytes)) free of \(formatByteSize(vm.storage.totalBytes))")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundColor(p.textSecondary)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    storageLegendDot(color: p.emerald, label: "Apps & System")
+                    storageLegendDot(color: p.indigo, label: "Photos & Videos")
+                    storageLegendDot(color: p.amber, label: "Documents & Archives")
+                    storageLegendDot(color: p.bgMuted, label: "Available Space")
                 }
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { vm.autoAccept },
-                    set: { vm.setReceiveMode(directGet: $0) }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
+                .padding(.top, 2)
             }
-            .padding(14)
-            .background(
-                RoundedRectangle(cornerRadius: 18)
-                    .fill(MacGlassCard)
-                    .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacGlassBorder, lineWidth: 1))
-            )
+            Spacer()
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 20)
+                .fill(p.bgSurface)
+                .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.border, lineWidth: 1))
+        )
+    }
+
+    private func storageLegendDot(color: Color, label: String) -> some View {
+        HStack(spacing: 7) {
+            RoundedRectangle(cornerRadius: 3)
+                .fill(color)
+                .frame(width: 10, height: 10)
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(p.textSecondary)
         }
     }
 
-    private func activePeerCard(_ peer: MacDiscoveredPeer) -> some View {
+    // ========================================================================
+    // TAB 1: Receive (Concentric Pulse Radar + Available Devices + Recent RX)
+    // ========================================================================
+    private var receiveRadarTabContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Radar Card (Mockup 1 Right)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(vm.activePeers.isEmpty ? "Looking for" : "Nearby")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(p.textSecondary)
+                        Text(vm.activePeers.isEmpty ? "Connections…" : "\(vm.activePeers.count) Device\(vm.activePeers.count == 1 ? "" : "s") Ready")
+                            .font(.system(size: 20, weight: .heavy))
+                            .foregroundColor(p.textPrimary)
+                    }
+                    Spacer()
+                    Button(action: { vm.setReceiveMode(directGet: !vm.autoAccept) }) {
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(vm.autoAccept ? p.emerald : p.amber)
+                                .frame(width: 6, height: 6)
+                            Text(vm.autoAccept ? "Auto-Accept" : "Ask First")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(vm.autoAccept ? p.emerald : p.amber)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule()
+                                .fill(vm.autoAccept ? p.emeraldSubtle : p.amberSubtle)
+                        )
+                    }
+                    .buttonStyle(MacScaleButtonStyle())
+                }
+
+                // Concentric Radar
+                ZStack {
+                    Circle()
+                        .fill(p.indigo.opacity(p.isDark ? 0.10 : 0.08))
+                        .frame(width: 214, height: 214)
+                        .scaleEffect(vm.pulse && !reduceMotion ? 1.04 : 0.96)
+                    Circle()
+                        .fill(p.indigo.opacity(p.isDark ? 0.18 : 0.15))
+                        .frame(width: 154, height: 154)
+                        .scaleEffect(vm.pulse && !reduceMotion ? 1.02 : 0.98)
+                    Circle()
+                        .fill(p.indigo.opacity(p.isDark ? 0.34 : 0.30))
+                        .frame(width: 98, height: 98)
+
+                    ZStack {
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: 54, height: 54)
+                            .shadow(color: p.indigo.opacity(0.35), radius: 10)
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                            .font(.system(size: 22, weight: .bold))
+                            .foregroundColor(p.indigo)
+                    }
+
+                    ForEach(Array(vm.activePeers.prefix(3).enumerated()), id: \.element.id) { idx, peer in
+                        let angle = (-38.0 + Double(idx) * 115.0) * .pi / 180.0
+                        let r: CGFloat = 96.0
+                        Button(action: {
+                            vm.chooseFilesForCategory(title: "Files for \(peer.name)", types: [])
+                        }) {
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(p.emerald)
+                                    .frame(width: 7, height: 7)
+                                Text(middleTruncateMacName(peer.name, maxChars: 16))
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(p.textPrimary)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(
+                                Capsule()
+                                    .fill(p.bgSurface)
+                                    .overlay(Capsule().stroke(p.emerald.opacity(0.6), lineWidth: 1.2))
+                                    .shadow(color: Color.black.opacity(0.12), radius: 5)
+                            )
+                        }
+                        .buttonStyle(MacScaleButtonStyle())
+                        .offset(x: CGFloat(cos(angle)) * r, y: CGFloat(sin(angle)) * r * 0.72)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 224)
+                .onAppear {
+                    guard !reduceMotion else { return }
+                    withAnimation(.easeInOut(duration: 2.0).repeatForever(autoreverses: true)) {
+                        vm.pulse = true
+                    }
+                }
+
+                Text("Visible as \"\(vm.macDeviceName)\" • Incoming files save to ~/Downloads")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(p.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .padding(16)
+            .background(
+                RoundedRectangle(cornerRadius: 22)
+                    .fill(p.bgSurface)
+                    .overlay(RoundedRectangle(cornerRadius: 22).stroke(p.border, lineWidth: 1))
+            )
+
+            // Available Devices Section
+            Text("Available Devices")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundColor(p.textPrimary)
+
+            if vm.activePeers.isEmpty {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Scanning for nearby phones and Macs…")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(p.textPrimary)
+                        Text("Open AirDrop P2P on your Android phone with Bluetooth enabled.")
+                            .font(.system(size: 11))
+                            .foregroundColor(p.textSecondary)
+                    }
+                    Spacer()
+                }
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(p.bgSurface)
+                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(p.border, lineWidth: 1))
+                )
+            } else {
+                ForEach(vm.activePeers) { peer in
+                    availablePeerRow(peer)
+                }
+            }
+
+            // Recently Received Section
+            let recentRx = vm.historyEntries.filter { !$0.isOutgoing }.prefix(4)
+            if !recentRx.isEmpty {
+                HStack {
+                    Text("Recently Received")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(p.textPrimary)
+                    Spacer()
+                    Button("Open ~/Downloads") {
+                        let dl = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
+                        NSWorkspace.shared.open(dl)
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(p.indigo)
+                    .buttonStyle(.plain)
+                }
+                ForEach(Array(recentRx)) { item in
+                    compactHistoryRow(item)
+                }
+            }
+        }
+    }
+
+    private func availablePeerRow(_ peer: MacDiscoveredPeer) -> some View {
         let bars: Int = {
             if peer.rssi >= -55 { return 4 }
             if peer.rssi >= -68 { return 3 }
             if peer.rssi >= -80 { return 2 }
             return 1
         }()
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 14)
-                        .fill(LinearGradient(
-                            colors: [MacCyan.opacity(0.25), MacIndigo.opacity(0.25)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ))
-                        .frame(width: 46, height: 46)
-                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(MacCyanBright.opacity(0.4), lineWidth: 1))
-                    Image(systemName: "iphone.gen3")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundColor(MacCyanBright)
-                }
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 8) {
-                        Text(peer.name)
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundColor(.white)
-                        Text(peer.transport)
-                            .font(.system(size: 9, weight: .heavy))
-                            .foregroundColor(MacEmerald)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(RoundedRectangle(cornerRadius: 5).fill(MacEmerald.opacity(0.16)))
-                    }
-                    Text("Live Signal: \(peer.rssi) dBm • Seen \(max(0, Int(Date().timeIntervalSince1970 - peer.lastSeen)))s ago")
-                        .font(.system(size: 11).monospacedDigit())
-                        .foregroundColor(.secondary)
-                }
-
-                Spacer()
-
-                // Live Signal Bars
-                HStack(alignment: .bottom, spacing: 2.5) {
-                    ForEach(1...4, id: \.self) { bar in
-                        RoundedRectangle(cornerRadius: 1.5)
-                            .fill(bar <= bars ? MacEmerald : Color.white.opacity(0.18))
-                            .frame(width: 3.5, height: CGFloat(4 + bar * 3))
-                    }
+        return HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(p.indigoSubtle)
+                    .frame(width: 44, height: 44)
+                Image(systemName: "iphone.gen3")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(p.indigo)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(peer.name)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(p.textPrimary)
+                Text("\(peer.transport) • \(peer.rssi) dBm")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundColor(p.textSecondary)
+            }
+            Spacer()
+            HStack(alignment: .bottom, spacing: 2.5) {
+                ForEach(1...4, id: \.self) { bar in
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(bar <= bars ? p.emerald : p.bgMuted)
+                        .frame(width: 3.5, height: CGFloat(4 + bar * 3))
                 }
             }
-
-            // Quick Send Actions
-            HStack(spacing: 8) {
-                Button(action: { vm.chooseAndSendFiles() }) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "paperplane.fill")
-                        Text("Send Files…")
-                            .fontWeight(.bold)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(MacCyan)
-                .disabled(vm.isTransferring)
-
-                Button(action: { vm.sendFinderSelection() }) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "folder.fill")
-                        Text("Finder Selection")
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-                }
-                .buttonStyle(.bordered)
-                .disabled(vm.isTransferring)
-
-                Button(action: { vm.sendClipboardTextOrUrl() }) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "doc.on.clipboard")
-                        Text("Send Clipboard")
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-                }
-                .buttonStyle(.bordered)
-                .disabled(vm.isTransferring)
+            Button(action: {
+                vm.chooseFilesForCategory(title: "Files for \(peer.name)", types: [])
+            }) {
+                Text("Select Files")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(p.indigo))
             }
-
-            // Inline URL / Text Input Row
-            HStack(spacing: 8) {
-                TextField("Paste URL or text to send to \(peer.name)…", text: $vm.urlInput)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { sendUrlInput() }
-                Button("Send") {
-                    sendUrlInput()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(MacIndigo)
-                .disabled(vm.urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.isTransferring)
-            }
+            .buttonStyle(MacScaleButtonStyle())
         }
-        .padding(16)
+        .padding(14)
         .background(
-            RoundedRectangle(cornerRadius: 20)
-                .fill(MacGlassCard)
-                .overlay(RoundedRectangle(cornerRadius: 20).stroke(MacCyan.opacity(0.35), lineWidth: 1))
+            RoundedRectangle(cornerRadius: 16)
+                .fill(p.bgSurface)
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(p.border, lineWidth: 1))
         )
     }
 
     // ========================================================================
-    // TAB 2: Transfers & History (Live Telemetry + All / Received / Sent)
+    // TAB 2: History (Search Bar + Filters + Totals + File Actions)
     // ========================================================================
-    private var transfersHistoryTab: some View {
-        let filtered = vm.historyEntries.filter {
-            if vm.historyFilter == 1 { return !$0.isOutgoing }
-            if vm.historyFilter == 2 { return $0.isOutgoing }
+    private var historyTabContent: some View {
+        let query = vm.historySearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let filtered = vm.historyEntries.filter { entry in
+            if vm.historyFilter == 1 && entry.isOutgoing { return false }
+            if vm.historyFilter == 2 && !entry.isOutgoing { return false }
+            if !query.isEmpty {
+                return entry.displayName.lowercased().contains(query) || entry.peerName.lowercased().contains(query)
+            }
             return true
         }
         let rxBytes = vm.historyEntries.filter { !$0.isOutgoing }.reduce(Int64(0)) { $0 + $1.sizeBytes }
         let txBytes = vm.historyEntries.filter { $0.isOutgoing }.reduce(Int64(0)) { $0 + $1.sizeBytes }
 
         return VStack(alignment: .leading, spacing: 14) {
+            // Search Bar (Mockup 1 Center)
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(p.textMuted)
+                TextField("Search for a file or device…", text: $vm.historySearch)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .foregroundColor(p.textPrimary)
+                if !vm.historySearch.isEmpty {
+                    Button(action: { vm.historySearch = "" }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(p.textMuted)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(p.bgSurface)
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(p.border, lineWidth: 1))
+            )
+
             // Summary Cards
             HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("RECEIVED")
-                        .font(.system(size: 10, weight: .heavy))
-                        .foregroundColor(MacEmerald)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Received")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(p.emerald)
                     Text(formatByteSize(rxBytes))
-                        .font(.system(size: 18, weight: .heavy).monospacedDigit())
-                        .foregroundColor(.white)
-                    Text("\(vm.historyEntries.filter { !$0.isOutgoing }.count) files in ~/Downloads")
+                        .font(.system(size: 17, weight: .heavy).monospacedDigit())
+                        .foregroundColor(p.textPrimary)
+                    let rxCount = vm.historyEntries.filter { !$0.isOutgoing }.count
+                    Text("\(rxCount) \(rxCount == 1 ? "item" : "items") in ~/Downloads")
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(p.textSecondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(14)
+                .padding(13)
                 .background(
                     RoundedRectangle(cornerRadius: 16)
-                        .fill(MacGlassCard)
-                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(MacGlassBorder, lineWidth: 1))
+                        .fill(p.bgSurface)
+                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(p.border, lineWidth: 1))
                 )
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("SENT")
-                        .font(.system(size: 10, weight: .heavy))
-                        .foregroundColor(MacCyanBright)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Sent")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(p.indigo)
                     Text(formatByteSize(txBytes))
-                        .font(.system(size: 18, weight: .heavy).monospacedDigit())
-                        .foregroundColor(.white)
-                    Text("\(vm.historyEntries.filter { $0.isOutgoing }.count) files delivered")
+                        .font(.system(size: 17, weight: .heavy).monospacedDigit())
+                        .foregroundColor(p.textPrimary)
+                    let txCount = vm.historyEntries.filter { $0.isOutgoing }.count
+                    Text("\(txCount) \(txCount == 1 ? "item" : "items") delivered")
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(p.textSecondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(14)
+                .padding(13)
                 .background(
                     RoundedRectangle(cornerRadius: 16)
-                        .fill(MacGlassCard)
-                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(MacGlassBorder, lineWidth: 1))
+                        .fill(p.bgSurface)
+                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(p.border, lineWidth: 1))
                 )
             }
 
-            // Filter Pills + Open Downloads + Clear
+            // Filter Pills
             HStack(spacing: 6) {
                 ForEach(Array(["All (\(vm.historyEntries.count))", "Received", "Sent"].enumerated()), id: \.offset) { idx, title in
                     let active = vm.historyFilter == idx
                     Button(action: { vm.historyFilter = idx }) {
                         Text(title)
                             .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(active ? .white : .secondary)
+                            .foregroundColor(active ? .white : p.textSecondary)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
                             .background(
                                 Capsule()
-                                    .fill(active ? MacCyan : MacGlassCard)
-                                    .overlay(Capsule().stroke(active ? MacCyanBright : MacGlassBorder, lineWidth: 1))
+                                    .fill(active ? p.indigo : p.bgSurface)
+                                    .overlay(Capsule().stroke(active ? p.indigo : p.border, lineWidth: 1))
                             )
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(MacScaleButtonStyle())
                 }
                 Spacer()
                 Button("Downloads") {
@@ -3109,145 +4077,154 @@ struct MacAirDropMainView: View {
 
             if filtered.isEmpty {
                 VStack(spacing: 8) {
-                    Image(systemName: "arrow.left.arrow.right.circle")
-                        .font(.system(size: 28))
-                        .foregroundColor(.secondary)
-                    Text("No Transfers Yet")
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 26))
+                        .foregroundColor(p.textMuted)
+                    Text(query.isEmpty ? "No History Found" : "No Matching Transfers")
                         .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(.white)
-                    Text("Files sent or received between MacBook Pro and Android devices appear here with exact sizes and Finder shortcuts.")
+                        .foregroundColor(p.textPrimary)
+                    Text(query.isEmpty ? "Files sent or received appear here with sizes and Finder links." : "Try a different file or device name.")
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
+                        .foregroundColor(p.textSecondary)
                 }
                 .frame(maxWidth: .infinity)
-                .padding(28)
+                .padding(26)
                 .background(
                     RoundedRectangle(cornerRadius: 18)
-                        .fill(MacGlassCard)
-                        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacGlassBorder, lineWidth: 1))
+                        .fill(p.bgSurface)
+                        .overlay(RoundedRectangle(cornerRadius: 18).stroke(p.border, lineWidth: 1))
                 )
             } else {
                 ForEach(filtered) { item in
-                    let badge = macFileBadge(name: item.displayName, isUrl: item.isUrl)
-                    HStack(spacing: 12) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 10)
-                                .fill(badge.color.opacity(0.18))
-                                .frame(width: 40, height: 40)
-                                .overlay(RoundedRectangle(cornerRadius: 10).stroke(badge.color.opacity(0.45), lineWidth: 1))
-                            Text(badge.label)
-                                .font(.system(size: 10, weight: .heavy))
-                                .foregroundColor(badge.color)
-                        }
-
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack(spacing: 6) {
-                                Text(item.isOutgoing ? "SENT" : "RECEIVED")
-                                    .font(.system(size: 9, weight: .heavy))
-                                    .foregroundColor(item.isOutgoing ? MacCyanBright : MacEmerald)
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1.5)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 4)
-                                            .fill((item.isOutgoing ? MacCyan : MacEmerald).opacity(0.18))
-                                    )
-                                Text(item.displayName)
-                                    .font(.system(size: 13, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .lineLimit(1)
-                            }
-                            Text("\(formatByteSize(item.sizeBytes)) • \(item.peerName) • \(item.timestamp.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.system(size: 11).monospacedDigit())
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                        }
-
-                        Spacer()
-
-                        Button("Copy") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(item.value, forType: .string)
-                        }
-                        .controlSize(.small)
-
-                        Button(item.isUrl ? "Open Link" : "Show in Finder") {
-                            if item.isUrl, let u = URL(string: item.value) {
-                                NSWorkspace.shared.open(u)
-                            } else {
-                                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.value)])
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(MacGlassElevated)
-                        .controlSize(.small)
-                    }
-                    .padding(12)
-                    .background(
-                        RoundedRectangle(cornerRadius: 16)
-                            .fill(MacGlassCard)
-                            .overlay(RoundedRectangle(cornerRadius: 16).stroke(MacGlassBorder, lineWidth: 1))
-                    )
+                    compactHistoryRow(item)
                 }
             }
         }
     }
 
-    // ========================================================================
-    // TAB 3: Receive Mode & P2P Radio Settings
-    // ========================================================================
-    private var receiveAndP2pTab: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            // 1. Receiving Mode Card (Direct Get vs. Ask Every Time)
-            VStack(alignment: .leading, spacing: 10) {
-                Text("RECEIVING MODE")
+    private func compactHistoryRow(_ item: MacHistoryEntry) -> some View {
+        let cat = inferMacCategory(pathOrUrl: item.displayName, isUrl: item.isUrl)
+        let color = macCategoryStyle(cat)
+        return HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(color.opacity(0.15))
+                    .frame(width: 38, height: 38)
+                Text(cat)
                     .font(.system(size: 10, weight: .heavy))
-                    .foregroundColor(MacCyanBright)
-                Text("Choose how incoming files from Android devices are handled on this Mac")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-
-                macReceiveOptionCard(
-                    title: "Direct Get (Instant Auto-Download)",
-                    subtitle: "Incoming files from Android devices save directly to ~/Downloads without any confirmation popup.",
-                    badge: "FASTEST",
-                    selected: vm.autoAccept,
-                    accent: MacEmerald
-                ) {
-                    vm.setReceiveMode(directGet: true)
+                    .foregroundColor(color)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(item.isOutgoing ? "SENT" : "RECEIVED")
+                        .font(.system(size: 9, weight: .heavy))
+                        .foregroundColor(item.isOutgoing ? p.indigo : p.emerald)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(item.isOutgoing ? p.indigoSubtle : p.emeraldSubtle)
+                        )
+                    Text(middleTruncateMacName(item.displayName, maxChars: 34))
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(p.textPrimary)
+                        .lineLimit(1)
                 }
+                Text("\(formatByteSize(item.sizeBytes)) • \(item.peerName) • \(item.timestamp.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(p.textSecondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button(item.isUrl ? "Open" : "Finder") {
+                if item.isUrl, let u = URL(string: item.value) {
+                    NSWorkspace.shared.open(u)
+                } else {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.value)])
+                }
+            }
+            .controlSize(.small)
+        }
+        .padding(11)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(p.bgSurface)
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(p.border, lineWidth: 1))
+        )
+    }
 
-                macReceiveOptionCard(
-                    title: "Ask Every Time (Accept / Decline Modal)",
-                    subtitle: "Prompt with sender name, file list, and total size before accepting incoming files.",
-                    badge: "SAFE",
-                    selected: !vm.autoAccept,
-                    accent: MacAmber
-                ) {
-                    vm.setReceiveMode(directGet: false)
+    // ========================================================================
+    // TAB 3: Settings (Day/Dark/System Theme + Approval + Identity + Radio)
+    // ========================================================================
+    private var settingsTabContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // 1. Appearance (Day / Dark / System)
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Appearance")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(p.textPrimary)
+                Text("Choose Day, Dark, or follow macOS appearance automatically.")
+                    .font(.system(size: 11))
+                    .foregroundColor(p.textSecondary)
+
+                HStack(spacing: 10) {
+                    themeOptionButton(mode: "light", title: "Day", icon: "sun.max.fill")
+                    themeOptionButton(mode: "dark", title: "Dark", icon: "moon.stars.fill")
+                    themeOptionButton(mode: "system", title: "System", icon: "circle.lefthalf.filled")
                 }
             }
             .padding(16)
             .background(
                 RoundedRectangle(cornerRadius: 20)
-                    .fill(MacGlassCard)
-                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(MacGlassBorder, lineWidth: 1))
+                    .fill(p.bgSurface)
+                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.border, lineWidth: 1))
             )
 
-            // 2. Visibility & Mac Identity Card
+            // 2. Incoming File Approval
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Incoming File Approval")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(p.textPrimary)
+
+                macSettingRadioCard(
+                    title: "Ask First",
+                    subtitle: "Confirm sender name, file list, and size before saving to ~/Downloads.",
+                    selected: !vm.autoAccept,
+                    accent: p.indigo
+                ) {
+                    vm.setReceiveMode(directGet: false)
+                }
+
+                macSettingRadioCard(
+                    title: "Auto-Accept",
+                    subtitle: "Save incoming files directly to ~/Downloads without a confirmation prompt.",
+                    selected: vm.autoAccept,
+                    accent: p.emerald
+                ) {
+                    vm.setReceiveMode(directGet: true)
+                }
+            }
+            .padding(16)
+            .background(
+                RoundedRectangle(cornerRadius: 20)
+                    .fill(p.bgSurface)
+                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.border, lineWidth: 1))
+            )
+
+            // 3. Device Name & Downloads
             VStack(alignment: .leading, spacing: 12) {
-                Text("VISIBILITY & IDENTITY")
-                    .font(.system(size: 10, weight: .heavy))
-                    .foregroundColor(MacCyanBright)
+                Text("Device & Storage")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(p.textPrimary)
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(vm.receiverRunning ? "Visible to Everyone Nearby" : "Hidden (Radio Paused)")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundColor(.white)
-                        Text("Advertises BLE L2CAP + mDNS + 5GHz Wi-Fi Direct")
+                        Text(vm.receiverRunning ? "Discoverable Nearby" : "Radio Paused")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(p.textPrimary)
+                        Text("BLE L2CAP + 5 GHz Wi-Fi Direct")
                             .font(.system(size: 11))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(p.textSecondary)
                     }
                     Spacer()
                     Toggle("", isOn: Binding(
@@ -3259,23 +4236,23 @@ struct MacAirDropMainView: View {
                 }
 
                 HStack(spacing: 8) {
-                    TextField("Mac Device Name", text: $vm.editingDeviceName)
+                    TextField("Device Name", text: $vm.editingDeviceName)
                         .textFieldStyle(.roundedBorder)
                     Button("Save Name") {
                         vm.saveDeviceName()
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(MacCyan)
+                    .tint(p.indigo)
                 }
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Downloads Folder")
+                        Text("Received Files Folder")
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.white)
+                            .foregroundColor(p.textPrimary)
                         Text("~/Downloads")
                             .font(.system(size: 11))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(p.textSecondary)
                     }
                     Spacer()
                     Button("Open ~/Downloads") {
@@ -3284,84 +4261,82 @@ struct MacAirDropMainView: View {
                     }
                     .controlSize(.small)
                 }
-
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("End-to-End Encryption")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.white)
-                        Text("TLS 1.3 (ECDSA P-256) + AES-256-GCM + Ephemeral WPA2")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary)
-                    }
-                    Spacer()
-                    Text("ACTIVE")
-                        .font(.system(size: 10, weight: .heavy))
-                        .foregroundColor(MacEmerald)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(
-                            Capsule()
-                                .fill(MacEmerald.opacity(0.16))
-                                .overlay(Capsule().stroke(MacEmerald.opacity(0.5), lineWidth: 1))
-                        )
-                }
             }
             .padding(16)
             .background(
                 RoundedRectangle(cornerRadius: 20)
-                    .fill(MacGlassCard)
-                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(MacGlassBorder, lineWidth: 1))
+                    .fill(p.bgSurface)
+                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.border, lineWidth: 1))
             )
 
-            // 3. P2P Radio Diagnostics & Live Protocol Log
+            // 4. Radio Diagnostics & Logs
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("P2P RADIO DIAGNOSTICS")
-                        .font(.system(size: 10, weight: .heavy))
-                        .foregroundColor(MacCyanBright)
+                    Text("Diagnostics")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(p.textPrimary)
                     Spacer()
-                    Button("Restart P2P Engine") {
+                    Button("Restart Radio") {
                         vm.rescanNow()
                     }
                     .controlSize(.small)
                 }
 
                 Text(vm.peerStatusSummary)
-                    .font(.system(size: 12, weight: .bold).monospacedDigit())
-                    .foregroundColor(MacEmerald)
+                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                    .foregroundColor(p.emerald)
 
-                DisclosureGroup("Live Protocol Logs (\(vm.logs.count))", isExpanded: $vm.showLogs) {
+                DisclosureGroup("Protocol Logs (\(vm.logs.count))", isExpanded: $vm.showLogs) {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 3) {
                             ForEach(Array(vm.logs.enumerated()), id: \.offset) { _, line in
                                 Text(line)
                                     .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(.secondary)
+                                    .foregroundColor(p.textSecondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
                         .padding(8)
                     }
-                    .frame(height: 140)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(MacObsidianBg))
+                    .frame(height: 130)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(p.bgSubtle))
                 }
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.secondary)
+                .foregroundColor(p.textSecondary)
             }
             .padding(16)
             .background(
                 RoundedRectangle(cornerRadius: 20)
-                    .fill(MacGlassCard)
-                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(MacGlassBorder, lineWidth: 1))
+                    .fill(p.bgSurface)
+                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.border, lineWidth: 1))
             )
         }
     }
 
-    private func macReceiveOptionCard(
+    private func themeOptionButton(mode: String, title: String, icon: String) -> some View {
+        let active = vm.themeMode == mode
+        return Button(action: { vm.setThemeMode(mode) }) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .bold))
+                Text(title)
+                    .font(.system(size: 12, weight: .bold))
+            }
+            .foregroundColor(active ? .white : p.textPrimary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(active ? p.indigo : p.bgSubtle)
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(active ? p.indigo : p.border, lineWidth: 1))
+            )
+        }
+        .buttonStyle(MacScaleButtonStyle())
+    }
+
+    private func macSettingRadioCard(
         title: String,
         subtitle: String,
-        badge: String,
         selected: Bool,
         accent: Color,
         action: @escaping () -> Void
@@ -3370,7 +4345,7 @@ struct MacAirDropMainView: View {
             HStack(spacing: 12) {
                 ZStack {
                     Circle()
-                        .stroke(selected ? accent : Color.secondary, lineWidth: 2)
+                        .stroke(selected ? accent : p.textMuted, lineWidth: 2)
                         .frame(width: 18, height: 18)
                     if selected {
                         Circle()
@@ -3378,78 +4353,73 @@ struct MacAirDropMainView: View {
                             .frame(width: 10, height: 10)
                     }
                 }
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 7) {
-                        Text(title)
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundColor(.white)
-                        Text(badge)
-                            .font(.system(size: 9, weight: .heavy))
-                            .foregroundColor(accent)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(RoundedRectangle(cornerRadius: 4).fill(accent.opacity(0.18)))
-                    }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(p.textPrimary)
                     Text(subtitle)
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(p.textSecondary)
                 }
                 Spacer()
             }
             .padding(12)
             .background(
                 RoundedRectangle(cornerRadius: 14)
-                    .fill(selected ? MacGlassElevated : MacObsidianBg.opacity(0.6))
-                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(selected ? accent : MacGlassBorder, lineWidth: 1.2))
+                    .fill(selected ? p.indigoSubtle.opacity(0.65) : p.bgSubtle)
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(selected ? accent : p.border, lineWidth: 1.2))
             )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(MacScaleButtonStyle())
     }
 
+    // ========================================================================
+    // Incoming Ask Approval Modal
+    // ========================================================================
     private func incomingAskModal(_ ask: MacPendingAsk) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 ZStack {
                     Circle()
-                        .fill(LinearGradient(colors: [MacCyan, MacIndigo], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .fill(p.indigo)
                         .frame(width: 44, height: 44)
                     Image(systemName: "arrow.down.doc.fill")
                         .font(.system(size: 20, weight: .bold))
                         .foregroundColor(.white)
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Incoming Quick Share")
+                    Text("Incoming Files")
                         .font(.system(size: 16, weight: .heavy))
-                        .foregroundColor(.white)
+                        .foregroundColor(p.textPrimary)
                     Text("From \(ask.senderName)")
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(MacCyanBright)
+                        .foregroundColor(p.indigo)
                 }
                 Spacer()
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("\(ask.fileNames.count) File(s) • \(formatByteSize(ask.totalBytes))")
+                Text("\(ask.fileNames.count) \(ask.fileNames.count == 1 ? "file" : "files") • \(formatByteSize(ask.totalBytes))")
                     .font(.system(size: 12, weight: .bold).monospacedDigit())
-                    .foregroundColor(MacEmerald)
+                    .foregroundColor(p.emerald)
                 ForEach(ask.fileNames.prefix(4), id: \.self) { fname in
-                    Text("• \(fname)")
+                    Text("• \(middleTruncateMacName(fname, maxChars: 38))")
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white)
+                        .foregroundColor(p.textPrimary)
                         .lineLimit(1)
                 }
                 if ask.fileNames.count > 4 {
-                    Text("+ \(ask.fileNames.count - 4) more file(s)")
+                    Text("+ \(ask.fileNames.count - 4) more")
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(p.textSecondary)
                 }
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 12)
-                    .fill(MacObsidianBg)
-                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(MacGlassBorder, lineWidth: 1))
+                    .fill(p.bgSubtle)
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(p.border, lineWidth: 1))
             )
 
             HStack(spacing: 10) {
@@ -3462,106 +4432,89 @@ struct MacAirDropMainView: View {
                 .buttonStyle(.bordered)
 
                 Button(action: { vm.respondToAsk(accepted: true) }) {
-                    Text("Accept & Save to Downloads")
+                    Text("Accept")
                         .fontWeight(.bold)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(MacCyan)
+                .tint(p.indigo)
             }
         }
         .padding(20)
         .frame(maxWidth: 390)
         .background(
             RoundedRectangle(cornerRadius: 22)
-                .fill(MacGlassElevated)
-                .overlay(RoundedRectangle(cornerRadius: 22).stroke(MacCyanBright.opacity(0.6), lineWidth: 1.5))
-                .shadow(color: .black.opacity(0.6), radius: 24)
+                .fill(p.bgSurface)
+                .overlay(RoundedRectangle(cornerRadius: 22).stroke(p.indigo.opacity(0.55), lineWidth: 1.5))
+                .shadow(color: .black.opacity(0.35), radius: 24)
         )
     }
 
+    // ========================================================================
+    // Bottom 4-Tab Navigation Bar (Send | Receive | History | Settings)
+    // ========================================================================
     private var bottomTabBar: some View {
-        HStack(spacing: 10) {
-            let tabs: [(String, String, String?, Int)] = [
-                ("Nearby & Send", "dot.radiowaves.left.and.right", vm.activePeers.isEmpty ? nil : "\(vm.activePeers.count)", 0),
-                ("Transfers", "arrow.up.arrow.down.circle", vm.historyEntries.isEmpty ? nil : "\(vm.historyEntries.count)", 1),
-                ("Receive & P2P", "shield.lefthalf.filled", vm.autoAccept ? "Direct" : "Ask", 2)
-            ]
+        let tabs: [(String, String, String?, Int)] = [
+            ("Send", "paperplane.fill", vm.stagedItems.isEmpty ? nil : "\(vm.stagedItems.count)", 0),
+            ("Receive", "dot.radiowaves.left.and.right", vm.activePeers.isEmpty ? nil : "\(vm.activePeers.count)", 1),
+            ("History", "clock.fill", nil, 2),
+            ("Settings", "gearshape.fill", nil, 3)
+        ]
+
+        return HStack(spacing: 8) {
             ForEach(tabs, id: \.3) { title, icon, badge, idx in
                 let active = vm.selectedTab == idx
                 Button(action: { vm.selectedTab = idx }) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         Image(systemName: icon)
-                            .font(.system(size: 13, weight: .bold))
+                            .font(.system(size: 12, weight: .bold))
                         Text(title)
-                            .font(.system(size: 12, weight: active ? .heavy : .medium))
+                            .font(.system(size: 12, weight: active ? .bold : .medium))
                         if let b = badge {
                             Text(b)
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(active ? .white : .secondary)
+                                .font(.system(size: 10, weight: .bold).monospacedDigit())
+                                .foregroundColor(active ? .white : p.indigo)
                                 .padding(.horizontal, 6)
-                                .padding(.vertical, 1.5)
-                                .background(Capsule().fill(active ? MacCyan : MacGlassElevated))
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(active ? p.indigo : p.indigoSubtle))
                         }
                     }
-                    .foregroundColor(active ? MacCyanBright : .secondary)
+                    .foregroundColor(active ? p.indigo : p.textSecondary)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 9)
+                    .padding(.vertical, 8)
                     .background(
                         RoundedRectangle(cornerRadius: 12)
-                            .fill(active ? MacCyan.opacity(0.18) : Color.clear)
+                            .fill(active ? p.indigoSubtle : Color.clear)
                             .overlay(
                                 RoundedRectangle(cornerRadius: 12)
-                                    .stroke(active ? MacCyan.opacity(0.55) : Color.clear, lineWidth: 1)
+                                    .stroke(active ? p.indigo.opacity(0.40) : Color.clear, lineWidth: 1)
                             )
                     )
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(MacScaleButtonStyle())
             }
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(
-            MacGlassCard
-                .overlay(Rectangle().fill(MacGlassBorder).frame(height: 1), alignment: .top)
+            p.bgSurface
+                .overlay(Rectangle().fill(p.border).frame(height: 1), alignment: .top)
         )
     }
 
-    private func macFileBadge(name: String, isUrl: Bool) -> (label: String, color: Color) {
-        if isUrl { return ("LINK", MacCyanBright) }
-        let ext = URL(fileURLWithPath: name).pathExtension.lowercased()
-        switch ext {
-        case "jpg", "jpeg", "png", "webp", "heic", "gif", "svg":
-            return ("IMG", MacCyanBright)
-        case "mp4", "mov", "mkv", "webm", "avi":
-            return ("VID", Color.purple)
-        case "mp3", "wav", "m4a", "flac", "aac":
-            return ("AUD", Color.pink)
-        case "zip", "rar", "7z", "tar", "gz", "dmg":
-            return ("ZIP", MacAmber)
-        case "apk", "aab":
-            return ("APK", MacEmerald)
-        default:
-            return ("FILE", MacIndigo)
+    private func macCategoryStyle(_ category: String) -> Color {
+        switch category {
+        case "IMG": return Color(red: 0.145, green: 0.388, blue: 0.922)
+        case "VID": return Color(red: 0.859, green: 0.153, blue: 0.467)
+        case "DOC": return Color(red: 0.086, green: 0.639, blue: 0.290)
+        case "AUD": return Color(red: 0.851, green: 0.467, blue: 0.024)
+        case "LINK": return Color(red: 0.863, green: 0.149, blue: 0.149)
+        default: return p.indigo
         }
     }
 
-    private func sendUrlInput() {
-        let trimmed = vm.urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        vm.urlInput = ""
-        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") {
-            vm.sendItems([trimmed])
-        } else {
-            let stamp = Int(Date().timeIntervalSince1970)
-            let tmpFile = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("Note-\(stamp).txt")
-            try? trimmed.data(using: .utf8)?.write(to: tmpFile)
-            vm.sendItems([tmpFile.path])
-        }
-    }
-
-    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+    private func handleDropToStage(_ providers: [NSItemProvider]) -> Bool {
         var collected: [String] = []
         let lock = NSLock()
         let group = DispatchGroup()
@@ -3580,7 +4533,7 @@ struct MacAirDropMainView: View {
         }
         group.notify(queue: .main) {
             if !collected.isEmpty {
-                vm.sendItems(collected)
+                vm.stagePathsOrUrls(collected)
             }
         }
         return true
@@ -3625,6 +4578,13 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
 
     init(openWindowOnLaunch: Bool) {
         super.init()
+        viewModel.onThemeChanged = { [weak self] pal in
+            self?.applyWindowAppearance(pal)
+        }
+        viewModel.onRequestFrontWindow = { [weak self] in
+            self?.showMainWindow()
+        }
+
         if let btn = statusItem.button {
             if let img = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: "AirDrop P2P") {
                 img.isTemplate = true
@@ -3635,22 +4595,22 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
             let dropView = StatusBarDropView(frame: btn.bounds)
             dropView.autoresizingMask = [.width, .height]
             dropView.onDropFiles = { [weak self] paths in
-                self?.viewModel.sendItems(paths)
+                self?.viewModel.stagePathsOrUrls(paths)
             }
             btn.addSubview(dropView)
         }
 
         let menu = NSMenu()
-        let openWin = NSMenuItem(title: "Open AirDrop P2P Window…", action: #selector(showMainWindow), keyEquivalent: "s")
+        let openWin = NSMenuItem(title: "Open AirDrop P2P…", action: #selector(showMainWindow), keyEquivalent: "s")
         openWin.target = self
         menu.addItem(openWin)
         menu.addItem(NSMenuItem.separator())
 
-        let sendSel = NSMenuItem(title: "AirDrop Selected Finder File(s) to Active Device", action: #selector(sendFinderSelection), keyEquivalent: "a")
+        let sendSel = NSMenuItem(title: "Stage Selected Finder File(s)…", action: #selector(sendFinderSelection), keyEquivalent: "a")
         sendSel.target = self
         menu.addItem(sendSel)
 
-        let pickFile = NSMenuItem(title: "Choose File to AirDrop to Active Device...", action: #selector(chooseAndSendFile), keyEquivalent: "o")
+        let pickFile = NSMenuItem(title: "Select Files to Send…", action: #selector(chooseAndSendFile), keyEquivalent: "o")
         pickFile.target = self
         menu.addItem(pickFile)
 
@@ -3680,24 +4640,35 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
         }
     }
 
+    private func applyWindowAppearance(_ pal: MacThemePalette) {
+        guard let win = window else { return }
+        win.appearance = NSAppearance(named: pal.isDark ? .darkAqua : .aqua)
+        win.backgroundColor = NSColor(
+            calibratedRed: pal.nsCanvasRed,
+            green: pal.nsCanvasGreen,
+            blue: pal.nsCanvasBlue,
+            alpha: 1.0
+        )
+    }
+
     @objc func showMainWindow() {
         NSApp.setActivationPolicy(.regular)
         if window == nil {
             let win = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 560, height: 680),
+                contentRect: NSRect(x: 0, y: 0, width: 570, height: 720),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
             )
-            win.title = "AirDrop P2P — Enterprise Cross-Platform Quick Share"
+            win.title = "AirDrop P2P"
             win.titlebarAppearsTransparent = true
-            win.backgroundColor = NSColor(calibratedRed: 0.03, green: 0.04, blue: 0.07, alpha: 1.0)
             win.center()
             win.isReleasedWhenClosed = false
             win.delegate = self
             win.contentView = NSHostingView(rootView: MacAirDropMainView(vm: viewModel))
             window = win
         }
+        applyWindowAppearance(viewModel.palette)
         viewModel.refreshSlow()
         viewModel.refreshFast()
         window?.makeKeyAndOrderFront(nil)
@@ -3722,10 +4693,20 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
     }
 
     func windowWillClose(_ notification: Notification) {
-        stopAllDaemonsAndQuit()
+        // Keep menu bar icon and background P2P receiver alive when closing the window
+        if !isShuttingDown {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            showMainWindow()
+        }
         return true
     }
 
@@ -3742,11 +4723,13 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
     }
 
     @objc func sendFinderSelection() {
-        viewModel.sendFinderSelection()
+        showMainWindow()
+        viewModel.stageFinderSelection()
     }
 
     @objc func chooseAndSendFile() {
-        viewModel.chooseAndSendFiles()
+        showMainWindow()
+        viewModel.chooseFilesForCategory(title: "Files", types: [])
     }
 
     @objc func openDownloads() {
@@ -3784,7 +4767,7 @@ final class AwdlLoopbackBridge {
     }
 
     static func pump(from src: NWConnection, to dst: NWConnection) {
-        src.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
+        src.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) { data, _, isComplete, error in
             if let d = data, !d.isEmpty {
                 dst.send(content: d, completion: .contentProcessed { _ in
                     if !isComplete && error == nil {
@@ -3821,6 +4804,7 @@ if args.count >= 2 && args[1] == "restore-wifi" {
     let sender = try BleAirDropSender(files: fileUrls, urls: urls)
     withExtendedLifetime(sender) {
         DispatchQueue.global().asyncAfter(deadline: .now() + 300.0) {
+            writeProgressJson(active: false)
             print("[BLE-Send] Timed out waiting for BLE L2CAP transfer")
             exit(1)
         }
