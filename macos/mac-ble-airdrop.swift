@@ -793,13 +793,16 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
         let now = Date().timeIntervalSince1970
 
         var isRxLockActive = false
-        if let content = try? String(contentsOf: rxLock, encoding: .utf8) {
-            let parts = content.split(separator: "\t")
-            if parts.count >= 3, let ts = Double(parts[2]) {
-                if (now - ts) < 8.0 { isRxLockActive = true }
-            } else if let attrs = try? FileManager.default.attributesOfItem(atPath: rxLock.path),
-                      let mtime = attrs[.modificationDate] as? Date {
-                if now - mtime.timeIntervalSince1970 < 8.0 { isRxLockActive = true }
+        if FileManager.default.fileExists(atPath: rxLock.path) {
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: rxLock.path),
+               let mtime = attrs[.modificationDate] as? Date {
+                if now - mtime.timeIntervalSince1970 < 30.0 { isRxLockActive = true }
+            }
+            if !isRxLockActive, let content = try? String(contentsOf: rxLock, encoding: .utf8) {
+                let parts = content.split(separator: "\t")
+                if parts.count >= 3, let ts = Double(parts[2]) {
+                    if (now - ts) < 30.0 { isRxLockActive = true }
+                }
             }
         }
 
@@ -808,7 +811,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let active = obj["active"] as? Bool, active,
            let updatedAt = obj["updatedAt"] as? Double {
-            if (now - updatedAt) < 8.0 { isProgressActive = true }
+            if (now - updatedAt) < 30.0 { isProgressActive = true }
         }
 
         let isActiveTcp = hasActiveTcpReceiverConnection()
@@ -817,11 +820,11 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
             lastActivity = Date()
             idleCount = 0
         } else {
-            // If all transfer activity and TCP sockets have completed for > 3.0s, restore Wi-Fi promptly
-            if Date().timeIntervalSince(lastActivity) > 3.0 {
+            // Generous silence threshold: wait at least 30s before considering stream terminated
+            if Date().timeIntervalSince(lastActivity) > 30.0 {
                 idleCount += 1
-                if idleCount >= 4 { // 4 * 0.5s = 2.0s -> ~5.0s of dead silence
-                    print("[BLE-Daemon] Transfer stream ended (idle timeout) — restoring Wi-Fi immediately")
+                if idleCount >= 20 { // 20 * 0.5s = 10.0s -> 40s total dead silence
+                    print("[BLE-Daemon] Transfer stream ended (idle timeout) — restoring Wi-Fi")
                     fflush(stdout)
                     break
                 }

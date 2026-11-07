@@ -30,6 +30,8 @@ import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
 import android.graphics.drawable.Icon
 import android.media.MediaScannerConnection
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
@@ -1639,11 +1641,20 @@ class AirDropNode(private val context: Context) {
             val sslCtx = buildSslContext()
             var rawSock: Socket? = null
             var lastConnErr: Throwable? = null
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val p2pNetwork = cm?.allNetworks?.firstOrNull { net ->
+                val caps = cm.getNetworkCapabilities(net)
+                caps != null && (
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_WIFI_P2P) ||
+                    cm.getLinkProperties(net)?.linkAddresses?.any { it.address.hostAddress?.startsWith("192.168.49.") == true } == true
+                )
+            }
             for (attempt in 1..10) {
                 if (transferCancelled) return false
                 try {
                     val candidate = Socket()
-                    candidate.connect(InetSocketAddress(host, port), 1800)
+                    p2pNetwork?.bindSocket(candidate)
+                    candidate.connect(InetSocketAddress(host, port), 2500)
                     rawSock = candidate
                     break
                 } catch (e: Throwable) {
@@ -1661,7 +1672,7 @@ class AirDropNode(private val context: Context) {
                 raw.receiveBufferSize = 524288
 
                 // Launch active ARP keepalive coroutine during 5GHz Wi-Fi Direct transfers
-                // Sends UDP pulse to port 8774 and runs ICMP reachable check every 2s to keep Android ARP entry REACHABLE
+                // Sends UDP pulse to port 8774 every 2s to keep Android ARP entry REACHABLE
                 if (host.startsWith("192.168.49.")) {
                     keepAliveJob = scope.launch(Dispatchers.IO) {
                         DatagramSocket().use { udpSock ->
@@ -1669,7 +1680,6 @@ class AirDropNode(private val context: Context) {
                             val targetAddr = InetAddress.getByName(host)
                             while (isActive && activeTransferSocket != null && !transferCancelled) {
                                 runCatching { udpSock.send(DatagramPacket(dummy, 1, targetAddr, 8774)) }
-                                runCatching { targetAddr.isReachable(1000) }
                                 kotlinx.coroutines.delay(2000)
                             }
                         }

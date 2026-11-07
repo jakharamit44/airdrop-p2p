@@ -360,6 +360,7 @@ object AirDropCodec {
             private var blockLen = 0
             private val compBuf = if (useStoredBlocks) ByteArray(0) else ByteArray(DVZIP_BLOCK_BYTES + 1024)
             private val hdrBytes = ByteArray(4)
+            private val deflater = if (!useStoredBlocks) Deflater(1, false) else null
 
             private fun writeHdr(value: Int) {
                 hdrBytes[0] = (value ushr 24).toByte()
@@ -390,13 +391,13 @@ object AirDropCodec {
 
             fun emitBlock() {
                 if (blockLen == 0) return
-                if (useStoredBlocks) {
+                if (useStoredBlocks || deflater == null) {
                     writeHdr(DVZIP_STORED or blockLen)
                     rawOut.write(blockBuf, 0, blockLen)
                     blockLen = 0
                     return
                 }
-                val deflater = Deflater(1, false) // fast zlib header
+                deflater.reset()
                 deflater.setInput(blockBuf, 0, blockLen)
                 deflater.finish()
                 var compLen = 0
@@ -408,7 +409,6 @@ object AirDropCodec {
                     }
                     compLen += n
                 }
-                deflater.end()
 
                 if (compLen in 1 until blockLen) {
                     writeHdr(compLen)
@@ -422,6 +422,7 @@ object AirDropCodec {
 
             override fun close() {
                 emitBlock()
+                deflater?.end()
                 rawOut.flush()
             }
         }

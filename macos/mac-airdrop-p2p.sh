@@ -769,7 +769,9 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
         if now - last_touch[0] >= 1.0:
             last_touch[0] = now
             try:
-                rx_lock.write_text(f"{os.getpid()}\tactive\t{now}")
+                tmp_lock = STATE_DIR / "rx_in_progress.lock.tmp"
+                tmp_lock.write_text(f"{os.getpid()}\tactive\t{now}")
+                tmp_lock.replace(rx_lock)
             except Exception:
                 pass
         if track_progress:
