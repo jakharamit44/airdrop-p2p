@@ -608,7 +608,11 @@ class StreamDecompressor:
                     if self.dvzip_stored:
                         self.buf.extend(chunk)
                     else:
-                        self.buf.extend(self.decompressor.decompress(chunk))
+                        try:
+                            self.buf.extend(self.decompressor.decompress(chunk))
+                        except zlib.error:
+                            self.decompressor = zlib.decompressobj()
+                            self.buf.extend(self.decompressor.decompress(chunk))
                 else:
                     hdr4 = self.raw.read_exact(4)
                     if len(hdr4) < 4:
@@ -617,9 +621,14 @@ class StreamDecompressor:
                         self.eof = True
                         break
                     v = struct.unpack(">I", hdr4)[0]
+                    if v == 0:
+                        if self.decompressor:
+                            self.buf.extend(self.decompressor.flush())
+                        self.eof = True
+                        break
                     self.dvzip_stored = bool(v & 0x80000000)
                     self.dvzip_rem = v & 0x7FFFFFFF
-                    if not self.dvzip_stored:
+                    if not self.dvzip_stored and self.decompressor is None:
                         self.decompressor = zlib.decompressobj()
 
         take = min(n, len(self.buf))
@@ -688,8 +697,10 @@ def extract_cpio_stream(stream, dest_dir: Path):
                 target = dest_dir / safe_name
                 if target.resolve().parent == dest_dir.resolve():
                     idx = 1
+                    orig_stem = target.stem
+                    orig_suffix = target.suffix
                     while target.exists():
-                        target = dest_dir / f"{target.stem}_{idx}{target.suffix}"
+                        target = dest_dir / f"{orig_stem}_{idx}{orig_suffix}"
                         idx += 1
                     with target.open("wb", buffering=1048576) as out_f:
                         rem = filesize
@@ -885,7 +896,9 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     for it in items:
                         if isinstance(it, str) and (it.startswith("http://") or it.startswith("https://")):
                             append_history("URL", it, len(it), "received", last_sender)
-                            subprocess.Popen(["open", it])
+                            safe_notify(f"Received link: {it}", f"AirDrop from {last_sender}")
+                            if re.match(r"^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$", it):
+                                subprocess.Popen(["open", it])
                 resp = plistlib.dumps({
                     "ReceiverComputerName": active_peer_name if is_p2p_proxy else current_mac_name(),
                     "ReceiverModelName": "iPhone16,2" if is_p2p_proxy else "MacBookPro18,2",
@@ -920,9 +933,9 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                         safe_notify(f"Saved {p.name} to Downloads", f"AirDrop from {last_sender}")
                         # Automatic Claude AI Analysis & Ingestion Hook
                         try:
-                            claude_py = SCRIPT_DIR / "claude_processor.py"
+                            claude_py = Path(SCRIPT_PATH).resolve().parent / "claude_processor.py"
                             if not claude_py.exists():
-                                claude_py = Path(__file__).resolve().parent / "claude_processor.py"
+                                claude_py = Path(SCRIPT_PATH).resolve().parent.parent / "macos" / "claude_processor.py"
                             if claude_py.exists():
                                 subprocess.Popen([sys.executable, str(claude_py), str(p)])
                         except Exception:
@@ -1051,12 +1064,6 @@ case "$MODE" in
     else
       echo "Finder AirDrop Proxy: STOPPED"
     fi
-    if [[ -f "$BLE_PID_FILE" ]] && kill -0 "$(cat "$BLE_PID_FILE")" 2>/dev/null; then
-      echo "Direct BLE L2CAP RX:  RUNNING (PID $(cat "$BLE_PID_FILE") -> ~/Downloads + AWDL 8774 Bridge)"
-    else
-      echo "Direct BLE L2CAP RX:  STOPPED"
-    fi
-    ;;
     if [[ -f "$BLE_PID_FILE" ]] && kill -0 "$(cat "$BLE_PID_FILE")" 2>/dev/null; then
       echo "Direct BLE L2CAP RX:  RUNNING (PID $(cat "$BLE_PID_FILE") -> ~/Downloads + AWDL 8774 Bridge)"
     else

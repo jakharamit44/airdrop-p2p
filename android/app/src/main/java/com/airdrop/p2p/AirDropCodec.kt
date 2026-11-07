@@ -236,6 +236,7 @@ object AirDropCodec {
         }
 
         fun readUint(pos: Int, len: Int): Long {
+            if (pos < 0 || len <= 0 || pos + len > bytes.size) return 0L
             var v = 0L
             for (i in 0 until len) {
                 v = (v shl 8) or (bytes[pos + i].toLong() and 0xFF)
@@ -250,17 +251,20 @@ object AirDropCodec {
         fun parseAt(objIdx: Int, depth: Int): Any? {
             if (depth > 32 || objIdx !in 0 until numObjects) return null
             var pos = offsets[objIdx]
+            if (pos !in bytes.indices) return null
             val marker = bytes[pos++].toInt() and 0xFF
             val high = (marker ushr 4) and 0x0F
             val low = marker and 0x0F
 
             fun readCount(): Int {
                 if (low != 0x0F) return low
+                if (pos !in bytes.indices) return 0
                 val intMarker = bytes[pos++].toInt() and 0xFF
                 val intBytes = 1 shl (intMarker and 0x0F)
+                if (pos + intBytes > bytes.size) return 0
                 val count = readUint(pos, intBytes).toInt()
                 pos += intBytes
-                return count
+                return count.coerceAtLeast(0)
             }
 
             return when (high) {
@@ -271,34 +275,36 @@ object AirDropCodec {
                 }
                 0x1 -> {
                     val nBytes = 1 shl low
-                    readUint(pos, nBytes)
+                    if (pos + nBytes > bytes.size) 0L else readUint(pos, nBytes)
                 }
                 0x2 -> {
                     val nBytes = 1 shl low
-                    if (nBytes == 4) ByteBuffer.wrap(bytes, pos, 4).float.toDouble()
+                    if (pos + nBytes > bytes.size) 0.0
+                    else if (nBytes == 4) ByteBuffer.wrap(bytes, pos, 4).float.toDouble()
                     else ByteBuffer.wrap(bytes, pos, 8).double
                 }
                 0x4 -> {
-                    val len = readCount()
-                    bytes.copyOfRange(pos, pos + len)
+                    val len = readCount().coerceAtMost(bytes.size - pos)
+                    if (len <= 0) ByteArray(0) else bytes.copyOfRange(pos, pos + len)
                 }
                 0x5 -> {
-                    val len = readCount()
-                    String(bytes, pos, len, StandardCharsets.US_ASCII)
+                    val len = readCount().coerceAtMost(bytes.size - pos)
+                    if (len <= 0) "" else String(bytes, pos, len, StandardCharsets.US_ASCII)
                 }
                 0x6 -> {
                     val chars = readCount()
-                    String(bytes, pos, chars * 2, StandardCharsets.UTF_16BE)
+                    val byteLen = (chars * 2).coerceAtMost(bytes.size - pos)
+                    if (byteLen <= 0) "" else String(bytes, pos, byteLen, StandardCharsets.UTF_16BE)
                 }
                 0xA -> {
-                    val count = readCount()
+                    val count = readCount().coerceAtMost((bytes.size - pos) / maxOf(1, refSize))
                     List(count) { i ->
                         val ref = readUint(pos + i * refSize, refSize).toInt()
                         parseAt(ref, depth + 1)
                     }
                 }
                 0xD -> {
-                    val count = readCount()
+                    val count = readCount().coerceAtMost((bytes.size - pos) / (2 * maxOf(1, refSize)))
                     val map = LinkedHashMap<String, Any?>(count)
                     val valStart = pos + count * refSize
                     for (i in 0 until count) {
@@ -544,7 +550,8 @@ object AirDropCodec {
             if (isRegularFile) {
                 val baseName = safeFileName(rawName)
                 var outFile = File(destDir, baseName)
-                if (!outFile.canonicalPath.startsWith(destDir.canonicalPath)) {
+                val destCanonical = destDir.canonicalPath.let { if (it.endsWith(File.separator)) it else it + File.separator }
+                if (!outFile.canonicalPath.startsWith(destCanonical)) {
                     throw SecurityException("CPIO path traversal detected: $rawName")
                 }
                 var suffix = 1
@@ -630,12 +637,30 @@ object AirDropCodec {
                             if (inf.finished()) {
                                 inf.end()
                                 inflater = null
+                                if (compLeft > 0) {
+                                    var toSkip = compLeft.toLong()
+                                    while (toSkip > 0) {
+                                        val skipped = combined.skip(toSkip)
+                                        if (skipped <= 0) break
+                                        toSkip -= skipped
+                                    }
+                                    compLeft = 0
+                                }
                             }
                             return produced
                         }
                         if (inf.finished()) {
                             inf.end()
                             inflater = null
+                            if (compLeft > 0) {
+                                var toSkip = compLeft.toLong()
+                                while (toSkip > 0) {
+                                    val skipped = combined.skip(toSkip)
+                                    if (skipped <= 0) break
+                                    toSkip -= skipped
+                                }
+                                compLeft = 0
+                            }
                             continue
                         }
                         if (inf.needsInput()) {
@@ -663,6 +688,10 @@ object AirDropCodec {
                     }
                     if (hRead < 4) throw EOFException("Truncated DVZip block header ($hRead bytes)")
                     val v = ByteBuffer.wrap(hdr).int
+                    if (v == 0) {
+                        eof = true
+                        return -1
+                    }
                     val blockLen = v and 0x7FFFFFFF
                     if ((v and DVZIP_STORED) != 0) {
                         storedLeft = blockLen
@@ -672,6 +701,13 @@ object AirDropCodec {
                     }
                 }
                 return -1
+            }
+
+            override fun close() {
+                runCatching { inflater?.end() }
+                inflater = null
+                combined.close()
+                super.close()
             }
         }
     }

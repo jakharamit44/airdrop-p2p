@@ -90,7 +90,7 @@ class AirDropService : Service() {
                 runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
                 nm.cancel(1999)
             } else {
-                runCatching { wakeLock?.acquire(60 * 60 * 1000L) }
+                runCatching { wakeLock?.acquire(15 * 60 * 1000L) }
                 val speedStr = if (speedBps > 0L) " • ${AirDropNode.formatSpeed(speedBps)}" else ""
                 val actionTitle = if (isSending) "Sending via AirDrop" else "Receiving via AirDrop"
                 val progressNotif = NotificationCompat.Builder(this, CHANNEL_RX)
@@ -107,6 +107,7 @@ class AirDropService : Service() {
         }
         node.onItemReceived = { item ->
             nm.cancel(1999)
+            val notifId = 2000 + (rxNotifId++ % 50)
             val targetIntent = if (item.isUrl) {
                 Intent(Intent.ACTION_VIEW, Uri.parse(item.pathOrUrl))
             } else {
@@ -116,7 +117,7 @@ class AirDropService : Service() {
             }
             val pi = PendingIntent.getActivity(
                 this,
-                rxNotifId,
+                notifId,
                 targetIntent,
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
@@ -128,7 +129,7 @@ class AirDropService : Service() {
                 .setAutoCancel(true)
                 .setContentIntent(pi)
                 .build()
-            nm.notify(rxNotifId++, rxNotif)
+            nm.notify(notifId, rxNotif)
         }
         node.start()
     }
@@ -145,6 +146,9 @@ class AirDropService : Service() {
 
     override fun onDestroy() {
         runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+        wakeLock = null
+        instance?.onTransferProgress = null
+        instance?.onItemReceived = null
         if (instance?.isTransferInProgress != true) {
             instance?.stop()
         }

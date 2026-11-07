@@ -254,6 +254,8 @@ func recordActivePeerOnDisk(
 }
 
 func loadActivePeersFromDisk(maxAge: TimeInterval = PEER_LIVE_TTL_SECONDS) -> [MacDiscoveredPeer] {
+    activePeersLock.lock()
+    defer { activePeersLock.unlock() }
     let pf = STATE_DIR.appendingPathComponent("active_peers.json")
     let now = Date().timeIntervalSince1970
     guard let d = try? Data(contentsOf: pf),
@@ -949,6 +951,12 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                         sn = os.path.basename(name.replace("\\\\", "/")).lstrip(".") or "airdrop_file"
                         t = (dest / sn).resolve()
                         if t.parent == dest:
+                            orig_stem = t.stem
+                            orig_suffix = t.suffix
+                            idx = 1
+                            while t.exists():
+                                t = dest / f"{orig_stem}_{idx}{orig_suffix}"
+                                idx += 1
                             with t.open("wb") as out_f:
                                 rem = fs
                                 while rem > 0:
@@ -1196,8 +1204,16 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         let macName = loadMacSettings().deviceName
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let inp = ch.inputStream!
-            let out = ch.outputStream!
+            guard let inp = ch.inputStream, let out = ch.outputStream else {
+                DispatchQueue.main.async {
+                    self?.pingChannel = nil
+                    self?.isPingingPeer = false
+                    if let s = self, let p = s.discoveredPeerPeripheral {
+                        s.cm.cancelPeripheralConnection(p)
+                    }
+                }
+                return
+            }
             inp.open()
             out.open()
             defer {
@@ -1363,8 +1379,12 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         fflush(stdout)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let inp = ch.inputStream!
-            let out = ch.outputStream!
+            guard let inp = ch.inputStream, let out = ch.outputStream else {
+                DispatchQueue.main.async {
+                    self?.activeChannels.removeAll { $0 === ch }
+                }
+                return
+            }
             inp.open()
             out.open()
             defer {
@@ -1620,8 +1640,10 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         activeChannel = ch
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let inp = ch.inputStream!
-            let out = ch.outputStream!
+            guard let inp = ch.inputStream, let out = ch.outputStream else {
+                print("[BLE-Send] Failed to acquire L2CAP channel streams")
+                exit(1)
+            }
             inp.open()
             out.open()
 
@@ -3568,16 +3590,19 @@ final class AwdlLoopbackBridge {
                     if !isComplete && error == nil {
                         pump(from: src, to: dst)
                     } else {
+                        src.cancel()
                         dst.cancel()
                     }
                 })
             } else if isComplete || error != nil {
+                src.cancel()
                 dst.cancel()
             }
         }
     }
 }
 
+signal(SIGPIPE, SIG_IGN)
 let args = CommandLine.arguments
 if args.count >= 2 && args[1] == "restore-wifi" {
     restoreMacInternetWifi()

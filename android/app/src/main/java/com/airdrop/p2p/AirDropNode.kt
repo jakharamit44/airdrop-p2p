@@ -335,6 +335,7 @@ class AirDropNode(private val context: Context) {
     fun cancelActiveTransfer() {
         transferCancelled = true
         _transferProgress.value = null
+        onTransferProgress?.invoke("Transfer cancelled", -1, 0L, 0L, 0L, false)
         pendingMacTx?.let { tx ->
             pendingMacTx = null
             tx.result.complete(false)
@@ -1640,7 +1641,12 @@ class AirDropNode(private val context: Context) {
                                     udpSock.send(DatagramPacket(dummy, 1, targetAddr, 8774))
                                 } catch (_: Throwable) {}
                                 try {
-                                    Runtime.getRuntime().exec(arrayOf("/system/bin/ping", "-c", "1", "-w", "1", host)).waitFor()
+                                    val proc = Runtime.getRuntime().exec(arrayOf("/system/bin/ping", "-c", "1", "-w", "1", host))
+                                    proc.waitFor()
+                                    runCatching { proc.inputStream.close() }
+                                    runCatching { proc.errorStream.close() }
+                                    runCatching { proc.outputStream.close() }
+                                    proc.destroy()
                                 } catch (_: Throwable) {}
                                 kotlinx.coroutines.delay(2000)
                             }
@@ -2296,6 +2302,7 @@ class AirDropNode(private val context: Context) {
             val b = inp.read()
             if (b < 0) return if (sb.size() == 0) null else sb.toString("ISO-8859-1").trimEnd('\r')
             if (b == '\n'.code) return sb.toString("ISO-8859-1").trimEnd('\r')
+            if (sb.size() >= 8192) throw IOException("HTTP line length exceeded 8KB limit")
             sb.write(b)
         }
     }
@@ -2323,7 +2330,10 @@ class AirDropNode(private val context: Context) {
                     if (len == 0) return 0
                     if (eof) return -1
                     if (chunkLeft == 0L) {
-                        val sizeLine = readHttpLine(inp) ?: throw EOFException("Truncated chunk line")
+                        var sizeLine = readHttpLine(inp) ?: throw EOFException("Truncated chunk line")
+                        while (sizeLine.isEmpty()) {
+                            sizeLine = readHttpLine(inp) ?: throw EOFException("Truncated chunk line")
+                        }
                         val hex = sizeLine.substringBefore(';').trim()
                         val sz = hex.toLongOrNull(16)
                             ?: throw IllegalArgumentException("Bad chunk size: $sizeLine")
