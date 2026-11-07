@@ -39,6 +39,11 @@ DMG_DEST="$RELEASE_DIR/AirDrop-P2P-v${VERSION}.dmg"
 DMG_TMP="$(mktemp -d /tmp/airdrop_dmg_XXXXXX)"
 cp -R "$ROOT_DIR/AirDrop P2P.app" "$DMG_TMP/"
 ln -s /Applications "$DMG_TMP/Applications"
+if [ -f "$ROOT_DIR/macos/open-app.command" ]; then
+  cp -f "$ROOT_DIR/macos/open-app.command" "$DMG_TMP/Open AirDrop P2P (Bypass Gatekeeper).command"
+  chmod +x "$DMG_TMP/Open AirDrop P2P (Bypass Gatekeeper).command"
+fi
+xattr -cr "$DMG_TMP"
 rm -f "$DMG_DEST"
 hdiutil create -volname "AirDrop P2P v${VERSION}" -srcfolder "$DMG_TMP" -ov -format UDZO "$DMG_DEST"
 rm -rf "$DMG_TMP"

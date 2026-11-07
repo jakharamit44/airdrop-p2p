@@ -53,5 +53,11 @@ cat > "$APP_DIR/Contents/Info.plist" << PLIST
 </plist>
 PLIST
 
+# Strip extended attributes and seal bundle with deep code signature
+echo "[+] Sealing and signing AirDrop P2P.app bundle..."
+xattr -cr "$APP_DIR"
+codesign --force --deep --sign - "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
+
 echo "[+] AirDrop P2P.app bundle created at: $APP_DIR"
 
