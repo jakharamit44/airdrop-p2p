@@ -405,6 +405,27 @@ class AirDropNode(private val context: Context) {
         refreshLocalAddresses()
     }
 
+    private fun clearProgressNotification() {
+        _transferProgress.value = null
+        onTransferProgress?.invoke("", -1, 0L, 0L, 0L, true)
+    }
+
+    private fun isValidPeerTransferIp(ip: String): Boolean {
+        return ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")
+    }
+
+    private fun readBleLineBounded(sock: BluetoothSocket, inp: InputStream, timeoutMs: Long): String? {
+        val timer = scope.launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(timeoutMs)
+            runCatching { sock.close() }
+        }
+        return try {
+            readHttpLine(inp)
+        } finally {
+            timer.cancel()
+        }
+    }
+
     private fun reportProgress(
         label: String,
         pct: Int,
@@ -1092,13 +1113,15 @@ class AirDropNode(private val context: Context) {
                                         if (credParts.size >= 2) {
                                             out.write("WP2P\t${credParts[0]}\t${credParts[1]}\n".toByteArray(StandardCharsets.UTF_8))
                                             out.flush()
-                                            val replyLine = readHttpLine(dis).orEmpty()
+                                            val replyLine = readBleLineBounded(sock, dis, 22_000L).orEmpty()
                                             if (replyLine.startsWith("OK ")) {
                                                 val macIp = replyLine.removePrefix("OK ").trim()
-                                                if (macIp.startsWith("192.168.49.")) {
+                                                if (isValidPeerTransferIp(macIp)) {
                                                     wp2pJoined = true
-                                                    lastMacP2pIp = macIp
-                                                    log("Mac joined 5GHz P2P at $macIp:8772 — streaming at 5GHz Wi-Fi Direct speed…")
+                                                    if (macIp.startsWith("192.168.49.")) {
+                                                        lastMacP2pIp = macIp
+                                                    }
+                                                    log("Mac ready at $macIp:8772 — streaming over 5GHz Wi-Fi…")
                                                     txOk = sendOverWifiDirectHttps(
                                                         macIp,
                                                         8772,
@@ -1127,70 +1150,82 @@ class AirDropNode(private val context: Context) {
                                     } else {
                                         ByteArray(0)
                                     }
-                                    val encMeta = encryptBlePayload(tx.metaBytes)
-                                    val encArch = if (rawArchBytes.isNotEmpty()) encryptBlePayload(rawArchBytes) else ByteArray(0)
-                                    val total = encArch.size.toLong().coerceAtLeast(1L)
-                                    out.write("ADRE\n".toByteArray(StandardCharsets.US_ASCII))
-                                    dos.writeInt(encMeta.size)
-                                    dos.writeInt(encArch.size)
-                                    dos.write(encMeta)
-                                    if (encArch.isNotEmpty()) {
-                                        reportProgress(tx.label, 0, 0L, total, startedAt, tx.fileCount, isSending = true)
-                                        var off = 0
-                                        var lastUpdate = 0L
-                                        while (off < encArch.size) {
-                                            if (transferCancelled) throw IOException("Transfer cancelled")
-                                            val step = minOf(16384, encArch.size - off)
-                                            dos.write(encArch, off, step)
-                                            off += step
-                                            val tNow = System.currentTimeMillis()
-                                            if (tNow - lastUpdate >= 100L || off == encArch.size) {
-                                                lastUpdate = tNow
-                                                val pct = ((off.toLong() * 100L) / total).toInt().coerceIn(0, 99)
-                                                reportProgress(tx.label, pct, off.toLong(), total, startedAt, tx.fileCount, isSending = true)
+                                    if (tx.entries.isNotEmpty() && rawArchBytes.isEmpty()) {
+                                        log("5GHz Wi-Fi Direct connection failed — file (${formatBytes(tx.totalRawBytes)}) exceeds BLE fallback limit")
+                                    } else {
+                                        val encMeta = encryptBlePayload(tx.metaBytes)
+                                        val encArch = if (rawArchBytes.isNotEmpty()) encryptBlePayload(rawArchBytes) else ByteArray(0)
+                                        val total = encArch.size.toLong().coerceAtLeast(1L)
+                                        out.write("ADRE\n".toByteArray(StandardCharsets.US_ASCII))
+                                        dos.writeInt(encMeta.size)
+                                        dos.writeInt(encArch.size)
+                                        dos.write(encMeta)
+                                        if (encArch.isNotEmpty()) {
+                                            reportProgress(tx.label, 0, 0L, total, startedAt, tx.fileCount, isSending = true)
+                                            var off = 0
+                                            var lastUpdate = 0L
+                                            while (off < encArch.size) {
+                                                if (transferCancelled) throw IOException("Transfer cancelled")
+                                                val step = minOf(16384, encArch.size - off)
+                                                dos.write(encArch, off, step)
+                                                off += step
+                                                val tNow = System.currentTimeMillis()
+                                                if (tNow - lastUpdate >= 100L || off == encArch.size) {
+                                                    lastUpdate = tNow
+                                                    val pct = ((off.toLong() * 100L) / total).toInt().coerceIn(0, 99)
+                                                    reportProgress(tx.label, pct, off.toLong(), total, startedAt, tx.fileCount, isSending = true)
+                                                }
                                             }
                                         }
-                                    }
-                                    dos.flush()
-                                    val ack = ByteArray(4)
-                                    val n = dis.read(ack)
-                                    reportProgress(tx.label, 100, total, total, startedAt, tx.fileCount, isSending = true)
-                                    val ackStr = if (n > 0) String(ack, 0, n, StandardCharsets.US_ASCII).trim() else ""
-                                    txOk = n > 0 && !ackStr.startsWith("NO") && !transferCancelled
-                                    if (txOk) {
-                                        val macPeerLabel = (learnedMacName ?: "MacBook Pro")
-                                        for (e in tx.entries) {
-                                            recordHistoryItem(
-                                                ReceivedItem(
-                                                    title = e.name,
-                                                    pathOrUrl = e.name,
-                                                    isUrl = false,
-                                                    sizeBytes = e.size,
-                                                    isOutgoing = true,
-                                                    peerName = macPeerLabel
-                                                )
-                                            )
+                                        dos.flush()
+                                        val ack = ByteArray(4)
+                                        val ackTimer = scope.launch(Dispatchers.IO) {
+                                            kotlinx.coroutines.delay(20_000L)
+                                            runCatching { sock.close() }
                                         }
-                                        if (tx.url != null) {
-                                            recordHistoryItem(
-                                                ReceivedItem(
-                                                    title = "Sent Link to $macPeerLabel",
-                                                    pathOrUrl = tx.url,
-                                                    isUrl = true,
-                                                    sizeBytes = tx.url.length.toLong(),
-                                                    isOutgoing = true,
-                                                    peerName = macPeerLabel
-                                                )
-                                            )
+                                        val n = try {
+                                            dis.read(ack)
+                                        } finally {
+                                            ackTimer.cancel()
                                         }
+                                        reportProgress(tx.label, 100, total, total, startedAt, tx.fileCount, isSending = true)
+                                        val ackStr = if (n > 0) String(ack, 0, n, StandardCharsets.US_ASCII).trim() else ""
+                                        txOk = n > 0 && !ackStr.startsWith("NO") && !transferCancelled
+                                        if (txOk) {
+                                            val macPeerLabel = (learnedMacName ?: "MacBook Pro")
+                                            for (e in tx.entries) {
+                                                recordHistoryItem(
+                                                    ReceivedItem(
+                                                        title = e.name,
+                                                        pathOrUrl = e.name,
+                                                        isUrl = false,
+                                                        sizeBytes = e.size,
+                                                        isOutgoing = true,
+                                                        peerName = macPeerLabel
+                                                    )
+                                                )
+                                            }
+                                            if (tx.url != null) {
+                                                recordHistoryItem(
+                                                    ReceivedItem(
+                                                        title = "Sent Link to $macPeerLabel",
+                                                        pathOrUrl = tx.url,
+                                                        isUrl = true,
+                                                        sizeBytes = tx.url.length.toLong(),
+                                                        isOutgoing = true,
+                                                        peerName = macPeerLabel
+                                                    )
+                                                )
+                                            }
+                                        }
+                                        log("BLE L2CAP E2EE TX complete (${formatBytes(rawArchBytes.size.toLong())}, ack=$ackStr, ok=$txOk)")
                                     }
-                                    log("BLE L2CAP E2EE TX complete (${formatBytes(rawArchBytes.size.toLong())}, ack=$ackStr, ok=$txOk)")
                                 }
                             } catch (t: Throwable) {
                                 log("BLE piggyback TX warning: ${t.message}")
                             } finally {
                                 activeTransferSocket = null
-                                _transferProgress.value = null
+                                clearProgressNotification()
                                 tx.result.complete(txOk)
                             }
                             break
@@ -1367,7 +1402,7 @@ class AirDropNode(private val context: Context) {
             log("BLE L2CAP RX error ($remoteAddr): ${t.message}")
         } finally {
             if (activeTransferSocket === sock) activeTransferSocket = null
-            _transferProgress.value = null
+            clearProgressNotification()
             try {
                 sock.close()
             } catch (_: Throwable) {
@@ -1491,12 +1526,14 @@ class AirDropNode(private val context: Context) {
                                             dos.write(wp2pPayload)
                                             dos.flush()
 
-                                            val replyLine = readHttpLine(inp).orEmpty()
+                                            val replyLine = readBleLineBounded(sock, inp, 22_000L).orEmpty()
                                             if (replyLine.startsWith("OK ")) {
                                                 val macIp = replyLine.removePrefix("OK ").trim()
-                                                if (macIp.startsWith("192.168.49.")) {
-                                                    lastMacP2pIp = macIp
-                                                    log("Mac joined 5GHz P2P at $macIp:8772 \u2014 streaming at 5GHz Wi-Fi Direct speed\u2026")
+                                                if (isValidPeerTransferIp(macIp)) {
+                                                    if (macIp.startsWith("192.168.49.")) {
+                                                        lastMacP2pIp = macIp
+                                                    }
+                                                    log("Mac ready at $macIp:8772 — streaming over 5GHz Wi-Fi…")
                                                     val p2pOk = sendOverWifiDirectHttps(macIp, 8772, metaBytes, archiveBytes, entries, url, label, fileCount)
                                                     runCatching {
                                                         dos.write("DONE".toByteArray(StandardCharsets.US_ASCII))
@@ -1517,6 +1554,10 @@ class AirDropNode(private val context: Context) {
                                     ByteArrayOutputStream().also { AirDropCodec.writeDvzipCpio(entries, it) }.toByteArray()
                                 } else {
                                     ByteArray(0)
+                                }
+                                if (entries.isNotEmpty() && rawArchBytes.isEmpty()) {
+                                    log("5GHz Wi-Fi Direct connection failed — file (${formatBytes(totalRawBytes)}) exceeds BLE fallback limit")
+                                    return@withLock false
                                 }
                                 val encMeta = encryptBlePayload(metaBytes)
                                 val encArch = if (rawArchBytes.isNotEmpty()) encryptBlePayload(rawArchBytes) else ByteArray(0)
@@ -1544,7 +1585,15 @@ class AirDropNode(private val context: Context) {
                                 }
                                 dos.flush()
                                 val ack = ByteArray(4)
-                                val n = inp.read(ack)
+                                val ackTimer = scope.launch(Dispatchers.IO) {
+                                    kotlinx.coroutines.delay(20_000L)
+                                    runCatching { sock.close() }
+                                }
+                                val n = try {
+                                    inp.read(ack)
+                                } finally {
+                                    ackTimer.cancel()
+                                }
                                 reportProgress(label, 100, encTotal, encTotal, startedAt, fileCount, isSending = true)
                                 val ackStr = if (n > 0) String(ack, 0, n, StandardCharsets.US_ASCII).trim() else ""
                                 val ok = n > 0 && !ackStr.startsWith("NO") && !transferCancelled
@@ -1616,7 +1665,7 @@ class AirDropNode(private val context: Context) {
             } finally {
                 releaseTransferLocks()
                 activeTransferSocket = null
-                _transferProgress.value = null
+                clearProgressNotification()
                 if (_running.value && bleScanCallback == null) {
                     restartBleScanOnly()
                 }
@@ -1637,23 +1686,31 @@ class AirDropNode(private val context: Context) {
         acquireTransferLocks()
         wifiTeardownJob?.cancel()
         var keepAliveJob: Job? = null
+        var writeWatchdogJob: Job? = null
         return try {
             val sslCtx = buildSslContext()
             var rawSock: Socket? = null
             var lastConnErr: Throwable? = null
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            val p2pNetwork = cm?.allNetworks?.firstOrNull { net ->
-                val caps = cm.getNetworkCapabilities(net)
-                caps != null && (
-                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_WIFI_P2P) ||
-                    cm.getLinkProperties(net)?.linkAddresses?.any { it.address.hostAddress?.startsWith("192.168.49.") == true } == true
-                )
+            val isP2pTarget = host.startsWith("192.168.49.")
+            val p2pNetwork = if (isP2pTarget) {
+                cm?.allNetworks?.firstOrNull { net ->
+                    val caps = cm.getNetworkCapabilities(net)
+                    caps != null && (
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_WIFI_P2P) ||
+                        cm.getLinkProperties(net)?.linkAddresses?.any { it.address.hostAddress?.startsWith("192.168.49.") == true } == true
+                    )
+                }
+            } else {
+                null
             }
             for (attempt in 1..10) {
                 if (transferCancelled) return false
                 try {
                     val candidate = Socket()
-                    p2pNetwork?.bindSocket(candidate)
+                    if (isP2pTarget) {
+                        p2pNetwork?.bindSocket(candidate)
+                    }
                     candidate.connect(InetSocketAddress(host, port), 2500)
                     rawSock = candidate
                     break
@@ -1665,17 +1722,18 @@ class AirDropNode(private val context: Context) {
             val connectedRaw = rawSock ?: throw (lastConnErr ?: IOException("Could not connect to $host:$port"))
             connectedRaw.use { raw ->
                 activeTransferSocket = raw
-                raw.soTimeout = 300_000
+                raw.soTimeout = 60_000
                 raw.tcpNoDelay = true
                 raw.keepAlive = true
                 raw.sendBufferSize = 524288
                 raw.receiveBufferSize = 524288
 
                 // Launch active ARP keepalive coroutine during 5GHz Wi-Fi Direct transfers
-                // Sends UDP pulse to port 8774 every 2s to keep Android ARP entry REACHABLE
-                if (host.startsWith("192.168.49.")) {
+                // Bound to p2pNetwork so pulses egress on p2p-wlan0-* rather than wlan0
+                if (isP2pTarget) {
                     keepAliveJob = scope.launch(Dispatchers.IO) {
                         DatagramSocket().use { udpSock ->
+                            runCatching { p2pNetwork?.bindSocket(udpSock) }
                             val dummy = byteArrayOf(0xAD.toByte())
                             val targetAddr = InetAddress.getByName(host)
                             while (isActive && activeTransferSocket != null && !transferCancelled) {
@@ -1716,6 +1774,23 @@ class AirDropNode(private val context: Context) {
 
                     // 2. /Upload — Stream directly from source files over HTTP chunked encoding (zero OOM even for multi-GB files)
                     if (entries.isNotEmpty()) {
+                        raw.soTimeout = 30_000
+                        val lastWriteActivityMs = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+                        writeWatchdogJob = scope.launch(Dispatchers.IO) {
+                            while (isActive) {
+                                kotlinx.coroutines.delay(1000)
+                                val idleMs = System.currentTimeMillis() - lastWriteActivityMs.get()
+                                if (transferCancelled || idleMs > 25_000L) {
+                                    if (!transferCancelled) {
+                                        log("5GHz P2P write stall timeout (${idleMs / 1000}s) — aborting stuck socket")
+                                    }
+                                    runCatching { tls.close() }
+                                    runCatching { raw.close() }
+                                    break
+                                }
+                            }
+                        }
+
                         val startedAt = System.currentTimeMillis()
                         val total = entries.sumOf { it.size }.coerceAtLeast(1L)
                         val upHdr = buildString {
@@ -1728,6 +1803,7 @@ class AirDropNode(private val context: Context) {
                         }
                         rawOut.write(upHdr.toByteArray(StandardCharsets.US_ASCII))
                         rawOut.flush()
+                        lastWriteActivityMs.set(System.currentTimeMillis())
                         reportProgress(label, 0, 0L, total, startedAt, fileCount, isSending = true)
                         var lastUpdate = 0L
 
@@ -1747,7 +1823,9 @@ class AirDropNode(private val context: Context) {
                             chunkBuffer[dataOffset + buffered] = '\r'.code.toByte()
                             chunkBuffer[dataOffset + buffered + 1] = '\n'.code.toByte()
                             val totalLen = hexBytes.size + buffered + 2
+                            lastWriteActivityMs.set(System.currentTimeMillis())
                             rawOut.write(chunkBuffer, start, totalLen)
+                            lastWriteActivityMs.set(System.currentTimeMillis())
                             buffered = 0
                         }
 
@@ -1760,7 +1838,9 @@ class AirDropNode(private val context: Context) {
                                     flushChunk()
                                     bytesSinceFlush += 262144
                                     if (bytesSinceFlush >= 2097152) {
+                                        lastWriteActivityMs.set(System.currentTimeMillis())
                                         rawOut.flush()
+                                        lastWriteActivityMs.set(System.currentTimeMillis())
                                         bytesSinceFlush = 0
                                     }
                                 }
@@ -1779,7 +1859,9 @@ class AirDropNode(private val context: Context) {
                                         flushChunk()
                                         bytesSinceFlush += 262144
                                         if (bytesSinceFlush >= 2097152) {
+                                            lastWriteActivityMs.set(System.currentTimeMillis())
                                             rawOut.flush()
+                                            lastWriteActivityMs.set(System.currentTimeMillis())
                                             bytesSinceFlush = 0
                                         }
                                     }
@@ -1788,14 +1870,18 @@ class AirDropNode(private val context: Context) {
 
                             override fun flush() {
                                 flushChunk()
+                                lastWriteActivityMs.set(System.currentTimeMillis())
                                 rawOut.flush()
+                                lastWriteActivityMs.set(System.currentTimeMillis())
                                 bytesSinceFlush = 0
                             }
 
                             override fun close() {
                                 flushChunk()
+                                lastWriteActivityMs.set(System.currentTimeMillis())
                                 rawOut.write("0\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
                                 rawOut.flush()
+                                lastWriteActivityMs.set(System.currentTimeMillis())
                             }
                         }
                         AirDropCodec.writeDvzipCpio(entries, chunkedOut) { doneBytes ->
@@ -1808,6 +1894,7 @@ class AirDropNode(private val context: Context) {
                             }
                         }
                         chunkedOut.close()
+                        writeWatchdogJob?.cancel()
                         val upStatus = readHttpLine(inp).orEmpty()
                         reportProgress(label, 100, total, total, startedAt, fileCount, isSending = true)
                         if (!upStatus.contains("200") || transferCancelled) return false
@@ -1845,7 +1932,9 @@ class AirDropNode(private val context: Context) {
             log("5GHz Wi-Fi Direct HTTPS fallback: ${t.message}")
             false
         } finally {
+            writeWatchdogJob?.cancel()
             keepAliveJob?.cancel()
+            clearProgressNotification()
             releaseTransferLocks()
             activeTransferSocket = null
             lastMacP2pIp = ""
@@ -2070,7 +2159,7 @@ class AirDropNode(private val context: Context) {
                         }
                         didUpload = true
                         activeTransferSocket = sock
-                        sock.soTimeout = 300_000
+                        sock.soTimeout = 30_000
                         val downloads = File(
                             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
                             "AirDrop"
@@ -2099,7 +2188,7 @@ class AirDropNode(private val context: Context) {
                                         done += n
                                         if (done - lastTimeoutResetBytes >= 4_194_304L) {
                                             lastTimeoutResetBytes = done
-                                            runCatching { sock.soTimeout = 300_000 }
+                                            runCatching { sock.soTimeout = 30_000 }
                                         }
                                         val now = System.currentTimeMillis()
                                         if (now - lastUpdateMs >= 350L || done >= expectedBytes) {
@@ -2151,7 +2240,7 @@ class AirDropNode(private val context: Context) {
             log("RX session ($remote) ended: ${t.message}")
         } finally {
             if (activeTransferSocket === sock) activeTransferSocket = null
-            _transferProgress.value = null
+            clearProgressNotification()
             try {
                 sock.close()
             } catch (_: Throwable) {

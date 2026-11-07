@@ -246,7 +246,7 @@ def safe_notify(message: str, title: str):
 
 def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int) -> bool:
     s = load_settings()
-    if s.get("autoAccept", True):
+    if s.get("autoAccept", False):
         return True
     req_id = str(uuid.uuid4())
     ask_file = STATE_DIR / "pending_ask.json"
@@ -829,15 +829,23 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
     last_total = 0
     last_count = 1
     ask_approved = False
+    owns_rx_lock = False
     peer_ip = str(addr[0]).replace("::ffff:", "")
     rx_lock = STATE_DIR / "rx_in_progress.lock"
-    if not is_p2p_proxy and peer_ip.startswith("192.168.49."):
+    upload_done_flag = STATE_DIR / "upload_completed.flag"
+
+    def touch_rx_lock():
+        nonlocal owns_rx_lock
         try:
-            rx_lock.write_text(f"{os.getpid()}\t{peer_ip}\t{time.time()}")
+            tmp_lock = STATE_DIR / f"rx_in_progress.lock.{threading.get_ident()}.tmp"
+            tmp_lock.write_text(f"{os.getpid()}\t{peer_ip}\t{time.time()}")
+            tmp_lock.replace(rx_lock)
+            owns_rx_lock = True
         except Exception:
             pass
+
     try:
-        conn.settimeout(300.0)
+        conn.settimeout(30.0)
         f = conn.makefile("rb", buffering=262144)
         while True:
             req_line = read_line(f)
@@ -907,10 +915,18 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                 last_total = sum(int(fd.get("FileSize") or 0) for fd in files if isinstance(fd, dict))
 
                 if not is_p2p_proxy:
+                    try:
+                        upload_done_flag.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    touch_rx_lock()
+                    conn.settimeout(60.0)
                     if not wait_for_user_accept(last_sender, fnames if fnames else [str(x) for x in items], last_total):
                         print(f"[P2P-Receiver] Declined transfer from {last_sender}")
                         send_resp(conn, 403, "Forbidden", b"")
                         break
+                    conn.settimeout(30.0)
+                    touch_rx_lock()
                     ask_approved = True
                     for it in items:
                         if isinstance(it, str) and (it.startswith("http://") or it.startswith("https://")):
@@ -930,6 +946,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     print(f"[{role}] Rejected unauthorized /Upload from {addr} without approved /Ask")
                     send_resp(conn, 403, "Forbidden", b"")
                     break
+                conn.settimeout(30.0)
                 if is_p2p_proxy:
                     tmp_dir = Path(tempfile.mkdtemp(prefix="airdrop_finder_proxy_"))
                     saved, rx_len = stream_upload_to_dir(f, headers, tmp_dir, track_progress=False, file_label=last_label, expected_total=exp_tot, file_count=last_count)
@@ -947,6 +964,11 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                         threading.Thread(target=forward_to_peer_worker, args=(tmp_dir, saved), daemon=True).start()
                     break
                 else:
+                    try:
+                        upload_done_flag.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    touch_rx_lock()
                     saved, rx_len = stream_upload_to_dir(f, headers, DOWNLOADS, track_progress=True, file_label=last_label, expected_total=exp_tot, file_count=last_count)
                     print(f"[{role}] {method} {path} from {addr} ({rx_len} B)")
                     for p in saved:
@@ -965,7 +987,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                             pass
                     send_resp(conn, 200, "OK", b"")
                     try:
-                        (STATE_DIR / "upload_completed.flag").write_text(str(time.time()))
+                        upload_done_flag.write_text(str(time.time()))
                     except Exception:
                         pass
                     break
@@ -973,14 +995,17 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                 send_resp(conn, 400, "Bad Request", b"")
                 break
     except Exception as e:
-        write_progress(False)
+        if owns_rx_lock:
+            write_progress(False)
         print(f"[-] Client {addr} error: {e}")
+        sys.stdout.flush()
     finally:
-        write_progress(False)
-        try:
-            rx_lock.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if owns_rx_lock:
+            write_progress(False)
+            try:
+                rx_lock.unlink(missing_ok=True)
+            except Exception:
+                pass
         try:
             conn.close()
         except Exception:
@@ -988,6 +1013,19 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(CERT_FILE, KEY_FILE)
+
+def is_authorized_peer_ip(peer_ip: str) -> bool:
+    if peer_ip.startswith("192.168.49.") or peer_ip.startswith("127.") or peer_ip in ("::1", "fe80::1"):
+        return True
+    lan_flag = STATE_DIR / "lan_fallback_active.flag"
+    if lan_flag.exists():
+        try:
+            ts = float(lan_flag.read_text(encoding="utf-8").strip())
+            if time.time() - ts < 180.0 and (peer_ip.startswith("192.168.") or peer_ip.startswith("10.") or peer_ip.startswith("172.")):
+                return True
+        except Exception:
+            pass
+    return False
 
 def serve_port(bind_port: int, is_p2p_proxy: bool):
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
@@ -1002,12 +1040,13 @@ def serve_port(bind_port: int, is_p2p_proxy: bool):
         try:
             peer_ip = str(addr[0]).replace("::ffff:", "")
             if not is_p2p_proxy:
-                if not peer_ip.startswith("192.168.49.") and not peer_ip.startswith("127.") and peer_ip not in ("::1", "fe80::1"):
+                if not is_authorized_peer_ip(peer_ip):
                     print(f"[-] Dropping connection from unauthorized non-P2P address: {addr[0]}")
                     raw.close()
                     continue
             raw.settimeout(15.0)
             raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             try:
                 raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
             except Exception:
@@ -1020,11 +1059,18 @@ def serve_port(bind_port: int, is_p2p_proxy: bool):
 def watch_awdl_mdns():
     pid_file = STATE_DIR / "awdl-mdns.pid"
     rx_lock = STATE_DIR / "rx_in_progress.lock"
+    tx_lock = STATE_DIR / "tx_in_progress.lock"
     cur_ip = None
     proc = None
     while True:
         try:
-            if rx_lock.exists():
+            if rx_lock.exists() or tx_lock.exists():
+                if proc and proc.poll() is None:
+                    proc.terminate()
+                proc = None
+                cur_ip = None
+                if pid_file.exists():
+                    pid_file.unlink(missing_ok=True)
                 time.sleep(2.0)
                 continue
             active_peers = get_active_peers(12.0)
