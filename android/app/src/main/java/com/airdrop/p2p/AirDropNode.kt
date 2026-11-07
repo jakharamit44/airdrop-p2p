@@ -1120,7 +1120,7 @@ class AirDropNode(private val context: Context) {
                                     val startedAt = System.currentTimeMillis()
                                     val rawArchBytes = if (tx.archiveBytes.isNotEmpty()) {
                                         tx.archiveBytes
-                                    } else if (tx.entries.isNotEmpty()) {
+                                    } else if (tx.entries.isNotEmpty() && tx.totalRawBytes < 30_000_000L) {
                                         ByteArrayOutputStream().also { AirDropCodec.writeDvzipCpio(tx.entries, it) }.toByteArray()
                                     } else {
                                         ByteArray(0)
@@ -1477,7 +1477,7 @@ class AirDropNode(private val context: Context) {
                                 val dos = DataOutputStream(BufferedOutputStream(sock.outputStream, 65536))
                                 val inp = sock.inputStream
 
-                                if (attempt == 1 && totalRawBytes >= 65_536L && entries.isNotEmpty() && totalRawBytes <= 50_000_000L) {
+                                if (totalRawBytes >= 65_536L && entries.isNotEmpty()) {
                                     val creds = ensureWifiDirectCreds()
                                     if (creds.isNotEmpty()) {
                                         val credParts = creds.split('\t')
@@ -1511,7 +1511,7 @@ class AirDropNode(private val context: Context) {
                                 val startedAt = System.currentTimeMillis()
                                 val rawArchBytes = if (archiveBytes.isNotEmpty()) {
                                     archiveBytes
-                                } else if (entries.isNotEmpty()) {
+                                } else if (entries.isNotEmpty() && totalRawBytes < 30_000_000L) {
                                     ByteArrayOutputStream().also { AirDropCodec.writeDvzipCpio(entries, it) }.toByteArray()
                                 } else {
                                     ByteArray(0)

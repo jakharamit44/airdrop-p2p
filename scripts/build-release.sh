@@ -16,7 +16,9 @@ mkdir -p "$RELEASE_DIR"
 echo "[1/4] Building Android APK..."
 cd "$ROOT_DIR/android"
 if [ -z "${JAVA_HOME:-}" ] || [[ "$("${JAVA_HOME}/bin/java" -version 2>&1)" =~ "1.8." ]]; then
-    if [ -d "/opt/homebrew/opt/openjdk@17" ]; then
+    if [ -d "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home" ]; then
+        export JAVA_HOME="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
+    elif [ -d "/opt/homebrew/opt/openjdk@17" ]; then
         export JAVA_HOME="/opt/homebrew/opt/openjdk@17"
     elif [ -d "/usr/local/opt/openjdk@17" ]; then
         export JAVA_HOME="/usr/local/opt/openjdk@17"
@@ -43,6 +45,44 @@ if [ -f "$ROOT_DIR/macos/open-app.command" ]; then
   cp -f "$ROOT_DIR/macos/open-app.command" "$DMG_TMP/Open AirDrop P2P (Bypass Gatekeeper).command"
   chmod +x "$DMG_TMP/Open AirDrop P2P (Bypass Gatekeeper).command"
 fi
+
+# Set custom volume icon
+if [ -f "$ROOT_DIR/macos/AppIcon.icns" ]; then
+  cp -f "$ROOT_DIR/macos/AppIcon.icns" "$DMG_TMP/.VolumeIcon.icns"
+  if command -v SetFile >/dev/null 2>&1; then
+    SetFile -a C "$DMG_TMP" 2>/dev/null || true
+  fi
+fi
+
+# Provide first-time user guidance for Gatekeeper bypass
+cat > "$DMG_TMP/READ ME - HOW TO OPEN.txt" << 'EOF'
+===========================================================
+  AirDrop P2P v2.0.2 - Installation & First Launch Guide
+===========================================================
+
+1. INSTALLATION:
+   Drag "AirDrop P2P.app" into the "Applications" folder.
+
+2. FIRST TIME OPENING (macOS Gatekeeper):
+   If macOS shows:
+   "AirDrop P2P.app is damaged and can't be opened"
+   This is macOS Gatekeeper blocking unsigned open-source apps downloaded via Safari.
+
+   To open it instantly:
+   Option A (Easiest):
+   Double-click: "Open AirDrop P2P (Bypass Gatekeeper).command"
+
+   Option B (Terminal):
+   Open Terminal and paste:
+   xattr -cr "/Applications/AirDrop P2P.app"
+
+   Option C (System Settings):
+   Go to System Settings -> Privacy & Security, scroll down and click "Open Anyway".
+
+3. Once opened, AirDrop P2P will live in your menu bar and radar window!
+===========================================================
+EOF
+
 xattr -cr "$DMG_TMP"
 rm -f "$DMG_DEST"
 hdiutil create -volname "AirDrop P2P v${VERSION}" -srcfolder "$DMG_TMP" -ov -format UDZO "$DMG_DEST"

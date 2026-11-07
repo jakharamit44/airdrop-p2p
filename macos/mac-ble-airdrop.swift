@@ -47,13 +47,19 @@ func resolveRepoRoot() -> URL {
        (FileManager.default.fileExists(atPath: "\(env)/macos/mac-airdrop-p2p.sh") || FileManager.default.fileExists(atPath: "\(env)/mac-airdrop-p2p.sh")) {
         return URL(fileURLWithPath: env)
     }
-    // 1. If running inside AirDrop P2P.app, check enclosing directory
+    // 1. If running inside AirDrop P2P.app bundle, check Resources
+    if let res = Bundle.main.resourceURL,
+       (FileManager.default.fileExists(atPath: res.appendingPathComponent("mac-airdrop-p2p.sh").path) ||
+        FileManager.default.fileExists(atPath: res.appendingPathComponent("macos/mac-airdrop-p2p.sh").path)) {
+        return res
+    }
+    // 2. Check enclosing directory
     let enclosing = Bundle.main.bundleURL.deletingLastPathComponent()
     if FileManager.default.fileExists(atPath: enclosing.appendingPathComponent("macos/mac-airdrop-p2p.sh").path) ||
        FileManager.default.fileExists(atPath: enclosing.appendingPathComponent("mac-airdrop-p2p.sh").path) {
         return enclosing
     }
-    // 2. Argument 0 walking
+    // 3. Argument 0 walking
     var url = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
     for _ in 0..<6 {
         if FileManager.default.fileExists(atPath: url.appendingPathComponent("macos/mac-airdrop-p2p.sh").path) ||
@@ -82,6 +88,14 @@ let STATE_DIR: URL = {
     return u
 }()
 let SCRIPT_PATH: String = {
+    if let p = Bundle.main.path(forResource: "mac-airdrop-p2p", ofType: "sh"), FileManager.default.fileExists(atPath: p) {
+        return p
+    }
+    if let res = Bundle.main.resourceURL?.appendingPathComponent("mac-airdrop-p2p.sh").path, FileManager.default.fileExists(atPath: res) {
+        return res
+    }
+    let p0 = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p/mac-airdrop-p2p.sh").path
+    if FileManager.default.fileExists(atPath: p0) { return p0 }
     let p1 = REPO_ROOT.appendingPathComponent("macos/mac-airdrop-p2p.sh").path
     if FileManager.default.fileExists(atPath: p1) { return p1 }
     let p2 = REPO_ROOT.appendingPathComponent("mac-airdrop-p2p.sh").path
@@ -3766,6 +3780,8 @@ if args.count >= 2 && args[1] == "restore-wifi" {
        let iconImg = NSImage(contentsOf: icns) {
         app.applicationIconImage = iconImg
     } else if let iconImg = NSImage(contentsOfFile: REPO_ROOT.appendingPathComponent("AirDrop P2P.app/Contents/Resources/AppIcon.icns").path) {
+        app.applicationIconImage = iconImg
+    } else if let iconImg = NSImage(contentsOfFile: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p/AppIcon.icns").path) {
         app.applicationIconImage = iconImg
     }
     let daemon = BleAirDropDaemon()
