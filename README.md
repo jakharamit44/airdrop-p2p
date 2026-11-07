@@ -178,9 +178,10 @@ python3 macos/claude_processor.py --test
 
 #### Protocol Versioning & Advanced Features
 * **Protocol Version (`ANTHROPIC_VERSION`)**: In Anthropic's Messages REST API (`/v1/messages`), `2023-06-01` is the canonical protocol specification version identifier (similar to HTTP/1.1 or TLS 1.3). Future capability flags and features are negotiated via beta headers.
-* **Modern Model Configuration**: Default model is `claude-3-5-sonnet-20241022` with fast fallback to `claude-3-5-haiku-20241022`. Override anytime via:
+* **Modern Model Configuration**: Default models use current active Anthropic endpoints (`claude-sonnet-4-6` and `claude-haiku-4-5`). Older models (`claude-3-5-sonnet-20241022` retired Oct 2025; `claude-3-5-haiku-20241022` retired Feb 2026) are retired by Anthropic; the integration includes automatic fallback to active models. Override anytime via:
   ```bash
-  export ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"
+  export ANTHROPIC_MODEL="claude-sonnet-4-6"
+  export ANTHROPIC_FAST_MODEL="claude-haiku-4-5"
   export ANTHROPIC_BETA="prompt-caching-2024-07-31,pdfs-2024-09-25"
   ```
 

@@ -22,11 +22,12 @@ import urllib.error
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
-FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-haiku-4-5-20251001")
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-haiku-4-5")
+FALLBACK_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-sonnet-5-5"]
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 # Note: In Anthropic's Messages API specification, "2023-06-01" is the canonical protocol version identifier
-# required by the /v1/messages endpoint. Modern 2024-2026 capabilities (caching, PDFs, fast reasoning)
+# required by the /v1/messages endpoint. Modern capabilities (caching, PDFs, fast reasoning)
 # are delivered through anthropic-beta headers.
 ANTHROPIC_VERSION = os.environ.get("ANTHROPIC_VERSION", "2023-06-01")
 ANTHROPIC_BETA = os.environ.get("ANTHROPIC_BETA", "prompt-caching-2024-07-31,pdfs-2024-09-25")
@@ -127,6 +128,9 @@ def call_claude_api(
             return "\n\n".join(text_blocks).strip()
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
+        if ("not_found_error" in err_body or "retired" in err_body.lower() or e.code == 404) and model != FALLBACK_MODELS[0]:
+            print(f"[Claude-AI] Configured model '{model}' is retired or unavailable. Retrying with active model '{FALLBACK_MODELS[0]}'...")
+            return call_claude_api(messages, system_prompt, model=FALLBACK_MODELS[0], max_tokens=max_tokens, api_key=key)
         raise RuntimeError(f"Claude API HTTP {e.code}: {err_body}")
     except Exception as e:
         raise RuntimeError(f"Claude API request failed: {e}")
