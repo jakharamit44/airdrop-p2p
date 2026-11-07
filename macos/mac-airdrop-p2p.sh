@@ -120,7 +120,7 @@ start_daemons() {
 
   # Start HTTPS AirDrop 1.0 receiver (8772) + Native Finder AirDrop Android proxy (8773)
   nohup python3 -u - "$STATE_DIR/cert.pem" "$STATE_DIR/key.pem" "$PORT" "$PROXY_PORT" "$SCRIPT_DIR/mac-airdrop-p2p.sh" >"$LOG_FILE" 2>&1 << 'PYEOF' &
-import gzip, io, json, os, plistlib, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, uuid, zlib
+import gzip, io, json, os, plistlib, re, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, uuid, zlib
 from pathlib import Path
 
 CERT_FILE, KEY_FILE, PORT, PROXY_PORT, SCRIPT_PATH = (
@@ -132,7 +132,10 @@ CERT_FILE, KEY_FILE, PORT, PROXY_PORT, SCRIPT_PATH = (
 )
 STATE_DIR = Path(CERT_FILE).parent
 DOWNLOADS = Path.home() / "Downloads"
-DEFAULT_MAC_NAME = subprocess.check_output(["scutil", "--get", "ComputerName"], text=True).strip() or "MacBook Pro"
+try:
+    DEFAULT_MAC_NAME = subprocess.check_output(["scutil", "--get", "ComputerName"], text=True).strip() or "MacBook Pro"
+except Exception:
+    DEFAULT_MAC_NAME = socket.gethostname().split(".")[0] or "MacBook Pro"
 MEDIA_CAP = b'{"Version":3,"Codecs":{"hvc1":{"Profiles":{"VTIsHDRAllowedOnDevice":true}}}}'
 
 def load_settings():
@@ -142,7 +145,7 @@ def load_settings():
             return json.loads(sf.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"autoAccept": True, "visible": True, "deviceName": DEFAULT_MAC_NAME}
+    return {"autoAccept": False, "visible": True, "deviceName": DEFAULT_MAC_NAME}
 
 def current_mac_name():
     return load_settings().get("deviceName") or DEFAULT_MAC_NAME
@@ -608,28 +611,30 @@ class StreamDecompressor:
                     if self.dvzip_stored:
                         self.buf.extend(chunk)
                     else:
-                        try:
-                            self.buf.extend(self.decompressor.decompress(chunk))
-                        except zlib.error:
+                        if self.decompressor is None:
                             self.decompressor = zlib.decompressobj()
-                            self.buf.extend(self.decompressor.decompress(chunk))
+                        self.buf.extend(self.decompressor.decompress(chunk))
+                        if self.dvzip_rem == 0:
+                            self.buf.extend(self.decompressor.flush())
+                            self.decompressor = None
                 else:
                     hdr4 = self.raw.read_exact(4)
                     if len(hdr4) < 4:
                         if self.decompressor:
                             self.buf.extend(self.decompressor.flush())
+                            self.decompressor = None
                         self.eof = True
                         break
                     v = struct.unpack(">I", hdr4)[0]
                     if v == 0:
                         if self.decompressor:
                             self.buf.extend(self.decompressor.flush())
+                            self.decompressor = None
                         self.eof = True
                         break
                     self.dvzip_stored = bool(v & 0x80000000)
                     self.dvzip_rem = v & 0x7FFFFFFF
-                    if not self.dvzip_stored and self.decompressor is None:
-                        self.decompressor = zlib.decompressobj()
+                    self.decompressor = None if self.dvzip_stored else zlib.decompressobj()
 
         take = min(n, len(self.buf))
         out = bytes(self.buf[:take])
@@ -702,20 +707,30 @@ def extract_cpio_stream(stream, dest_dir: Path):
                     while target.exists():
                         target = dest_dir / f"{orig_stem}_{idx}{orig_suffix}"
                         idx += 1
-                    with target.open("wb", buffering=1048576) as out_f:
-                        rem = filesize
-                        while rem > 0:
-                            c = stream.read(min(262144, rem))
-                            if not c:
-                                break
-                            out_f.write(c)
-                            rem -= len(c)
-                    if rem > 0:
-                        saved_bytes = filesize - rem
-                        print(f"[!] Warning: Transfer stream truncated: preserved {saved_bytes} of {filesize} bytes in {target}")
+                    part_target = target.with_name(target.name + ".part")
+                    try:
+                        with part_target.open("wb", buffering=1048576) as out_f:
+                            rem = filesize
+                            while rem > 0:
+                                c = stream.read(min(262144, rem))
+                                if not c:
+                                    break
+                                out_f.write(c)
+                                rem -= len(c)
+                            out_f.flush()
+                            os.fsync(out_f.fileno())
+                        if rem > 0:
+                            part_target.unlink(missing_ok=True)
+                            raise IOError(f"Transfer stream truncated: expected {filesize} bytes, missing {rem} bytes")
+                        part_target.rename(target)
+                        try:
+                            subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;AirDrop;", str(target)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            pass
                         saved.append(target)
-                        raise IOError(f"Transfer stream truncated: expected {filesize} bytes, missing {rem} bytes")
-                    saved.append(target)
+                    except Exception:
+                        part_target.unlink(missing_ok=True)
+                        raise
                 else:
                     rem = filesize
                     while rem > 0:
@@ -811,6 +826,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
     last_label = "Incoming File"
     last_total = 0
     last_count = 1
+    ask_approved = False
     peer_ip = str(addr[0]).replace("::ffff:", "")
     rx_lock = STATE_DIR / "rx_in_progress.lock"
     if not is_p2p_proxy and peer_ip.startswith("192.168.49."):
@@ -893,6 +909,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                         print(f"[P2P-Receiver] Declined transfer from {last_sender}")
                         send_resp(conn, 403, "Forbidden", b"")
                         break
+                    ask_approved = True
                     for it in items:
                         if isinstance(it, str) and (it.startswith("http://") or it.startswith("https://")):
                             append_history("URL", it, len(it), "received", last_sender)
@@ -907,6 +924,10 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                 }, fmt=plistlib.FMT_BINARY)
                 send_resp(conn, 200, "OK", resp)
             elif method == "POST" and path == "/Upload":
+                if not is_p2p_proxy and not ask_approved:
+                    print(f"[{role}] Rejected unauthorized /Upload from {addr} without approved /Ask")
+                    send_resp(conn, 403, "Forbidden", b"")
+                    break
                 if is_p2p_proxy:
                     tmp_dir = Path(tempfile.mkdtemp(prefix="airdrop_finder_proxy_"))
                     saved, rx_len = stream_upload_to_dir(f, headers, tmp_dir, track_progress=False, file_label=last_label, expected_total=exp_tot, file_count=last_count)
@@ -977,6 +998,13 @@ def serve_port(bind_port: int, is_p2p_proxy: bool):
     while True:
         raw, addr = sock.accept()
         try:
+            peer_ip = str(addr[0]).replace("::ffff:", "")
+            if not is_p2p_proxy:
+                if not peer_ip.startswith("192.168.49.") and not peer_ip.startswith("127.") and peer_ip not in ("::1", "fe80::1"):
+                    print(f"[-] Dropping connection from unauthorized non-P2P address: {addr[0]}")
+                    raw.close()
+                    continue
+            raw.settimeout(15.0)
             raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)

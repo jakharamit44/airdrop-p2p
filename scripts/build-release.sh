@@ -15,6 +15,13 @@ mkdir -p "$RELEASE_DIR"
 # 1. Build Android APK
 echo "[1/4] Building Android APK..."
 cd "$ROOT_DIR/android"
+if [ -z "${JAVA_HOME:-}" ] || [[ "$("${JAVA_HOME}/bin/java" -version 2>&1)" =~ "1.8." ]]; then
+    if [ -d "/opt/homebrew/opt/openjdk@17" ]; then
+        export JAVA_HOME="/opt/homebrew/opt/openjdk@17"
+    elif [ -d "/usr/local/opt/openjdk@17" ]; then
+        export JAVA_HOME="/usr/local/opt/openjdk@17"
+    fi
+fi
 ./gradlew assembleDebug --no-daemon
 APK_SRC="$ROOT_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
 APK_DEST="$RELEASE_DIR/AirDrop-P2P-v${VERSION}.apk"

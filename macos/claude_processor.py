@@ -22,8 +22,8 @@ import urllib.error
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
-FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-3-5-haiku-20241022")
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-haiku-4-5-20251001")
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 # Note: In Anthropic's Messages API specification, "2023-06-01" is the canonical protocol version identifier
 # required by the /v1/messages endpoint. Modern 2024-2026 capabilities (caching, PDFs, fast reasoning)
@@ -31,7 +31,7 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = os.environ.get("ANTHROPIC_VERSION", "2023-06-01")
 ANTHROPIC_BETA = os.environ.get("ANTHROPIC_BETA", "prompt-caching-2024-07-31,pdfs-2024-09-25")
 
-MAX_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MB Anthropic vision limit
+MAX_IMAGE_BYTES = 5 * 1024 * 1024   # 5 MB Anthropic vision limit
 MAX_TEXT_CHARS = 120_000            # ~30,000 tokens safe context bound
 
 CONFIG_DIR = Path.home() / ".airdrop-p2p"
@@ -69,16 +69,16 @@ def get_api_key() -> Optional[str]:
 
 
 def is_claude_enabled() -> bool:
-    """Check if Claude auto-processing is enabled."""
-    if os.environ.get("CLAUDE_AI_ENABLED", "").lower() in ("0", "false", "no"):
-        return False
+    """Check if Claude auto-processing is enabled (opt-in by default for privacy)."""
+    if os.environ.get("CLAUDE_AI_ENABLED", "").lower() in ("1", "true", "yes"):
+        return True
     if CONFIG_FILE.exists():
         try:
             cfg = json.loads(CONFIG_FILE.read_text())
-            return cfg.get("enabled", True)
+            return cfg.get("enabled", False)
         except Exception:
             pass
-    return True
+    return False
 
 
 def call_claude_api(

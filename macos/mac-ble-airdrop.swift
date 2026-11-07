@@ -312,12 +312,12 @@ func loadMacSettings() -> (autoAccept: Bool, visible: Bool, deviceName: String) 
     let sf = STATE_DIR.appendingPathComponent("settings.json")
     if let d = try? Data(contentsOf: sf),
        let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
-        let auto = (obj["autoAccept"] as? Bool) ?? true
+        let auto = (obj["autoAccept"] as? Bool) ?? false
         let vis = (obj["visible"] as? Bool) ?? true
         let name = (obj["deviceName"] as? String) ?? defaultName
         return (auto, vis, name.isEmpty ? defaultName : name)
     }
-    return (true, true, defaultName)
+    return (false, true, defaultName)
 }
 
 func saveMacSettings(autoAccept: Bool, visible: Bool, deviceName: String) {
@@ -665,6 +665,11 @@ func writeAll(
 }
 
 func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
+    guard ssid.hasPrefix("DIRECT-"), !pass.isEmpty else {
+        print("[BLE-Daemon] Rejected invalid WP2P request: SSID '\(ssid)' does not start with DIRECT-")
+        _ = writeAll(out, data: Data("ERR\n".utf8))
+        return
+    }
     saveCurrentWifiSsid()
     print("[BLE-Daemon] Incoming WP2P 5GHz Wi-Fi Direct request: joining \(ssid)...")
     fflush(stdout)
@@ -934,26 +939,30 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                             if self.cur_stored:
                                 self.buf.extend(chunk)
                             else:
-                                try:
-                                    self.buf.extend(self.decompressor.decompress(chunk))
-                                except zlib.error:
+                                if self.decompressor is None:
                                     self.decompressor = zlib.decompressobj()
-                                    self.buf.extend(self.decompressor.decompress(chunk))
+                                self.buf.extend(self.decompressor.decompress(chunk))
+                                if self.cur_rem == 0:
+                                    self.buf.extend(self.decompressor.flush())
+                                    self.decompressor = None
                         else:
                             hdr4 = self.raw.read(4)
                             if len(hdr4) < 4:
+                                if self.decompressor:
+                                    self.buf.extend(self.decompressor.flush())
+                                    self.decompressor = None
                                 self.eof = True
                                 break
                             v = struct.unpack(">I", hdr4)[0]
                             if v == 0:
                                 if self.decompressor:
                                     self.buf.extend(self.decompressor.flush())
+                                    self.decompressor = None
                                 self.eof = True
                                 break
                             self.cur_stored = bool(v & 0x80000000)
                             self.cur_rem = v & 0x7FFFFFFF
-                            if not self.cur_stored and self.decompressor is None:
-                                self.decompressor = zlib.decompressobj()
+                            self.decompressor = None if self.cur_stored else zlib.decompressobj()
 
                     take = min(len(b), len(self.buf))
                     b[:take] = self.buf[:take]
@@ -1006,15 +1015,30 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                             while t.exists():
                                 t = dest / f"{orig_stem}_{idx}{orig_suffix}"
                                 idx += 1
-                            with t.open("wb") as out_f:
-                                rem = fs
-                                while rem > 0:
-                                    c = stream.read(min(65536, rem))
-                                    if not c:
-                                        break
-                                    out_f.write(c)
-                                    rem -= len(c)
-                            print(t)
+                            part_t = t.with_name(t.name + ".part")
+                            try:
+                                with part_t.open("wb") as out_f:
+                                    rem = fs
+                                    while rem > 0:
+                                        c = stream.read(min(65536, rem))
+                                        if not c:
+                                            break
+                                        out_f.write(c)
+                                        rem -= len(c)
+                                    out_f.flush()
+                                    os.fsync(out_f.fileno())
+                                if rem > 0:
+                                    part_t.unlink(missing_ok=True)
+                                else:
+                                    part_t.rename(t)
+                                    try:
+                                        import subprocess
+                                        subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;AirDrop;", str(t)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    except Exception:
+                                        pass
+                                    print(t)
+                            except Exception:
+                                part_t.unlink(missing_ok=True)
                     else:
                         rem = fs
                         while rem > 0:
@@ -1892,7 +1916,7 @@ final class MacAirDropViewModel: ObservableObject {
     @Published var mdnsRunning: Bool = false
     @Published var awdlProxyRunning: Bool = false
     @Published var bleRunning: Bool = true
-    @Published var autoAccept: Bool = true
+    @Published var autoAccept: Bool = false
     @Published var macDeviceName: String = Host.current().localizedName ?? "Amit’s MacBook Pro"
     @Published var editingDeviceName: String = ""
     @Published var activePeers: [MacDiscoveredPeer] = []

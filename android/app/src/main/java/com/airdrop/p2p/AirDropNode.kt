@@ -215,7 +215,7 @@ class AirDropNode(private val context: Context) {
 
     var deviceModel: String = Build.MODEL ?: "Android"
 
-    private val _autoAcceptFlow = MutableStateFlow(prefs.getBoolean("auto_accept", true))
+    private val _autoAcceptFlow = MutableStateFlow(prefs.getBoolean("auto_accept", false))
     val autoAcceptFlow: StateFlow<Boolean> = _autoAcceptFlow.asStateFlow()
 
     var autoAccept: Boolean
@@ -467,6 +467,7 @@ class AirDropNode(private val context: Context) {
         val fileCount: Int,
         val totalRawBytes: Long,
         val result: CompletableDeferred<Boolean>,
+        val targetPeerAddress: String? = null,
         @Volatile var claimed: Boolean = false
     )
 
@@ -1068,7 +1069,7 @@ class AirDropNode(private val context: Context) {
                         }
 
                         val tx = pendingMacTx
-                        if (tx == null) {
+                        if (tx == null || (tx.targetPeerAddress != null && tx.targetPeerAddress != remoteAddr)) {
                             val pong = "PONG\t$deviceName\t$localBlePsm\n"
                             out.write(pong.toByteArray(StandardCharsets.UTF_8))
                             out.flush()
@@ -1196,11 +1197,13 @@ class AirDropNode(private val context: Context) {
                     break
                 }
                 if (magicStr == "WP2P") {
-                    val creds = ensureWifiDirectCreds()
+                    val isAuthorized = (pendingMacTx != null && (pendingMacTx?.targetPeerAddress == null || pendingMacTx?.targetPeerAddress == remoteAddr)) ||
+                                       (learnedMacName != null && bleMacDevice?.address == remoteAddr)
+                    val creds = if (isAuthorized) ensureWifiDirectCreds() else ""
                     val reply = if (creds.isNotEmpty()) "OK\t$creds\n" else "NO\n"
                     out.write(reply.toByteArray(StandardCharsets.UTF_8))
                     out.flush()
-                    log("BLE WP2P handshake with $remoteAddr -> ${if (creds.isNotEmpty()) "5GHz P2P Ready" else "Fallback"}")
+                    log("BLE WP2P handshake with $remoteAddr -> ${if (creds.isNotEmpty()) "5GHz P2P Ready" else "Rejected/Fallback"}")
                     continue
                 }
                 val isEncryptedBle = (magicStr == "ADRE")
@@ -1254,7 +1257,7 @@ class AirDropNode(private val context: Context) {
                         decision = deferred
                     )
                     try {
-                        deferred.await()
+                        kotlinx.coroutines.withTimeoutOrNull(45_000L) { deferred.await() } ?: false
                     } finally {
                         _incomingAsk.value = null
                     }
@@ -1426,6 +1429,7 @@ class AirDropNode(private val context: Context) {
 
                 // 2. Queue transfer for Mac's 1.5s BLE L2CAP heartbeat (works even when Android BLE scan is blocked by OS Location toggle)
                 val deferred = CompletableDeferred<Boolean>()
+                val targetAddr = bleMacDevice?.address
                 val tx = PendingMacTx(
                     metaBytes = metaBytes,
                     archiveBytes = archiveBytes,
@@ -1434,7 +1438,8 @@ class AirDropNode(private val context: Context) {
                     label = label,
                     fileCount = fileCount,
                     totalRawBytes = totalRawBytes,
-                    result = deferred
+                    result = deferred,
+                    targetPeerAddress = targetAddr
                 )
                 pendingMacTx = tx
                 log("Queued transfer for Mac BLE L2CAP P2P channel\u2026")
@@ -1883,8 +1888,11 @@ class AirDropNode(private val context: Context) {
                 while (_running.value) {
                     val client = try {
                         srv.accept() as SSLSocket
-                    } catch (_: Throwable) {
-                        break
+                    } catch (e: Throwable) {
+                        if (srv.isClosed || !_running.value) break
+                        log("Receiver accept error (recovering): ${e.message}")
+                        kotlinx.coroutines.delay(100)
+                        continue
                     }
                     scope.launch { handleReceiverConnection(client) }
                 }
@@ -1896,6 +1904,11 @@ class AirDropNode(private val context: Context) {
 
     private suspend fun handleReceiverConnection(sock: SSLSocket) = withContext(Dispatchers.IO) {
         val remoteIp = sock.inetAddress?.hostAddress.orEmpty()
+        if (!remoteIp.startsWith("192.168.49.") && remoteIp != "127.0.0.1" && remoteIp != "::1" && !remoteIp.endsWith(":127.0.0.1")) {
+            log("Rejecting non-P2P incoming connection from $remoteIp")
+            runCatching { sock.close() }
+            return@withContext
+        }
         if (remoteIp.startsWith("192.168.49.")) {
             lastMacP2pIp = remoteIp
         }
@@ -1910,6 +1923,7 @@ class AirDropNode(private val context: Context) {
             var lastAskLabel = "Incoming AirDrop"
             var lastAskFileCount = 1
             var lastAskTotalBytes = 0L
+            var connectionAskApproved = false
 
             while (_running.value) {
                 val reqLine = readHttpLine(inp) ?: break
@@ -1995,7 +2009,7 @@ class AirDropNode(private val context: Context) {
                                 decision = deferred
                             )
                             try {
-                                deferred.await()
+                                kotlinx.coroutines.withTimeoutOrNull(45_000L) { deferred.await() } ?: false
                             } finally {
                                 _incomingAsk.value = null
                             }
@@ -2007,6 +2021,7 @@ class AirDropNode(private val context: Context) {
                             writeHttpResponse(out, 403, "Forbidden", ByteArray(0), close = true)
                             break
                         }
+                        connectionAskApproved = true
 
                         for (item in items) {
                             val url = item?.toString() ?: continue
@@ -2037,6 +2052,12 @@ class AirDropNode(private val context: Context) {
                         sock.soTimeout = 60_000
                     }
                     method == "POST" && path == "/Upload" -> {
+                        if (!connectionAskApproved) {
+                            log("Rejected unauthorized /Upload from $remote without approved /Ask")
+                            didUpload = true
+                            writeHttpResponse(out, 403, "Forbidden", ByteArray(0), close = true)
+                            break
+                        }
                         didUpload = true
                         activeTransferSocket = sock
                         sock.soTimeout = 300_000

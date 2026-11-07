@@ -566,6 +566,9 @@ object AirDropCodec {
                 if (!outFile.canonicalPath.startsWith(destCanonical)) {
                     throw SecurityException("CPIO path traversal detected: $rawName")
                 }
+                if (destDir.usableSpace < fileSize) {
+                    throw IOException("Insufficient storage space for $baseName: required $fileSize B, available ${destDir.usableSpace} B")
+                }
                 var suffix = 1
                 while (outFile.exists()) {
                     val dot = baseName.lastIndexOf('.')
@@ -576,18 +579,31 @@ object AirDropCodec {
                     }
                     suffix++
                 }
-                BufferedOutputStream(FileOutputStream(outFile), 262144).use { fos ->
-                    var left = fileSize
-                    while (left > 0) {
-                        val want = minOf(ioBuf.size.toLong(), left).toInt()
-                        val n = cpioStream.read(ioBuf, 0, want)
-                        if (n <= 0) throw EOFException("Truncated CPIO file data for $baseName")
-                        fos.write(ioBuf, 0, n)
-                        left -= n
+                val partFile = File(destDir, "${outFile.name}.part")
+                var writeSuccess = false
+                try {
+                    BufferedOutputStream(FileOutputStream(partFile), 262144).use { fos ->
+                        var left = fileSize
+                        while (left > 0) {
+                            val want = minOf(ioBuf.size.toLong(), left).toInt()
+                            val n = cpioStream.read(ioBuf, 0, want)
+                            if (n <= 0) throw EOFException("Truncated CPIO file data for $baseName")
+                            fos.write(ioBuf, 0, n)
+                            left -= n
+                        }
+                        fos.flush()
                     }
-                    fos.flush()
+                    if (partFile.renameTo(outFile)) {
+                        writeSuccess = true
+                        saved.add(outFile)
+                    } else {
+                        throw IOException("Failed to atomically rename temporary file $partFile to $outFile")
+                    }
+                } finally {
+                    if (!writeSuccess) {
+                        partFile.delete()
+                    }
                 }
-                saved.add(outFile)
             } else {
                 var left = fileSize
                 while (left > 0) {

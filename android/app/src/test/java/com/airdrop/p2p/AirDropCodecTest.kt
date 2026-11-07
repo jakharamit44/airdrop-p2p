@@ -137,4 +137,39 @@ class AirDropCodecTest {
             out
         )
     }
+
+    @Test
+    fun atomicPartFileCleanupOnTruncation() {
+        val payload = ByteArray(100_000) { (it % 256).toByte() }
+        val out = ByteArrayOutputStream()
+        AirDropCodec.writeDvzipCpio(
+            listOf(
+                AirDropCodec.OutgoingEntry(
+                    name = "interrupted.bin",
+                    size = payload.size.toLong(),
+                    openStream = { ByteArrayInputStream(payload) }
+                )
+            ),
+            out
+        )
+        val fullArchive = out.toByteArray()
+        // Truncate archive in the middle of payload data
+        val truncatedArchive = fullArchive.copyOf(fullArchive.size / 2)
+
+        val tempDir = Files.createTempDirectory("airdrop-atomic-test").toFile()
+        try {
+            var failed = false
+            try {
+                AirDropCodec.extractDvzipCpio(ByteArrayInputStream(truncatedArchive), tempDir)
+            } catch (_: java.io.IOException) {
+                failed = true
+            }
+            assertTrue("Expected truncated stream to throw IOException", failed)
+            val files = tempDir.listFiles().orEmpty()
+            assertTrue("Destination directory must not contain .part files after failure", files.none { it.name.endsWith(".part") })
+            assertTrue("Destination directory must not contain partial target files", files.none { it.name == "interrupted.bin" })
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }
