@@ -16,7 +16,7 @@ android {
         applicationId = "com.airdrop.p2p"
         minSdk = 31
         targetSdk = 36
-        versionCode = 210
+        versionCode = 211
         versionName = appVersionName
     }
 

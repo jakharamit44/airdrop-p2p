@@ -1,0 +1,40 @@
+# Changelog
+
+All notable changes to AirDrop P2P are documented in this file.
+
+## [v2.1.1] - 2026-11-08
+
+### Fixed
+- **64-bit Extended CPIO Format (`070764`) for Files > 8 GiB**: Fixed the POSIX CPIO `odc` format octal field constraint (`0x1FFFFFFFFL` / 8,589,934,591 bytes) that caused transfers of files $\ge 8$ GiB (including 16.50 GB archives) to fail with an `IllegalArgumentException` before transmission.
+- **Arbitrary 64-bit Payload Streaming**: Android (`AirDropCodec.kt`) and macOS daemon (`mac-airdrop-p2p.sh` and `mac-ble-airdrop.swift`) now stream and extract 64-bit archives without size limits (16.5 GB, 50 GB, 100+ GB) using the `070764` extended header.
+- **Full Backward Compatibility**: Files $\le 8$ GiB continue using standard POSIX `070707` CPIO headers, preserving compatibility with legacy receivers.
+- **Accurate Release Changelog Pipeline**: Replaced static release descriptions in `scripts/publish-release.py` with automatic extraction from `CHANGELOG.md`, ensuring every release notes entry reflects actual technical changes.
+
+## [v2.1.0] - 2026-11-07
+
+### Added
+- **QuickShare 4-Tab Navigation**: Redesigned Android UI with dedicated Send, Receive, History, and Settings tabs with modern Material 3 styling and light/dark theme support.
+- **File Staging Queue**: Users can select and inspect multiple files before initiating transfer, with remove/clear controls and size summaries.
+- **Connecting Phase Telemetry**: Visible connecting message and spinner during Wi-Fi Direct P2P negotiation and BLE discovery so the user is informed while connecting.
+
+### Improved
+- **5GHz Wi-Fi Direct Socket Throughput**: 1 MiB chunk buffering and socket send/receive tuning for transfer speeds up to 45 MB/s.
+
+## [v2.0.2] - 2026-11-07
+
+### Fixed
+- **Cloudflare WARP Firewall Drop**: Automatically pauses Cloudflare WARP during active P2P transfers and restores it upon completion, eliminating the 36-second socket timeout caused by local tunnel firewall rules.
+- **ARP Keepalive Pulses**: Bidirectional 2.0s ICMP/UDP keepalive to prevent Linux kernel ARP cache entry expiration on multi-gigabyte transfers.
+
+## [v2.0.1] - 2026-11-07
+
+### Fixed
+- **macOS Gatekeeper Unblocker**: Added `Open AirDrop P2P (Bypass Gatekeeper).command` and `/Applications` symlink inside the DMG installer to simplify opening on macOS without manual Terminal commands.
+- **Multi-Resolution App Icon**: Packaged 16x16 to 512x512@2x icons into `AppIcon.icns` for macOS Dock and menu bar.
+
+## [v2.0.0] - 2026-11-07
+
+### Added
+- **Pure P2P Transfer Engine**: Direct 5GHz Wi-Fi Direct Autonomous Group (WP2P) and Bluetooth LE L2CAP transfer between Android and macOS without shared Wi-Fi router or LAN requirements.
+- **Native AirDrop Protocol Emulation**: Implemented `/Discover`, `/Ask`, and `/Upload` endpoints with binary property lists (`bplist00`) and streaming CPIO archives.
+

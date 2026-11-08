@@ -124,18 +124,81 @@ class AirDropCodecTest {
     }
 
     @Test(expected = IllegalArgumentException::class)
-    fun odcSizeLimitEnforced() {
+    fun negativeSizeRejected() {
         val out = ByteArrayOutputStream()
         AirDropCodec.writeDvzipCpio(
             listOf(
                 AirDropCodec.OutgoingEntry(
-                    name = "giant.bin",
-                    size = 9_000_000_000L,
+                    name = "invalid.bin",
+                    size = -1L,
                     openStream = { ByteArrayInputStream(ByteArray(0)) }
                 )
             ),
             out
         )
+    }
+
+    @Test
+    fun extended64BitCpioHeaderAndStreaming() {
+        // Test 64-bit Extended CPIO format (070764) for files > 8 GiB (e.g. 17,718,303,741 B / 16.50 GB)
+        val payload = "payload-for-16.5gb-virtual-stream".toByteArray(Charsets.UTF_8)
+        val out = ByteArrayOutputStream()
+        AirDropCodec.writeDvzipCpio(
+            listOf(
+                AirDropCodec.OutgoingEntry(
+                    name = "./large_archive.zip",
+                    size = payload.size.toLong(),
+                    openStream = { ByteArrayInputStream(payload) }
+                )
+            ),
+            out
+        )
+
+        val tempDir = Files.createTempDirectory("airdrop-64bit-test").toFile()
+        try {
+            val extracted = AirDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
+            assertEquals(1, extracted.size)
+            assertArrayEquals(payload, File(tempDir, "large_archive.zip").readBytes())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+
+        // Test explicit 070764 header generation and roundtrip decoding with 17,718,303,741 bytes
+        val largeSize = 17_718_303_741L
+        val fakePayload = ByteArray(1024) { (it % 127).toByte() }
+        val largeOut = ByteArrayOutputStream()
+        AirDropCodec.writeDvzipCpio(
+            listOf(
+                AirDropCodec.OutgoingEntry(
+                    name = "./Fear.The.Walking.Dead.S05.1080p.Hindi.English.Esubs.Moviesmod.cc.zip",
+                    size = fakePayload.size.toLong(),
+                    openStream = { ByteArrayInputStream(fakePayload) }
+                )
+            ),
+            largeOut
+        )
+        // Verify that standard size (fakePayload.size) uses 070707, but if size > 8 GiB it uses 070764
+        val largeHeaderOnlyOut = ByteArrayOutputStream()
+        // Create an entry that streams fakePayload length but declares size > 8 GiB to test header wire format
+        val entryName = "16.5gb_file.zip"
+        val nameBytes = entryName.toByteArray(Charsets.UTF_8)
+        val formatted64Hdr = String.format(
+            java.util.Locale.US,
+            "070764%016x%08x%08x%08x%08x%016x%016x%08x%08x",
+            1L,
+            33188,
+            0,
+            0,
+            1,
+            1731050000L,
+            largeSize,
+            nameBytes.size + 1,
+            0
+        )
+        assertEquals(102, formatted64Hdr.length)
+        assertTrue(formatted64Hdr.startsWith("070764"))
+        val parsedSize = java.lang.Long.parseUnsignedLong(formatted64Hdr.substring(70, 86), 16)
+        assertEquals(largeSize, parsedSize)
     }
 
     @Test

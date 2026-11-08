@@ -18,7 +18,7 @@ import java.util.zip.Inflater
 /**
  * AirDrop wire codecs ported from netmojo-systems/omdrop-plugin:
  * 1. Apple binary plist (bplist00) encoder/decoder for /Discover and /Ask
- * 2. DVZip + CPIO (070707 odc / 070701 newc) streaming archive encoder/decoder for /Upload
+ * 2. DVZip + CPIO (070707 odc / 070701 newc / 070764 64-bit) streaming archive encoder/decoder for /Upload
  * 3. Apple Continuity BLE (0x004C, type 0x05) wake payload
  */
 object AirDropCodec {
@@ -453,33 +453,52 @@ object AirDropCodec {
             }
         }
 
-        fun writeOdcHeader(
+        fun writeCpioHeader(
             ino: Int,
             mode: Int,
             mtime: Long,
             nameBytes: ByteArray,
             fileSize: Long
         ) {
-            require(fileSize in 0..0x1FFFFFFFFL) {
-                "File size $fileSize exceeds CPIO odc 8 GiB limit"
+            require(fileSize >= 0L) { "Negative file size: $fileSize" }
+            if (fileSize <= 0x1FFFFFFFFL) {
+                // POSIX odc 070707 format (76-byte header, backwards-compatible for files <= 8 GiB)
+                val header = String.format(
+                    java.util.Locale.US,
+                    "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o",
+                    0,
+                    ino and 0x3FFFF,
+                    mode and 0x3FFFF,
+                    0,
+                    0,
+                    1,
+                    0,
+                    mtime.coerceAtLeast(0),
+                    nameBytes.size + 1,
+                    fileSize
+                )
+                dvzipOut.write(header.toByteArray(StandardCharsets.US_ASCII))
+                dvzipOut.write(nameBytes)
+                dvzipOut.write(0)
+            } else {
+                // Extended 64-bit CPIO 070764 format (102-byte header, unconstrained 64-bit size for >= 8 GiB, 16.5 GB, 50 GB+)
+                val header = String.format(
+                    java.util.Locale.US,
+                    "070764%016x%08x%08x%08x%08x%016x%016x%08x%08x",
+                    ino.toLong() and 0xFFFFFFFFL,
+                    mode and 0xFFFFFF,
+                    0, // uid
+                    0, // gid
+                    1, // nlink
+                    mtime.coerceAtLeast(0),
+                    fileSize,
+                    nameBytes.size + 1,
+                    0  // check
+                )
+                dvzipOut.write(header.toByteArray(StandardCharsets.US_ASCII))
+                dvzipOut.write(nameBytes)
+                dvzipOut.write(0)
             }
-            val header = String.format(
-                java.util.Locale.US,
-                "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o",
-                0,
-                ino and 0x3FFFF,
-                mode and 0x3FFFF,
-                0,
-                0,
-                1,
-                0,
-                mtime.coerceAtLeast(0),
-                nameBytes.size + 1,
-                fileSize
-            )
-            dvzipOut.write(header.toByteArray(StandardCharsets.US_ASCII))
-            dvzipOut.write(nameBytes)
-            dvzipOut.write(0)
         }
 
         val buf = ByteArray(if (useStoredBlocks) DVZIP_STORED_BLOCK_BYTES else 262144)
@@ -488,7 +507,7 @@ object AirDropCodec {
         for (entry in entries) {
             val safeName = safeFileName(entry.name)
             val nameBytes = safeName.toByteArray(StandardCharsets.UTF_8)
-            writeOdcHeader(
+            writeCpioHeader(
                 ino = ino++,
                 mode = 33188, // 0100644 regular file
                 mtime = entry.mtimeSec,
@@ -509,7 +528,7 @@ object AirDropCodec {
             }
         }
         // CPIO TRAILER!!!
-        writeOdcHeader(
+        writeCpioHeader(
             ino = 0,
             mode = 0,
             mtime = 0,
@@ -569,6 +588,15 @@ object AirDropCodec {
                     fileSize = hStr.substring(48, 56).toLong(16)
                     nameSize = hStr.substring(88, 96).toInt(16)
                     isNewc = true
+                }
+                "070764" -> {
+                    val hdr = ByteArray(96)
+                    if (readExact(cpioStream, hdr, 96) < 96) throw EOFException("Truncated 070764 header")
+                    val hStr = String(hdr, StandardCharsets.US_ASCII)
+                    mode = hStr.substring(16, 24).toInt(16)
+                    fileSize = java.lang.Long.parseUnsignedLong(hStr.substring(64, 80), 16)
+                    nameSize = hStr.substring(80, 88).toInt(16)
+                    isNewc = false
                 }
                 else -> throw IllegalArgumentException("Invalid CPIO magic: $magic")
             }
@@ -664,7 +692,7 @@ object AirDropCodec {
         }
         if (got == 6) {
             val magic6 = String(prefix, 0, 6, StandardCharsets.US_ASCII)
-            if (magic6 == "070707" || magic6 == "070701" || magic6 == "070702") {
+            if (magic6 == "070707" || magic6 == "070701" || magic6 == "070702" || magic6 == "070764") {
                 return combined
             }
         }

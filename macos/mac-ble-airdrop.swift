@@ -997,10 +997,18 @@ func buildDvzipCpio(files: [URL]) throws -> (Data, [[String: Any]]) {
 
     func makeOdcHdr(path: String, mode: Int, size: Int64) -> Data {
         let nameBytes = Array(path.utf8) + [0]
-        let header = String(
-            format: "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o",
-            0, ino, mode, 501, 20, 1, 0, Int(Date().timeIntervalSince1970), nameBytes.count, size
-        )
+        let header: String
+        if size > 0x1FFFFFFFF {
+            header = String(
+                format: "070764%016llx%08x%08x%08x%08x%016llx%016llx%08x%08x",
+                ino, mode, 501, 20, 1, Int64(Date().timeIntervalSince1970), size, nameBytes.count, 0
+            )
+        } else {
+            header = String(
+                format: "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o",
+                0, ino, mode, 501, 20, 1, 0, Int(Date().timeIntervalSince1970), nameBytes.count, size
+            )
+        }
         ino += 1
         var d = Data(header.utf8)
         d.append(contentsOf: nameBytes)
@@ -1138,7 +1146,7 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                 f.seek(0)
                 if len(prefix) >= 2 and prefix[:2] == b"\\x1f\\x8b":
                     stream = gzip.GzipFile(fileobj=f, mode="rb")
-                elif len(prefix) >= 6 and prefix[:6] in (b"070707", b"070701", b"070702"):
+                elif len(prefix) >= 6 and prefix[:6] in (b"070707", b"070701", b"070702", b"070764"):
                     stream = f
                 else:
                     stream = io.BufferedReader(DvzipReader(f), buffer_size=65536)
@@ -1163,6 +1171,13 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                         if (110 + ns) % 4 != 0:
                             stream.read(4 - ((110 + ns) % 4))
                         is_newc = True
+                    elif magic == b"070764":
+                        h = (magic + stream.read(96)).decode("ascii", "replace")
+                        mode = int(h[22:30], 16)
+                        fs = int(h[70:86], 16)
+                        ns = int(h[86:94], 16)
+                        name = stream.read(ns).rstrip(b"\\x00").decode("utf-8", "replace")
+                        is_newc = False
                     else:
                         break
                     if name == "TRAILER!!!":

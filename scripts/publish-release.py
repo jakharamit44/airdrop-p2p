@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -17,6 +18,40 @@ VERSION = VERSION_FILE.read_text(encoding="utf-8").strip()
 TAG = f"v{VERSION}"
 OWNER = "jakharamit44"
 REPO = "airdrop-p2p"
+
+def load_version_changelog(version: str) -> str:
+    changelog_path = REPO_ROOT / "CHANGELOG.md"
+    if not changelog_path.exists():
+        return ""
+    text = changelog_path.read_text(encoding="utf-8")
+    pattern = rf"##\s*\[?v?{re.escape(version)}\]?[^\n]*\n\n?(.*?)(?=(?:\n##\s*\[)|\Z)"
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+def generate_release_body(version: str) -> str:
+    notes = load_version_changelog(version)
+    if not notes:
+        try:
+            prev_tag = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0", "HEAD^"], text=True).strip()
+            log_out = subprocess.check_output(["git", "log", f"{prev_tag}..HEAD", "--oneline"], text=True).strip()
+            notes = "### Commits\n" + "\n".join(f"- {line}" for line in log_out.splitlines())
+        except Exception:
+            notes = f"Release v{version}"
+
+    body = f"""# AirDrop P2P v{version}
+
+Pure peer-to-peer AirDrop between macOS and all modern Android devices.
+
+{notes}
+
+### Release Assets
+- `AirDrop-P2P-v{version}.apk`: Universal Android application (API 29+).
+- `AirDrop-P2P-v{version}.dmg`: macOS standalone drag-and-drop application (macOS 13.0+ Ventura, Sonoma, Sequoia).
+- `SHA256SUMS.txt`: Cryptographic checksums.
+"""
+    return body
 
 print(f"[+] Publishing GitHub Release {TAG} for {OWNER}/{REPO}...")
 
@@ -41,6 +76,7 @@ headers = {
 get_req = urllib.request.Request(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/tags/{TAG}", headers=headers)
 release_id = None
 upload_url = None
+release_notes = generate_release_body(VERSION)
 
 try:
     with urllib.request.urlopen(get_req) as resp:
@@ -49,25 +85,25 @@ try:
         upload_url = rel_data.get("upload_url", "").partition("{")[0]
         html_url = rel_data.get("html_url")
         print(f"[+] Found existing release {TAG} (ID: {release_id}): {html_url}")
+        # Update release body with authentic CHANGELOG.md notes
+        patch_payload = json.dumps({
+            "name": f"AirDrop P2P v{VERSION}",
+            "body": release_notes,
+        }).encode("utf-8")
+        patch_req = urllib.request.Request(
+            f"https://api.github.com/repos/{OWNER}/{REPO}/releases/{release_id}",
+            data=patch_payload,
+            headers={**headers, "Content-Type": "application/json"},
+            method="PATCH"
+        )
+        try:
+            with urllib.request.urlopen(patch_req) as pr:
+                print(f"[+] Updated release {TAG} body with accurate notes from CHANGELOG.md")
+        except Exception as pe:
+            print(f"[-] Warning: Failed to update release body: {pe}")
 except urllib.error.HTTPError as e:
     if e.code == 404:
         # Create Release
-        release_notes = f"""# AirDrop P2P v{VERSION}
-
-Pure peer-to-peer AirDrop between macOS and all modern Android devices.
-
-### What's New in v{VERSION}
-- **Universal Android Support**: Dynamic manufacturer and model discovery across Samsung, Google Pixel, OnePlus, Xiaomi, and other modern Android devices.
-- **100% Pure P2P Engine**: High-speed transfers strictly negotiate direct 5GHz Wi-Fi Direct Autonomous Groups (WP2P) and Bluetooth LE L2CAP. Zero shared Wi-Fi router / LAN dependency.
-- **ARP Connection Keepalive**: Real-time bidirectional ARP refresh (2.0s ICMP & UDP keepalive pulses) preventing Linux kernel ARP table timeouts during multi-gigabyte transfers.
-- **Clean macOS Wi-Fi Restoration**: Automatic disassociation and preferred network pruning returning macOS Wi-Fi to Internet connectivity upon transfer completion.
-- **Claude AI Ingestion Engine**: Integrated multimodal Vision OCR, document, code, and PDF summarization generating companion `.claude.md` analysis directly into `~/Downloads`.
-
-### Release Assets
-- `AirDrop-P2P-v{VERSION}.apk`: Universal Android application (API 29+).
-- `AirDrop-P2P-v{VERSION}.dmg`: macOS standalone drag-and-drop application (macOS 13.0+ Ventura, Sonoma, Sequoia).
-- `SHA256SUMS.txt`: Cryptographic checksums.
-"""
         create_payload = json.dumps({
             "tag_name": TAG,
             "target_commitish": "main",
@@ -88,6 +124,8 @@ Pure peer-to-peer AirDrop between macOS and all modern Android devices.
             upload_url = rel_data.get("upload_url", "").partition("{")[0]
             html_url = rel_data.get("html_url")
             print(f"[+] Created release {TAG} (ID: {release_id}): {html_url}")
+    else:
+        sys.exit(f"[-] HTTP error getting release: {e}")
     else:
         sys.exit(f"[-] HTTP error getting release: {e}")
 

@@ -567,7 +567,7 @@ class StreamDecompressor:
             self.mode = "gzip"
             self.decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
             self.buf.extend(self.decompressor.decompress(prefix))
-        elif prefix[:6] in (b"070707", b"070701", b"070702"):
+        elif prefix[:6] in (b"070707", b"070701", b"070702", b"070764"):
             self.mode = "raw"
             self.buf.extend(prefix)
         else:
@@ -716,6 +716,16 @@ def extract_cpio_stream(stream, dest_dir: Path):
             if (110 + namesize) % 4 != 0:
                 stream.read_exact(4 - ((110 + namesize) % 4))
             is_newc = True
+        elif magic == b"070764":
+            rest = stream.read_exact(96)
+            if len(rest) < 96:
+                break
+            hdr = (magic + rest).decode("ascii")
+            mode = int(hdr[22:30], 16)
+            filesize = int(hdr[70:86], 16)
+            namesize = int(hdr[86:94], 16)
+            name = stream.read_exact(namesize).rstrip(b"\x00").decode("utf-8", "replace")
+            is_newc = False
         else:
             break
         if name == "TRAILER!!!":
@@ -1433,6 +1443,8 @@ try:
 
                 def make_odc_hdr(ino: int, mode: int, name: str, fsize: int) -> bytes:
                     nb = name.encode("utf-8") + b"\x00"
+                    if fsize > 0x1FFFFFFFF:
+                        return f"070764{ino:016x}{mode:08x}{0:08x}{0:08x}{1:08x}{int(time.time()):016x}{fsize:016x}{len(nb):08x}{0:08x}".encode("ascii") + nb
                     return f"070707{0:06o}{ino:06o}{mode:06o}{0:06o}{0:06o}{1:06o}{0:06o}{int(time.time()):011o}{len(nb):06o}{fsize:011o}".encode("ascii") + nb
 
                 send_dvzip_block(make_odc_hdr(1, 0o040755, ".", 0))
