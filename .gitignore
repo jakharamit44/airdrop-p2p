@@ -19,7 +19,10 @@
 claude_key.txt
 claude_config.json
 credentials*
-*token*
+*auth_token*
+*access_token*
+*.token
+tokens.json
 *id_rsa*
 
 # Local runtime state, temporary files & logs

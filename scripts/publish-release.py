@@ -48,7 +48,8 @@ Pure peer-to-peer AirDrop between macOS and all modern Android devices.
 
 ### Release Assets
 - `AirDrop-P2P-v{version}.apk`: Universal Android application (API 29+).
-- `AirDrop-P2P-v{version}.dmg`: macOS standalone drag-and-drop application (macOS 13.0+ Ventura, Sonoma, Sequoia).
+- `AirDrop-P2P-v{version}.pkg`: macOS Native Installer package (installs directly to /Applications and auto-unquarantines; eliminates Gatekeeper "damaged" alert).
+- `AirDrop-P2P-v{version}.dmg`: macOS drag-and-drop application with built-in Gatekeeper launcher.
 - `SHA256SUMS.txt`: Cryptographic checksums.
 """
     return body
@@ -139,6 +140,7 @@ with urllib.request.urlopen(list_assets_req) as resp:
 assets_to_upload = [
     (RELEASE_DIR / f"AirDrop-P2P-v{VERSION}.apk", "application/vnd.android.package-archive"),
     (RELEASE_DIR / f"AirDrop-P2P-v{VERSION}.dmg", "application/x-apple-diskimage"),
+    (RELEASE_DIR / f"AirDrop-P2P-v{VERSION}.pkg", "application/octet-stream"),
     (RELEASE_DIR / "SHA256SUMS.txt", "text/plain"),
 ]
 

@@ -9,7 +9,8 @@ All notable changes to AirDrop P2P are documented in this file.
 - **Mac Radio & Discovery Toggle**: When incoming transfers ("Discoverable Nearby") are switched off on Mac, CoreBluetooth advertising and scanning immediately stop and active peer records are cleared. Android devices reliably prune the Mac from discovery within 6 seconds.
 - **Eliminated Duplicate macOS Accept Prompts**: Suppressed redundant AppleScript `System Events` fallback dialogs while the native `AirDrop P2P.app` SwiftUI modal is active, ensuring only a single in-window prompt is shown.
 - **Single-Instance BLE Daemon & Persistent Permissions**: Prevented background bash scripts from spawning unbundled `airdrop-p2p-daemon` subprocesses when `AirDrop P2P.app` is already running. Eliminates duplicate Bluetooth authorization dialogs and preserves persistent permission under the signed app bundle.
-- **Repository Privacy & Git Hygiene**: Expanded `.gitignore` to block user downloads, media payloads, temporary `.part` archives, credentials, certificates, and local state locks from being committed to GitHub.
+- **Repository Privacy & Git Hygiene**: Expanded `.gitignore` to block user downloads, media payloads, temporary `.part` archives, credentials, certificates, and local state locks from being committed to GitHub. Scoped token patterns to auth token files to avoid colliding with design tokens.
+- **macOS Native PKG Installer**: Added automated `.pkg` package builder with a `postinstall` script that installs directly to `/Applications` and unquarantines the app bundle, eliminating Gatekeeper "damaged" alerts.
 
 ## [v2.1.1] - 2026-11-08
 

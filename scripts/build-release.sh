@@ -89,10 +89,33 @@ hdiutil create -volname "AirDrop P2P v${VERSION}" -srcfolder "$DMG_TMP" -ov -for
 rm -rf "$DMG_TMP"
 echo "  -> Created: $DMG_DEST ($(du -h "$DMG_DEST" | cut -f1))"
 
+# 3b. Create macOS Native PKG installer (auto-unquarantines during install)
+PKG_DEST="$RELEASE_DIR/AirDrop-P2P-v${VERSION}.pkg"
+if command -v pkgbuild >/dev/null 2>&1; then
+  echo "[+] Creating macOS PKG installer..."
+  PKG_SCRIPTS="$(mktemp -d /tmp/airdrop_pkg_scripts_XXXXXX)"
+  cat > "$PKG_SCRIPTS/postinstall" << 'EOF'
+#!/bin/bash
+xattr -cr "/Applications/AirDrop P2P.app" 2>/dev/null || true
+exit 0
+EOF
+  chmod +x "$PKG_SCRIPTS/postinstall"
+  pkgbuild --component "$ROOT_DIR/AirDrop P2P.app" \
+           --install-location "/Applications" \
+           --scripts "$PKG_SCRIPTS" \
+           "$PKG_DEST"
+  rm -rf "$PKG_SCRIPTS"
+  echo "  -> Created: $PKG_DEST ($(du -h "$PKG_DEST" | cut -f1))"
+fi
+
 # 4. Generate SHA256 Checksums
 echo "[4/4] Calculating SHA-256 Checksums..."
 cd "$RELEASE_DIR"
-shasum -a 256 "AirDrop-P2P-v${VERSION}.apk" "AirDrop-P2P-v${VERSION}.dmg" > "$RELEASE_DIR/SHA256SUMS.txt"
+FILES_TO_SUM=("AirDrop-P2P-v${VERSION}.apk" "AirDrop-P2P-v${VERSION}.dmg")
+if [ -f "$PKG_DEST" ]; then
+  FILES_TO_SUM+=("AirDrop-P2P-v${VERSION}.pkg")
+fi
+shasum -a 256 "${FILES_TO_SUM[@]}" > "$RELEASE_DIR/SHA256SUMS.txt"
 cat "$RELEASE_DIR/SHA256SUMS.txt"
 
 echo "====================================================="
