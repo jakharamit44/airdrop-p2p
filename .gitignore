@@ -4,16 +4,25 @@
 .Spotlight-V100
 .Trashes
 
-# Security & Secrets (NEVER COMMIT)
+# Security, Credentials & Secrets (NEVER COMMIT)
 *.pem
 *.key
 *.p12
 *.jks
 *.keystore
+*.cer
+*.crt
+*.pfx
+*.der
+.env
+.env.*
 claude_key.txt
 claude_config.json
+credentials*
+*token*
+*id_rsa*
 
-# Local runtime state & logs
+# Local runtime state, temporary files & logs
 .mac-airdrop-v2/
 .airdrop-p2p/
 .gravitas/
@@ -21,10 +30,32 @@ claude_config.json
 *.log
 *.lock
 *.flag
+*.part
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
 last_peer_ip
 active_peers.json
 transfer_progress.json
 pending_ask.json
+ask_decision.json
+
+# User media and downloaded test payloads (NEVER COMMIT)
+*.zip
+*.tar*
+*.7z
+*.rar
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.iso
+*.img
+downloads/
+Downloads/
+test_output/
 
 # Android build artifacts
 .gradle/
@@ -37,7 +68,7 @@ android/.idea/
 android/*.iml
 android/app/*.iml
 
-# macOS binaries & packages
+# macOS binaries, app bundles & releases
 AirDrop P2P.app/
 *.app/
 *.dmg
@@ -46,11 +77,13 @@ release/
 macos/*.o
 macos/*.dSYM
 
-# Python cache
+# Python cache & virtual environments
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
 .venv/
 env/
+.idea/
+.vscode/
 

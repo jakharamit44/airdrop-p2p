@@ -16,7 +16,13 @@ AWDL_MDNS_PID_FILE="$STATE_DIR/awdl-mdns.pid"
 BLE_PID_FILE="$STATE_DIR/ble-daemon.pid"
 LOG_FILE="$STATE_DIR/daemon.log"
 BLE_LOG_FILE="$STATE_DIR/ble-daemon.log"
-BLE_BIN="$STATE_DIR/airdrop-p2p-daemon"
+if [[ -x "/Applications/AirDrop P2P.app/Contents/MacOS/AirDropP2P" ]]; then
+  BLE_BIN="/Applications/AirDrop P2P.app/Contents/MacOS/AirDropP2P"
+elif [[ -x "$SCRIPT_DIR/AirDrop P2P.app/Contents/MacOS/AirDropP2P" ]]; then
+  BLE_BIN="$SCRIPT_DIR/AirDrop P2P.app/Contents/MacOS/AirDropP2P"
+else
+  BLE_BIN="$STATE_DIR/airdrop-p2p-daemon"
+fi
 PORT=8772
 PROXY_PORT=8773
 MAC_SERVICE_ID="airdrop77a8b9c0"
@@ -108,8 +114,8 @@ start_daemons() {
   # Pure P2P Mode: Do NOT advertise on shared LAN router mDNS (_airdrop._tcp.local. without interface restriction).
   # Discovery is strictly over Direct Bluetooth LE L2CAP + 5GHz Wi-Fi Direct P2P (and local awdl0 for Finder integration).
 
-  # Start Direct Bluetooth LE L2CAP receiver + AWDL 8774->8773 PeerToPeer bridge + Menu Bar item
-  if [[ "${SKIP_BLE_RESTART:-0}" != "1" ]]; then
+  # Start Direct Bluetooth LE L2CAP receiver only if AirDrop P2P app is not already running
+  if [[ "${SKIP_BLE_RESTART:-0}" != "1" ]] && ! pgrep -f "AirDrop P2P.app" >/dev/null 2>&1 && ! pgrep -x "AirDropP2P" >/dev/null 2>&1; then
     if [[ ! -f "$BLE_PID_FILE" ]] || ! kill -0 "$(cat "$BLE_PID_FILE")" 2>/dev/null; then
       if [[ -x "$BLE_BIN" ]]; then
         nohup "$BLE_BIN" daemon >"$BLE_LOG_FILE" 2>&1 < /dev/null &
@@ -267,9 +273,17 @@ def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int) -
 
         summary = f"{len(file_names)} file(s)" if len(file_names) > 1 else (file_names[0] if file_names else "items")
         def prompt_dialog():
-            time.sleep(1.0)
+            time.sleep(0.5)
             if dec_file.exists():
                 return
+            # If AirDrop P2P GUI is running, it renders the modal inside the window.
+            # Do NOT prompt with osascript to prevent double accept prompts.
+            try:
+                out = subprocess.check_output(["pgrep", "-f", "AirDrop P2P"], text=True)
+                if out.strip():
+                    return
+            except Exception:
+                pass
             try:
                 res = subprocess.check_output([
                     "osascript",

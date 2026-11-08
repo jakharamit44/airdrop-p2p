@@ -2,6 +2,15 @@
 
 All notable changes to AirDrop P2P are documented in this file.
 
+## [v2.1.2] - 2026-11-08
+
+### Fixed
+- **Android Background Lifecycle**: `AirDropService` now stops when the user exits or dismisses the app from Recent Tasks (unless an active file transfer is in progress). Foreground service changed from `START_STICKY` to `START_NOT_STICKY` and added an explicit "Stop" action button in the notification.
+- **Mac Radio & Discovery Toggle**: When incoming transfers ("Discoverable Nearby") are switched off on Mac, CoreBluetooth advertising and scanning immediately stop and active peer records are cleared. Android devices reliably prune the Mac from discovery within 6 seconds.
+- **Eliminated Duplicate macOS Accept Prompts**: Suppressed redundant AppleScript `System Events` fallback dialogs while the native `AirDrop P2P.app` SwiftUI modal is active, ensuring only a single in-window prompt is shown.
+- **Single-Instance BLE Daemon & Persistent Permissions**: Prevented background bash scripts from spawning unbundled `airdrop-p2p-daemon` subprocesses when `AirDrop P2P.app` is already running. Eliminates duplicate Bluetooth authorization dialogs and preserves persistent permission under the signed app bundle.
+- **Repository Privacy & Git Hygiene**: Expanded `.gitignore` to block user downloads, media payloads, temporary `.part` archives, credentials, certificates, and local state locks from being committed to GitHub.
+
 ## [v2.1.1] - 2026-11-08
 
 ### Fixed

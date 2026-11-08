@@ -16,6 +16,7 @@ import androidx.core.app.NotificationCompat
 class AirDropService : Service() {
 
     companion object {
+        const val ACTION_STOP = "com.airdrop.p2p.ACTION_STOP"
         private const val CHANNEL_STATUS = "airdrop_status"
         private const val CHANNEL_RX = "airdrop_rx"
         private const val NOTIF_ID_STATUS = 1001
@@ -59,11 +60,19 @@ class AirDropService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val stopIntent = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, AirDropService::class.java).apply { action = ACTION_STOP },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         val statusNotif = NotificationCompat.Builder(this, CHANNEL_STATUS)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle("AirDrop P2P Active")
             .setContentText("Encrypted BLE L2CAP + 5GHz Wi-Fi Direct P2P")
             .setContentIntent(openAppIntent)
+            .addAction(0, "Stop", stopIntent)
             .setOngoing(true)
             .build()
 
@@ -149,13 +158,22 @@ class AirDropService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            instance?.stop()
+            stopSelf()
+            return START_NOT_STICKY
+        }
         getNode(applicationContext).start()
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Keep foreground service alive when task is dismissed so background transfers and AirDrop discovery persist.
         super.onTaskRemoved(rootIntent)
+        // If no active file transfer is running, cleanly exit service when app is dismissed from recents
+        if (instance?.isTransferInProgress != true) {
+            instance?.stop()
+            stopSelf()
+        }
     }
 
     override fun onDestroy() {

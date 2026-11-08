@@ -288,6 +288,11 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (isFinishing && ::node.isInitialized && !node.isTransferInProgress) {
+            runCatching {
+                stopService(Intent(this, AirDropService::class.java))
+            }
+        }
         super.onDestroy()
     }
 

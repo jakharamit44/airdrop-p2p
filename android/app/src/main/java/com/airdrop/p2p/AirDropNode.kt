@@ -151,7 +151,7 @@ class AirDropNode(private val context: Context) {
 
     companion object {
         const val AIRDROP_PORT = 8771
-        const val PEER_TTL_MS = 12_000L
+        const val PEER_TTL_MS = 6_000L
         private const val KEYSTORE_ALIAS = "airdrop_p2p_ec_v2"
         val MAC_BLE_SERVICE_UUID: UUID = UUID.fromString("52300001-a12d-4000-8000-523a12d00001")
         val MAC_BLE_PSM_CHAR_UUID: UUID = UUID.fromString("52300002-a12d-4000-8000-523a12d00002")

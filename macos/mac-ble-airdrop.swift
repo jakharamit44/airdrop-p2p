@@ -1289,7 +1289,44 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         }
     }
 
+    func stopAdvertisingAndScanning() {
+        if pm?.state == .poweredOn && pm?.isAdvertising == true {
+            pm?.stopAdvertising()
+            print("[BLE-Daemon] Stopped BLE advertising (Incoming radio turned off)")
+        }
+        if cm?.state == .poweredOn {
+            cm?.stopScan()
+            print("[BLE-Daemon] Stopped BLE scanning (Incoming radio turned off)")
+        }
+        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("active_peers.json"))
+        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("p2p_status"))
+    }
+
+    func startAdvertisingAndScanning() {
+        let settings = loadMacSettings()
+        guard settings.visible else { return }
+        if cm?.state == .poweredOn {
+            cm?.stopScan()
+            cm?.scanForPeripherals(
+                withServices: nil,
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+            )
+        }
+        if pm?.state == .poweredOn && publishedPsm > 0 && pm?.isAdvertising == false {
+            let psmUuid = CBUUID(string: String(format: "%04X", 0xAD00 | (Int(publishedPsm) & 0xFF)))
+            pm?.startAdvertising([
+                CBAdvertisementDataServiceUUIDsKey: [MAC_SERVICE_UUID, psmUuid]
+            ])
+            print("[BLE-Daemon] Started BLE advertising on PSM \(publishedPsm)")
+        }
+    }
+
     func rescanNow() {
+        let settings = loadMacSettings()
+        guard settings.visible else {
+            stopAdvertisingAndScanning()
+            return
+        }
         isPingingPeer = false
         lastPingTime = 0
         if cm.state == .poweredOn {
@@ -1309,6 +1346,8 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        let settings = loadMacSettings()
+        guard settings.visible else { return }
         if central.state == .poweredOn {
             central.scanForPeripherals(
                 withServices: nil,
@@ -1619,11 +1658,16 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         peripheral.add(svc)
 
         let psmUuid = CBUUID(string: String(format: "%04X", 0xAD00 | (Int(PSM) & 0xFF)))
-        // Keep primary advertisement <= 25 bytes (3B Flags + 18B MAC_SERVICE_UUID + 4B psmUuid)
-        // so macOS CoreBluetooth never pushes MAC_SERVICE_UUID into the proprietary Apple Overflow Area.
-        peripheral.startAdvertising([
-            CBAdvertisementDataServiceUUIDsKey: [MAC_SERVICE_UUID, psmUuid]
-        ])
+        let settings = loadMacSettings()
+        if settings.visible {
+            // Keep primary advertisement <= 25 bytes (3B Flags + 18B MAC_SERVICE_UUID + 4B psmUuid)
+            // so macOS CoreBluetooth never pushes MAC_SERVICE_UUID into the proprietary Apple Overflow Area.
+            peripheral.startAdvertising([
+                CBAdvertisementDataServiceUUIDsKey: [MAC_SERVICE_UUID, psmUuid]
+            ])
+        } else {
+            print("[BLE-Daemon] Published PSM \(PSM), but radio visibility is OFF.")
+        }
     }
 
     func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
@@ -1986,6 +2030,8 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                             self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
                             let txProc = Process()
                             txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                            txProc.environment = ProcessInfo.processInfo.environment
+                            txProc.environment?["SKIP_BLE_RESTART"] = "1"
                             txProc.arguments = ["send", "--peer", "\(host):\(port)"] + self.files.map { $0.path } + self.urls
                             try? txProc.run()
                             txProc.waitUntilExit()
@@ -2564,6 +2610,8 @@ final class MacAirDropViewModel: ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                p.environment = ProcessInfo.processInfo.environment
+                p.environment?["SKIP_BLE_RESTART"] = "1"
                 p.arguments = ["restart-receiver"]
                 try? p.run()
                 p.waitUntilExit()
@@ -2589,12 +2637,17 @@ final class MacAirDropViewModel: ObservableObject {
         transferStatus = turnOn ? "Starting P2P radio…" : "Pausing P2P radio…"
         saveMacSettings(autoAccept: autoAccept, visible: turnOn, deviceName: macDeviceName, themeMode: themeMode)
         if turnOn {
+            BleAirDropDaemon.shared?.startAdvertisingAndScanning()
             BleAirDropDaemon.shared?.rescanNow()
+        } else {
+            BleAirDropDaemon.shared?.stopAdvertisingAndScanning()
         }
         DispatchQueue.global(qos: .userInitiated).async {
             if turnOn {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                p.environment = ProcessInfo.processInfo.environment
+                p.environment?["SKIP_BLE_RESTART"] = "1"
                 p.arguments = ["restart-receiver"]
                 try? p.run()
                 p.waitUntilExit()
@@ -2847,6 +2900,8 @@ final class MacAirDropViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+            p.environment = ProcessInfo.processInfo.environment
+            p.environment?["SKIP_BLE_RESTART"] = "1"
             p.arguments = ["send"] + args
             let pipe = Pipe()
             p.standardOutput = pipe
@@ -4856,6 +4911,8 @@ if args.count >= 2 && args[1] == "restore-wifi" {
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                p.environment = ProcessInfo.processInfo.environment
+                p.environment?["SKIP_BLE_RESTART"] = "1"
                 p.arguments = ["restart-receiver"]
                 try? p.run()
                 p.waitUntilExit()
