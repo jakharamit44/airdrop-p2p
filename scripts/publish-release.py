@@ -126,8 +126,6 @@ except urllib.error.HTTPError as e:
             print(f"[+] Created release {TAG} (ID: {release_id}): {html_url}")
     else:
         sys.exit(f"[-] HTTP error getting release: {e}")
-    else:
-        sys.exit(f"[-] HTTP error getting release: {e}")
 
 # 3. List existing assets to avoid duplicate upload error
 list_assets_req = urllib.request.Request(f"https://api.github.com/repos/{OWNER}/{REPO}/releases/{release_id}/assets", headers=headers)
