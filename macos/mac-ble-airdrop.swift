@@ -2462,13 +2462,6 @@ func middleTruncateMacName(_ raw: String, maxChars: Int = 36) -> String {
     return "\(raw.prefix(headCount))…\(raw.suffix(tailCount))"
 }
 
-func currentMacGreeting() -> String {
-    let hour = Calendar.current.component(.hour, from: Date())
-    if hour >= 5 && hour < 12 { return "Good Morning" }
-    if hour >= 12 && hour < 17 { return "Good Afternoon" }
-    return "Good Evening"
-}
-
 func inferMacCategory(pathOrUrl: String, isUrl: Bool) -> String {
     if isUrl { return "LINK" }
     let ext = URL(fileURLWithPath: pathOrUrl).pathExtension.lowercased()
@@ -2565,7 +2558,185 @@ struct MacScaleButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1.0)
             .opacity(configuration.isPressed ? 0.92 : 1.0)
-            .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.78), value: configuration.isPressed)
+            .animation(reduceMotion ? nil : .spring(response: 0.20, dampingFraction: 0.80), value: configuration.isPressed)
+    }
+}
+
+final class MacConnectingBridgeAnim: ObservableObject {
+    @Published var phase: CGFloat = 0
+}
+
+struct MacConnectingBridgeLine: View {
+    let color: Color
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var anim = MacConnectingBridgeAnim()
+
+    var body: some View {
+        Path { path in
+            path.move(to: CGPoint(x: 8, y: 26))
+            path.addQuadCurve(to: CGPoint(x: 172, y: 26), control: CGPoint(x: 90, y: -4))
+        }
+        .stroke(
+            color.opacity(0.55),
+            style: StrokeStyle(lineWidth: 1.8, lineCap: .round, dash: [5, 5], dashPhase: anim.phase)
+        )
+        .frame(width: 180, height: 34)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.linear(duration: 1.1).repeatForever(autoreverses: false)) {
+                anim.phase = -20
+            }
+        }
+    }
+}
+
+final class MacIndeterminateBarAnim: ObservableObject {
+    @Published var pulse: Bool = false
+}
+
+struct MacIndeterminateConnectingBar: View {
+    let color: Color
+    let width: CGFloat
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var anim = MacIndeterminateBarAnim()
+
+    var body: some View {
+        Capsule()
+            .fill(color.opacity(0.75))
+            .frame(width: max(48, width * 0.28), height: 7)
+            .offset(x: anim.pulse ? width * 0.68 : 4)
+            .onAppear {
+                guard !reduceMotion else { return }
+                withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                    anim.pulse = true
+                }
+            }
+    }
+}
+
+final class MacRadarAnimationModel: ObservableObject {
+    @Published var sweepAngle: Double = 0
+    @Published var pulseScale: CGFloat = 0.5
+    @Published var pulseOpacity: Double = 0.8
+}
+
+struct MacRadarScannerView: View {
+    let peers: [MacDiscoveredPeer]
+    let palette: MacThemePalette
+    let onSelectPeer: (MacDiscoveredPeer) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var anim = MacRadarAnimationModel()
+
+    private func peerIcon(for peer: MacDiscoveredPeer) -> String {
+        let lower = peer.name.lowercased()
+        if lower.contains("mac") || lower.contains("book") || lower.contains("desktop") || lower.contains("laptop") {
+            return "laptopcomputer"
+        } else if lower.contains("pad") || lower.contains("tablet") {
+            return "ipad.gen2"
+        }
+        return peer.transport.lowercased().contains("ble") ? "iphone.gen3" : "laptopcomputer"
+    }
+
+    var body: some View {
+        ZStack {
+            // Ambient radar container circle
+            Circle()
+                .fill(palette.isDark ? Color(red: 0.05, green: 0.07, blue: 0.12).opacity(0.7) : Color(red: 0.94, green: 0.96, blue: 0.99))
+                .frame(width: 240, height: 240)
+                .overlay(Circle().stroke(palette.indigo.opacity(palette.isDark ? 0.20 : 0.14), lineWidth: 1))
+
+            // Concentric Guide Rings
+            Circle()
+                .stroke(palette.indigo.opacity(palette.isDark ? 0.22 : 0.15), lineWidth: 1)
+                .frame(width: 216, height: 216)
+            Circle()
+                .stroke(palette.indigo.opacity(palette.isDark ? 0.28 : 0.20), lineWidth: 1)
+                .frame(width: 154, height: 154)
+            Circle()
+                .stroke(palette.indigo.opacity(palette.isDark ? 0.35 : 0.25), lineWidth: 1)
+                .frame(width: 92, height: 92)
+
+            // Smooth Sweeping Radar Cone
+            if !reduceMotion {
+                Circle()
+                    .fill(
+                        AngularGradient(
+                            gradient: Gradient(colors: [
+                                palette.indigo.opacity(0.0),
+                                palette.indigo.opacity(0.02),
+                                palette.indigo.opacity(palette.isDark ? 0.24 : 0.16)
+                            ]),
+                            center: .center,
+                            startAngle: .degrees(0),
+                            endAngle: .degrees(360)
+                        )
+                    )
+                    .frame(width: 216, height: 216)
+                    .rotationEffect(.degrees(anim.sweepAngle))
+            }
+
+            // Expanding Pulse Wave
+            if !reduceMotion {
+                Circle()
+                    .stroke(palette.indigo.opacity(anim.pulseOpacity * 0.45), lineWidth: 1.5)
+                    .frame(width: 216 * anim.pulseScale, height: 216 * anim.pulseScale)
+            }
+
+            // Central Pulse Transmitter Node
+            ZStack {
+                Circle()
+                    .fill(palette.indigo.opacity(palette.isDark ? 0.22 : 0.15))
+                    .frame(width: 54, height: 54)
+                Circle()
+                    .fill(LinearGradient(colors: [palette.indigo, palette.indigoHover], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 42, height: 42)
+                    .shadow(color: palette.indigo.opacity(0.45), radius: 8, x: 0, y: 2)
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundColor(.white)
+            }
+
+            // Discovered Peers positioned on the orbital ring
+            ForEach(Array(peers.prefix(3).enumerated()), id: \.element.id) { idx, peer in
+                let angle = (-36.0 + Double(idx) * 118.0) * .pi / 180.0
+                let r: CGFloat = 92.0
+                Button(action: { onSelectPeer(peer) }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: peerIcon(for: peer))
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(palette.indigo)
+                        Text(middleTruncateMacName(peer.name, maxChars: 15))
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(palette.textPrimary)
+                        Circle()
+                            .fill(palette.emerald)
+                            .frame(width: 6, height: 6)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule()
+                            .fill(palette.bgSurface)
+                            .overlay(Capsule().stroke(palette.emerald.opacity(0.65), lineWidth: 1.2))
+                            .shadow(color: Color.black.opacity(palette.isDark ? 0.35 : 0.08), radius: 6, x: 0, y: 2)
+                    )
+                }
+                .buttonStyle(MacScaleButtonStyle())
+                .offset(x: CGFloat(cos(angle)) * r, y: CGFloat(sin(angle)) * r * 0.72)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 236)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.linear(duration: 4.0).repeatForever(autoreverses: false)) {
+                anim.sweepAngle = 360
+            }
+            withAnimation(.easeOut(duration: 2.2).repeatForever(autoreverses: false)) {
+                anim.pulseScale = 1.0
+                anim.pulseOpacity = 0.0
+            }
+        }
     }
 }
 
@@ -2661,13 +2832,46 @@ final class MacAirDropViewModel: ObservableObject {
     @Published var urlInput: String = ""
     @Published var isDropTargeted: Bool = false
     @Published var showLogs: Bool = false
-    @Published var pulse: Bool = false
-    @Published var bridgePhaseTick: Bool = false
+    @Published var aiSubsystemEnabled: Bool = false
     @Published var historyEntries: [MacHistoryEntry] = []
     @Published var logs: [String] = []
     @Published var bluetoothAuthorized: Bool = true
     @Published var bluetoothPoweredOn: Bool = true
     @Published var wifiPoweredOn: Bool = true
+
+    func refreshAiStatus() {
+        let envVal = ProcessInfo.processInfo.environment["CLAUDE_AI_ENABLED"]?.lowercased()
+        if envVal == "1" || envVal == "true" || envVal == "yes" || envVal == "on" {
+            aiSubsystemEnabled = true
+            return
+        }
+        let cfgPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".airdrop-p2p")
+            .appendingPathComponent("claude_config.json")
+        if let data = try? Data(contentsOf: cfgPath),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let enabled = obj["enabled"] as? Bool {
+            aiSubsystemEnabled = enabled
+        } else {
+            aiSubsystemEnabled = false
+        }
+    }
+
+    func toggleAiSubsystem(_ enabled: Bool) {
+        aiSubsystemEnabled = enabled
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let cfgPath = dir.appendingPathComponent("claude_config.json")
+        var dict: [String: Any] = [:]
+        if let data = try? Data(contentsOf: cfgPath),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            dict = obj
+        }
+        dict["enabled"] = enabled
+        if let out = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
+            try? out.write(to: cfgPath)
+        }
+    }
 
     var onThemeChanged: ((MacThemePalette) -> Void)?
     var onRequestFrontWindow: (() -> Void)?
@@ -2699,6 +2903,7 @@ final class MacAirDropViewModel: ObservableObject {
         self.editingDeviceName = s.deviceName
         self.themeMode = s.themeMode
         self.systemIsDark = Self.detectSystemDark()
+        self.refreshAiStatus()
         refreshSlow()
         refreshFast()
         fastTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
@@ -3251,19 +3456,19 @@ struct MacAirDropMainView: View {
 
             VStack(spacing: 0) {
                 topHeaderBar
-                    .padding(.horizontal, 18)
-                    .padding(.top, 14)
-                    .padding(.bottom, 10)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 36)
+                    .padding(.bottom, 12)
 
                 if !vm.bluetoothAuthorized || !vm.bluetoothPoweredOn || !vm.wifiPoweredOn {
                     systemReadinessBanner
-                        .padding(.horizontal, 18)
+                        .padding(.horizontal, 20)
                         .padding(.bottom, 10)
                 }
 
                 if let prog = vm.liveProgress {
                     liveConnectionBridgeCard(prog)
-                        .padding(.horizontal, 18)
+                        .padding(.horizontal, 20)
                         .padding(.bottom, 10)
                 } else if vm.isTransferring {
                     liveConnectionBridgeCard(MacLiveProgress(
@@ -3279,7 +3484,7 @@ struct MacAirDropMainView: View {
                         peerName: vm.activePeers.first?.name ?? "Nearby Device",
                         isConnecting: true
                     ))
-                    .padding(.horizontal, 18)
+                    .padding(.horizontal, 20)
                     .padding(.bottom, 10)
                 }
 
@@ -3296,7 +3501,7 @@ struct MacAirDropMainView: View {
                             settingsTabContent
                         }
                     }
-                    .padding(.horizontal, 18)
+                    .padding(.horizontal, 20)
                     .padding(.vertical, 8)
                 }
 
@@ -3306,39 +3511,45 @@ struct MacAirDropMainView: View {
             if let ask = vm.pendingAsk {
                 Color.black.opacity(p.isDark ? 0.65 : 0.35)
                     .ignoresSafeArea()
+                    .transition(.opacity)
                 incomingAskModal(ask)
                     .padding(28)
+                    .transition(.asymmetric(
+                        insertion: .scale(scale: 0.95).combined(with: .opacity),
+                        removal: .scale(scale: 0.97).combined(with: .opacity)
+                    ))
             }
         }
+        .animation(.spring(response: 0.28, dampingFraction: 0.82), value: vm.pendingAsk != nil)
         .frame(minWidth: 550, idealWidth: 570, minHeight: 680, idealHeight: 720)
         .preferredColorScheme(p.isDark ? .dark : .light)
     }
 
     // ========================================================================
-    // Top Header Bar (Greeting + Radio Status + Day/Dark Toggle + Scan)
+    // Top Header Bar (AirDrop Title + Radio Status + Day/Dark Toggle + Scan)
     // ========================================================================
     private var topHeaderBar: some View {
         HStack(spacing: 12) {
             ZStack {
                 Circle()
                     .fill(p.indigoSubtle)
-                    .frame(width: 42, height: 42)
-                    .overlay(Circle().stroke(p.indigo.opacity(0.28), lineWidth: 1))
+                    .frame(width: 40, height: 40)
+                    .overlay(Circle().stroke(p.indigo.opacity(0.30), lineWidth: 1))
                 Image(systemName: "dot.radiowaves.left.and.right")
-                    .font(.system(size: 18, weight: .bold))
+                    .font(.system(size: 17, weight: .bold))
                     .foregroundColor(p.indigo)
             }
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 7) {
-                    Text(currentMacGreeting())
-                        .font(.system(size: 18, weight: .bold))
+                    Text("AirDrop")
+                        .font(.system(size: 19, weight: .bold, design: .rounded))
                         .foregroundColor(p.textPrimary)
                     HStack(spacing: 4) {
                         Circle()
                             .fill(vm.receiverRunning ? p.emerald : p.amber)
                             .frame(width: 6, height: 6)
-                        Text(vm.receiverRunning ? "Ready" : "Paused")
+                        Text(vm.receiverRunning ? "Discoverable" : "Paused")
                             .font(.system(size: 10, weight: .bold))
                             .foregroundColor(vm.receiverRunning ? p.emerald : p.amber)
                     }
@@ -3349,8 +3560,8 @@ struct MacAirDropMainView: View {
                             .fill(vm.receiverRunning ? p.emeraldSubtle : p.amberSubtle)
                     )
                 }
-                Text("\(vm.macDeviceName) • Send & receive files directly")
-                    .font(.system(size: 11))
+                Text("Discoverable as \"\(vm.macDeviceName)\" • ~/Downloads")
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundColor(p.textSecondary)
                     .lineLimit(1)
             }
@@ -3521,20 +3732,7 @@ struct MacAirDropMainView: View {
                 .frame(width: 110)
 
                 ZStack {
-                    Path { path in
-                        path.move(to: CGPoint(x: 8, y: 26))
-                        path.addQuadCurve(to: CGPoint(x: 172, y: 26), control: CGPoint(x: 90, y: -4))
-                    }
-                    .stroke(
-                        p.indigo.opacity(0.55),
-                        style: StrokeStyle(
-                            lineWidth: 1.8,
-                            lineCap: .round,
-                            dash: [5, 5],
-                            dashPhase: vm.bridgePhaseTick ? -20 : 0
-                        )
-                    )
-                    .frame(width: 180, height: 34)
+                    MacConnectingBridgeLine(color: p.indigo)
 
                     ZStack {
                         RoundedRectangle(cornerRadius: 10)
@@ -3565,12 +3763,6 @@ struct MacAirDropMainView: View {
                 }
                 .frame(width: 110)
             }
-            .onAppear {
-                guard !reduceMotion else { return }
-                withAnimation(.linear(duration: 1.1).repeatForever(autoreverses: false)) {
-                    vm.bridgePhaseTick = true
-                }
-            }
 
             // Live step-by-step phase text (eliminates blind connecting gap)
             Text(prog.phase)
@@ -3596,10 +3788,7 @@ struct MacAirDropMainView: View {
                         .fill(p.bgSubtle)
                         .frame(height: 7)
                     if prog.isConnecting {
-                        Capsule()
-                            .fill(p.indigo.opacity(0.75))
-                            .frame(width: max(48, geo.size.width * 0.28), height: 7)
-                            .offset(x: vm.pulse ? geo.size.width * 0.68 : 4)
+                        MacIndeterminateConnectingBar(color: p.indigo, width: geo.size.width)
                     } else {
                         Capsule()
                             .fill(isSending ? p.indigo : p.emerald)
@@ -4116,19 +4305,19 @@ struct MacAirDropMainView: View {
     }
 
     // ========================================================================
-    // TAB 1: Receive (Concentric Pulse Radar + Available Devices + Recent RX)
+    // TAB 1: Receive (Apple Radar Scanner + Discovered Peers + Recent RX)
     // ========================================================================
     private var receiveRadarTabContent: some View {
         VStack(alignment: .leading, spacing: 14) {
-            // Radar Card (Mockup 1 Right)
-            VStack(alignment: .leading, spacing: 12) {
+            // Radar Card
+            VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(vm.activePeers.isEmpty ? "Looking for" : "Nearby")
-                            .font(.system(size: 12, weight: .medium))
+                        Text(vm.activePeers.isEmpty ? "Looking for Connections" : "Nearby Devices")
+                            .font(.system(size: 12, weight: .semibold))
                             .foregroundColor(p.textSecondary)
-                        Text(vm.activePeers.isEmpty ? "Connections…" : "\(vm.activePeers.count) Device\(vm.activePeers.count == 1 ? "" : "s") Ready")
-                            .font(.system(size: 20, weight: .heavy))
+                        Text(vm.activePeers.isEmpty ? "Radar Scanning…" : "\(vm.activePeers.count) Device\(vm.activePeers.count == 1 ? "" : "s") Ready")
+                            .font(.system(size: 20, weight: .bold, design: .rounded))
                             .foregroundColor(p.textPrimary)
                     }
                     Spacer()
@@ -4151,65 +4340,14 @@ struct MacAirDropMainView: View {
                     .buttonStyle(MacScaleButtonStyle())
                 }
 
-                // Concentric Radar
-                ZStack {
-                    Circle()
-                        .fill(p.indigo.opacity(p.isDark ? 0.10 : 0.08))
-                        .frame(width: 214, height: 214)
-                        .scaleEffect(vm.pulse && !reduceMotion ? 1.04 : 0.96)
-                    Circle()
-                        .fill(p.indigo.opacity(p.isDark ? 0.18 : 0.15))
-                        .frame(width: 154, height: 154)
-                        .scaleEffect(vm.pulse && !reduceMotion ? 1.02 : 0.98)
-                    Circle()
-                        .fill(p.indigo.opacity(p.isDark ? 0.34 : 0.30))
-                        .frame(width: 98, height: 98)
-
-                    ZStack {
-                        Circle()
-                            .fill(Color.white)
-                            .frame(width: 54, height: 54)
-                            .shadow(color: p.indigo.opacity(0.35), radius: 10)
-                        Image(systemName: "dot.radiowaves.left.and.right")
-                            .font(.system(size: 22, weight: .bold))
-                            .foregroundColor(p.indigo)
+                // Apple Radar Visual
+                MacRadarScannerView(
+                    peers: vm.activePeers,
+                    palette: p,
+                    onSelectPeer: { peer in
+                        vm.chooseFilesForCategory(title: "Files for \(peer.name)", types: [])
                     }
-
-                    ForEach(Array(vm.activePeers.prefix(3).enumerated()), id: \.element.id) { idx, peer in
-                        let angle = (-38.0 + Double(idx) * 115.0) * .pi / 180.0
-                        let r: CGFloat = 96.0
-                        Button(action: {
-                            vm.chooseFilesForCategory(title: "Files for \(peer.name)", types: [])
-                        }) {
-                            HStack(spacing: 5) {
-                                Circle()
-                                    .fill(p.emerald)
-                                    .frame(width: 7, height: 7)
-                                Text(middleTruncateMacName(peer.name, maxChars: 16))
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundColor(p.textPrimary)
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(
-                                Capsule()
-                                    .fill(p.bgSurface)
-                                    .overlay(Capsule().stroke(p.emerald.opacity(0.6), lineWidth: 1.2))
-                                    .shadow(color: Color.black.opacity(0.12), radius: 5)
-                            )
-                        }
-                        .buttonStyle(MacScaleButtonStyle())
-                        .offset(x: CGFloat(cos(angle)) * r, y: CGFloat(sin(angle)) * r * 0.72)
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .frame(height: 224)
-                .onAppear {
-                    guard !reduceMotion else { return }
-                    withAnimation(.easeInOut(duration: 2.0).repeatForever(autoreverses: true)) {
-                        vm.pulse = true
-                    }
-                }
+                )
 
                 Text("Visible as \"\(vm.macDeviceName)\" • Incoming files save to ~/Downloads")
                     .font(.system(size: 11, weight: .medium))
@@ -4284,12 +4422,21 @@ struct MacAirDropMainView: View {
             if peer.rssi >= -80 { return 2 }
             return 1
         }()
+        let iconName: String = {
+            let lower = peer.name.lowercased()
+            if lower.contains("mac") || lower.contains("book") || lower.contains("desktop") || lower.contains("laptop") {
+                return "laptopcomputer"
+            } else if lower.contains("pad") || lower.contains("tablet") {
+                return "ipad.gen2"
+            }
+            return peer.transport.lowercased().contains("ble") ? "iphone.gen3" : "laptopcomputer"
+        }()
         return HStack(spacing: 12) {
             ZStack {
                 Circle()
                     .fill(p.indigoSubtle)
                     .frame(width: 44, height: 44)
-                Image(systemName: "iphone.gen3")
+                Image(systemName: iconName)
                     .font(.system(size: 20, weight: .semibold))
                     .foregroundColor(p.indigo)
             }
@@ -4583,7 +4730,68 @@ struct MacAirDropMainView: View {
                     .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.border, lineWidth: 1))
             )
 
-            // 3. Device Name & Downloads
+            // 3. AI Intelligence Subsystem
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    ZStack {
+                        Circle()
+                            .fill(p.indigoSubtle)
+                            .frame(width: 32, height: 32)
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(p.indigo)
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("AI Ingestion & Analysis")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(p.textPrimary)
+                        Text("Multimodal summaries, Vision OCR, and code analysis for received files.")
+                            .font(.system(size: 11))
+                            .foregroundColor(p.textSecondary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { vm.aiSubsystemEnabled },
+                        set: { vm.toggleAiSubsystem($0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                }
+
+                HStack(spacing: 8) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.shield.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(p.emerald)
+                        Text("Privacy Guard: Active")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(p.emerald)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(p.emeraldSubtle))
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "cpu")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(p.indigo)
+                        Text("Local Vision Engine: Ready")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(p.indigo)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(p.indigoSubtle))
+                }
+            }
+            .padding(16)
+            .background(
+                RoundedRectangle(cornerRadius: 20)
+                    .fill(p.bgSurface)
+                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.border, lineWidth: 1))
+            )
+
+            // 4. Device Name & Downloads
             VStack(alignment: .leading, spacing: 12) {
                 Text("Device & Storage")
                     .font(.system(size: 14, weight: .bold))
@@ -5035,12 +5243,14 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
         if window == nil {
             let win = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 570, height: 720),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
             )
             win.title = "AirDrop P2P"
+            win.titleVisibility = .hidden
             win.titlebarAppearsTransparent = true
+            win.isMovableByWindowBackground = true
             win.center()
             win.isReleasedWhenClosed = false
             win.delegate = self

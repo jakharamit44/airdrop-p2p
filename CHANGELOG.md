@@ -2,6 +2,22 @@
 
 All notable changes to AirDrop P2P are documented in this file.
 
+## [v2.3.0] - 2026-11-09
+
+### AI Subsystem Hardening & Audit
+- **SSE Real-Time Token Streaming**: Added Server-Sent Events (`text/event-stream`) streaming support to `claude_processor.py`, parsing `content_block_delta` tokens as they arrive.
+- **Local Ollama Integration**: Added zero-cloud offline processing via local Ollama (`http://localhost:11434`), supporting `llama3.2`, `mistral`, `qwen2.5`, and `phi3` models with automatic health detection.
+- **Content Regex Token Exfiltration Prevention**: Privacy Guard now scans text content for exposed API keys (Anthropic, OpenAI, AWS, GitHub, Slack) and blocks transmission to cloud endpoints.
+- **Zero-Injection Apple Vision OCR**: Passed image paths securely via `CommandLine.arguments` to `/usr/bin/swift`, eliminating arbitrary code injection vulnerabilities with malformed or quoted filenames.
+- **9/9 Forensic Audit Suite**: Added automated CLI audit (`python3 macos/claude_processor.py --audit`) and 11 unit tests (`macos/test_claude_processor.py`).
+
+### macOS UI Polish & SwiftUI Performance Rewrite ("Unslop")
+- **Isolated Animation Architecture**: Extracted `MacRadarScannerView`, `MacConnectingBridgeLine`, and `MacIndeterminateConnectingBar` into dedicated subviews with local animation models, eliminating 120 FPS view invalidation thrashing on the root window view.
+- **Restored Connecting Telemetry Bar**: Re-linked indeterminate progress bar physics in `LiveConnectionBridgeCard`.
+- **Apple HIG Spring Transitions & Traffic Light Breathing Room**: Added smooth scale-and-fade modal springs on incoming file transfer requests (`response: 0.28, dampingFraction: 0.82`) and added top clearance for macOS Sequoia window controls.
+- **Modern Squircle macOS App Icon**: Re-rendered `AppIcon.icns` with exact macOS 13+ superellipse/squircle geometry, multi-layer concentric ripple radar artwork, and all 10 canonical Retina resolutions (16x16 to 1024x1024).
+- **Auto-Detecting JDK in `gradlew`**: `gradlew` now automatically discovers modern JDKs (Android Studio JBR / Homebrew OpenJDK 17) without requiring manual `JAVA_HOME` configuration.
+
 ## [v2.2.1] - 2026-11-09
 
 ### Code Cleanup, Dead Code Removal & Modernization (Phase 3)

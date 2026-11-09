@@ -16,7 +16,9 @@ mkdir -p "$RELEASE_DIR"
 echo "[1/4] Building Android APK..."
 cd "$ROOT_DIR/android"
 if [ -z "${JAVA_HOME:-}" ] || [[ "$("${JAVA_HOME}/bin/java" -version 2>&1)" =~ "1.8." ]]; then
-    if [ -d "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home" ]; then
+    if [ -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]; then
+        export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+    elif [ -d "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home" ]; then
         export JAVA_HOME="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
     elif [ -d "/opt/homebrew/opt/openjdk@17" ]; then
         export JAVA_HOME="/opt/homebrew/opt/openjdk@17"
