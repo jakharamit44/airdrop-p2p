@@ -181,6 +181,16 @@ for asset_path, ctype in assets_to_upload:
         result = json.loads(up_resp.read().decode("utf-8"))
         print(f"[+] Successfully uploaded {asset_name}: {result.get('browser_download_url')}")
 
+# 5. Maintain rolling release backup branch on GitHub
+try:
+    backup_branch = f"backup/{TAG}"
+    print(f"\n[+] Syncing release backup branch {backup_branch} to GitHub...")
+    subprocess.run(["git", "branch", "-f", backup_branch, "HEAD"], check=True)
+    subprocess.run(["git", "push", "origin", backup_branch], check=True)
+    print(f"[+] Successfully synced {backup_branch} to origin.")
+except Exception as be:
+    print(f"[-] Warning: Failed to sync backup branch: {be}")
+
 print(f"\n=======================================================")
 print(f" Release {TAG} published successfully!")
 print(f" URL: https://github.com/{OWNER}/{REPO}/releases/tag/{TAG}")
