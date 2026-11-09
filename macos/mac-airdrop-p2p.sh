@@ -96,7 +96,7 @@ stop_daemons() {
   pkill -f "airdrop-p2p-daemon" 2>/dev/null || true
   pkill -f "mac-ble-airdrop daemon" 2>/dev/null || true
   pkill -x "AirDropP2P" 2>/dev/null || true
-  rm -f "$STATE_DIR/tx_in_progress.lock" "$STATE_DIR/rx_in_progress.lock" "$STATE_DIR/transfer_progress.json" "$STATE_DIR/cancel_transfer.flag" "$STATE_DIR/lan_fallback_active.flag" "$STATE_DIR/pending_ask.json" 2>/dev/null || true
+  rm -f "$STATE_DIR/tx_in_progress.lock" "$STATE_DIR/rx_in_progress.lock" "$STATE_DIR/transfer_progress.json" "$STATE_DIR/cancel_transfer.flag" "$STATE_DIR/lan_fallback_active.flag" "$STATE_DIR/pending_ask.json" "$STATE_DIR/wp2p_authorized_session.json" 2>/dev/null || true
 }
 
 start_daemons() {
@@ -331,6 +331,17 @@ def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int) -
     s = load_settings()
     if s.get("autoAccept", False):
         return True
+    auth_session_file = STATE_DIR / "wp2p_authorized_session.json"
+    if auth_session_file.exists():
+        try:
+            auth_data = json.loads(auth_session_file.read_text(encoding="utf-8"))
+            auth_time = float(auth_data.get("authorizedAt", 0))
+            if time.time() - auth_time < 60.0:
+                print(f"[P2P-Receiver] Reusing authorized WP2P session from {auth_data.get('senderName', sender_name)}")
+                auth_session_file.unlink(missing_ok=True)
+                return True
+        except Exception:
+            pass
     req_id = str(uuid.uuid4())
     ask_file = STATE_DIR / "pending_ask.json"
     dec_file = STATE_DIR / "ask_decision.json"
@@ -447,15 +458,27 @@ def restore_internet_wifi():
     except Exception:
         pass
 
+def is_transfer_cancelled() -> bool:
+    cf = STATE_DIR / "cancel_transfer.flag"
+    if not cf.exists():
+        return False
+    try:
+        ts = float(cf.read_text(encoding="utf-8").strip())
+        return (time.time() - ts) < 10.0
+    except Exception:
+        try:
+            return (time.time() - cf.stat().st_mtime) < 10.0
+        except Exception:
+            return True
+
+
 def read_body_bytes(f, headers, track_progress: bool = False, file_label: str = "Incoming File", expected_total: int = 0, file_count: int = 1):
     t0 = time.time()
     last_emit = 0.0
-    cancel_file = STATE_DIR / "cancel_transfer.flag"
     if "chunked" in headers.get("transfer-encoding", "").lower():
         out = bytearray()
         while True:
-            if track_progress and cancel_file.exists():
-                cancel_file.unlink(missing_ok=True)
+            if track_progress and is_transfer_cancelled():
                 write_progress(False)
                 raise RuntimeError("Transfer cancelled by user")
             sz_line = read_line(f)
@@ -476,8 +499,7 @@ def read_body_bytes(f, headers, track_progress: bool = False, file_label: str = 
                 break
             rem = sz
             while rem > 0:
-                if track_progress and cancel_file.exists():
-                    cancel_file.unlink(missing_ok=True)
+                if track_progress and is_transfer_cancelled():
                     write_progress(False)
                     raise RuntimeError("Transfer cancelled by user")
                 step = min(65536, rem)
@@ -507,8 +529,7 @@ def read_body_bytes(f, headers, track_progress: bool = False, file_label: str = 
     out = bytearray()
     rem = clen
     while rem > 0:
-        if track_progress and cancel_file.exists():
-            cancel_file.unlink(missing_ok=True)
+        if track_progress and is_transfer_cancelled():
             write_progress(False)
             raise RuntimeError("Transfer cancelled by user")
         step = min(65536, rem)
@@ -546,10 +567,10 @@ class ChunkedReader:
             return b""
         while self.chunk_rem == 0:
             now = time.time()
-            if now - self.last_cancel_check >= 0.5:
+            if now - self.last_cancel_check >= 0.1:
                 self.last_cancel_check = now
-                if self.cancel_file and self.cancel_file.exists():
-                    self.cancel_file.unlink(missing_ok=True)
+                if is_transfer_cancelled():
+                    write_progress(False)
                     raise RuntimeError("Transfer cancelled by user")
             line = read_line(self.f)
             if line is None:
@@ -610,10 +631,10 @@ class FixedLengthReader:
         if self.rem <= 0:
             return b""
         now = time.time()
-        if now - self.last_cancel_check >= 0.5:
+        if now - self.last_cancel_check >= 0.1:
             self.last_cancel_check = now
-            if self.cancel_file and self.cancel_file.exists():
-                self.cancel_file.unlink(missing_ok=True)
+            if is_transfer_cancelled():
+                write_progress(False)
                 raise RuntimeError("Transfer cancelled by user")
         want = min(n, self.rem)
         chunk = self.f.read(want)
@@ -900,6 +921,13 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
         write_progress(True, "Receiving", file_label, 0, max(1, expected_total), 0, 0, 0, file_count, phase="Receiving files", peer_name=peer_name, is_connecting=False)
 
     def on_bytes_read(n):
+        if is_transfer_cancelled():
+            write_progress(False)
+            try:
+                rx_lock.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise RuntimeError("Transfer cancelled by user")
         done[0] += n
         now = time.time()
         if now - last_touch[0] >= 1.0:
@@ -1165,6 +1193,14 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                 rx_lock.unlink(missing_ok=True)
             except Exception:
                 pass
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        except Exception:
+            pass
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
         try:
             conn.close()
         except Exception:
@@ -1583,7 +1619,7 @@ try:
                 def send_dvzip_block(raw_block: bytes):
                     if not raw_block:
                         return
-                    if cancel_file.exists():
+                    if is_transfer_cancelled():
                         write_progress(False)
                         sys.exit("[-] Transfer cancelled by user")
                     hdr4 = struct.pack(">I", 0x80000000 | len(raw_block))

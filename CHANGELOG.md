@@ -2,6 +2,14 @@
 
 All notable changes to AirDrop P2P are documented in this file.
 
+## [v2.3.1] - 2026-11-09
+
+### Fixed
+- **Discoverable Nearby Toggle Asymmetry**: Fixed CoreBluetooth advertising teardown in `mac-ble-airdrop.swift` by stopping advertising without removing registered GATT services, and decoupled `receiverRunning` state in `MacAirDropViewModel` from ephemeral daemon PID checks so `settings.visible` is never overwritten. Android peer TTL was lowered to 4.5s (`PEER_TTL_MS = 4500L`) for prompt disappearance when Mac turns off discovery.
+- **Single-Click Transfer Acceptance (Eliminated Double Prompt)**: Replaced the duplicate user prompt with an atomic authorization session (`wp2p_authorized_session.json`). When the user accepts the incoming transfer in the Mac UI on BLE L2CAP, the session token is verified on subsequent HTTP `/Ask` and `/Upload` requests, requiring only a single Accept click.
+- **Single-Click Cancellation & Immediate Android Sync**: Fixed a race condition where `cancel_transfer.flag` was prematurely deleted by Python before Swift could read it. The cancel flag now carries a 10s timestamp TTL. On cancellation, Mac immediately issues a hard TCP RST (`SO_LINGER(1, 0)`) to the Android sender socket, instantly clearing the transfer card and notification on Android.
+- **Post-Cancel Reconnection & Mac Radio Disappearance**: Eliminated destructive `-setairportpower en0 off/on` power-cycling in `restoreMacInternetWifi()`. Mac now cleanly disassociates via CoreWLAN without restarting the combined Wi-Fi/Bluetooth chip, preventing the Mac from disappearing from Android's radar and allowing immediate subsequent transfers.
+
 ## [v2.3.0] - 2026-11-09
 
 ### AI Subsystem Hardening & Audit

@@ -158,7 +158,7 @@ class AirDropNode(private val context: Context) {
 
     companion object {
         const val AIRDROP_PORT = 8771
-        const val PEER_TTL_MS = 6_000L
+        const val PEER_TTL_MS = 4_500L
         private const val KEYSTORE_ALIAS = "airdrop_p2p_ec_v2"
         val MAC_BLE_SERVICE_UUID: UUID = UUID.fromString("52300001-a12d-4000-8000-523a12d00001")
         val MAC_BLE_PSM_CHAR_UUID: UUID = UUID.fromString("52300002-a12d-4000-8000-523a12d00002")
@@ -673,7 +673,7 @@ class AirDropNode(private val context: Context) {
     private fun startPeerPruningLoop() {
         scope.launch {
             while (_running.value) {
-                kotlinx.coroutines.delay(2_000)
+                kotlinx.coroutines.delay(1_000)
                 val now = System.currentTimeMillis()
                 _peers.update { curr ->
                     val active = curr.filter { (now - it.lastSeenMs) <= PEER_TTL_MS }
@@ -1405,6 +1405,7 @@ class AirDropNode(private val context: Context) {
                                 log("BLE piggyback TX warning: ${t.message}")
                             } finally {
                                 activeTransferSocket = null
+                                _transferProgress.value = null
                                 clearProgressNotification()
                                 tx.result.complete(txOk)
                             }
@@ -2001,6 +2002,7 @@ class AirDropNode(private val context: Context) {
             } finally {
                 releaseTransferLocks()
                 activeTransferSocket = null
+                _transferProgress.value = null
                 clearProgressNotification()
                 if (_running.value && bleScanCallback == null) {
                     restartBleScanOnly()
@@ -2024,6 +2026,7 @@ class AirDropNode(private val context: Context) {
         wifiTeardownJob?.cancel()
         var keepAliveJob: Job? = null
         var writeWatchdogJob: Job? = null
+        var txSuccess = false
         return try {
             val sslCtx = sslContext
             var rawSock: Socket? = null
@@ -2303,6 +2306,7 @@ class AirDropNode(private val context: Context) {
                             )
                         )
                     }
+                    txSuccess = true
                     true
                 }
             }
@@ -2312,17 +2316,22 @@ class AirDropNode(private val context: Context) {
         } finally {
             writeWatchdogJob?.cancel()
             keepAliveJob?.cancel()
+            _transferProgress.value = null
             clearProgressNotification()
             releaseTransferLocks()
             activeTransferSocket = null
             lastMacP2pIp = ""
-            // Tear down ephemeral 5GHz Wi-Fi Direct group with grace period so Mac immediately returns to Internet Wi-Fi
+            // Tear down ephemeral 5GHz Wi-Fi Direct group immediately if cancelled or failed, or after grace period on success
             if (host.startsWith("192.168.49.")) {
                 wifiTeardownJob?.cancel()
-                wifiTeardownJob = scope.launch {
-                    kotlinx.coroutines.delay(5000)
-                    if (!isTransferInProgress) {
-                        stopWifiDirectGroup()
+                if (transferCancelled || !txSuccess) {
+                    stopWifiDirectGroup()
+                } else {
+                    wifiTeardownJob = scope.launch {
+                        kotlinx.coroutines.delay(5000)
+                        if (!isTransferInProgress) {
+                            stopWifiDirectGroup()
+                        }
                     }
                 }
             }

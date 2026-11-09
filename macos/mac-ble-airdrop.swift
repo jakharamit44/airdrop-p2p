@@ -217,6 +217,11 @@ func runProcessCapture(_ executablePath: String, _ arguments: [String]) -> (Int3
 }
 
 func hasActiveTcpReceiverConnection() -> Bool {
+    if isTransferCancelled() {
+        let rxLock = STATE_DIR.appendingPathComponent("rx_in_progress.lock")
+        try? FileManager.default.removeItem(at: rxLock)
+        return false
+    }
     let rxLock = STATE_DIR.appendingPathComponent("rx_in_progress.lock")
     guard FileManager.default.fileExists(atPath: rxLock.path) else { return false }
     let now = Date().timeIntervalSince1970
@@ -498,7 +503,14 @@ func waitForMacUserAccept(senderName: String, fileNames: [String], totalBytes: I
 }
 
 func isTransferCancelled() -> Bool {
-    return FileManager.default.fileExists(atPath: STATE_DIR.appendingPathComponent("cancel_transfer.flag").path)
+    let flag = STATE_DIR.appendingPathComponent("cancel_transfer.flag")
+    guard let s = try? String(contentsOf: flag, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+          let ts = Double(s) else {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: flag.path),
+              let mtime = attrs[.modificationDate] as? Date else { return false }
+        return Date().timeIntervalSince(mtime) < 10.0
+    }
+    return Date().timeIntervalSince1970 - ts < 10.0
 }
 
 func clearCancelFlag() {
@@ -698,8 +710,18 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
         return false
     }
 
-    // 2. Check if iface is already back on normal Wi-Fi
-    if wifiHasNormalIpv4() {
+    // 2. Check if iface is already back on normal Wi-Fi or was never on P2P
+    let curSsid = currentWifiSsid()
+    let savedSsid = (try? String(contentsOf: PREV_WIFI_FILE, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !curSsid.hasPrefix("DIRECT-") && (wifiHasNormalIpv4() || savedSsid.isEmpty) {
+        print("[BLE-Daemon] \(iface) already on normal Wi-Fi ('\(curSsid)'). P2P cleanup completed.")
+        fflush(stdout)
+        try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
+        resumeCloudflareWarpIfNeeded()
+        return
+    }
+
+    if wifiHasNormalIpv4() && !curSsid.hasPrefix("DIRECT-") {
         print("[BLE-Daemon] \(iface) connected to normal Wi-Fi. P2P removed from preferred list.")
         fflush(stdout)
         try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
@@ -711,14 +733,15 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     fflush(stdout)
 
     // 3. Resolve target home network to restore
-    let savedSsid = (try? String(contentsOf: PREV_WIFI_FILE, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let targetSsid = (!savedSsid.isEmpty && !savedSsid.hasPrefix("DIRECT-")) ? savedSsid : topPreferredWifiNetwork()
 
-    // 4. Disassociate iface using CoreWLAN to cleanly detach from P2P
-    if let cwIface = CWWiFiClient.shared().interface(withName: iface) ?? CWWiFiClient.shared().interface() {
-        cwIface.disassociate()
+    // 4. Disassociate iface using CoreWLAN to cleanly detach from P2P only if currently associated to P2P
+    if curSsid.hasPrefix("DIRECT-") {
+        if let cwIface = CWWiFiClient.shared().interface(withName: iface) ?? CWWiFiClient.shared().interface() {
+            cwIface.disassociate()
+        }
+        Thread.sleep(forTimeInterval: 0.5)
     }
-    Thread.sleep(forTimeInterval: 1.5)
 
     // 5. If target network is known and not yet reconnected, reassociate
     let activeNow = currentWifiSsid()
@@ -728,25 +751,11 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
         _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", iface, targetSsid])
     }
 
-    // 6. Wait synchronously up to 4.5s for iface to obtain normal Wi-Fi IPv4 before resuming WARP
-    let waitDeadline = Date().addingTimeInterval(4.5)
+    // 6. Wait synchronously up to 3.0s for iface to obtain normal Wi-Fi IPv4 before resuming WARP
+    let waitDeadline = Date().addingTimeInterval(3.0)
     while Date() < waitDeadline {
         if wifiHasNormalIpv4() { break }
         Thread.sleep(forTimeInterval: 0.25)
-    }
-
-    // 7. Fallback safety verification: only cycle power if iface is still wedged without valid IPv4
-    if !wifiHasNormalIpv4() {
-        print("[BLE-Daemon] Network did not reassociate automatically — power cycling radio on \(iface) as fallback...")
-        fflush(stdout)
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportpower", iface, "off"])
-        Thread.sleep(forTimeInterval: 0.3)
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportpower", iface, "on"])
-        let cycleDeadline = Date().addingTimeInterval(4.0)
-        while Date() < cycleDeadline {
-            if wifiHasNormalIpv4() { break }
-            Thread.sleep(forTimeInterval: 0.25)
-        }
     }
 
     try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
@@ -768,7 +777,6 @@ func readExact(
     var lastEmit = Date.distantPast
     while offset < count {
         if trackProgress && isTransferCancelled() {
-            clearCancelFlag()
             writeProgressJson(active: false)
             return nil
         }
@@ -830,7 +838,6 @@ func writeAll(
     var lastEmit = Date.distantPast
     while offset < total {
         if trackProgress && isTransferCancelled() {
-            clearCancelFlag()
             writeProgressJson(active: false)
             return false
         }
@@ -956,15 +963,31 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         wp2pJoinLock.lock()
         wp2pJoinActive = false
         wp2pJoinLock.unlock()
+        let authSessionFile = STATE_DIR.appendingPathComponent("wp2p_authorized_session.json")
+        try? FileManager.default.removeItem(at: authSessionFile)
     }
 
     let incomingPeerName = peerName ?? (loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Nearby Device")
+    clearCancelFlag()
 
     // Gate incoming WP2P join behind user confirmation/authorization
-    if !waitForMacUserAccept(senderName: incomingPeerName, fileNames: ["5 GHz Wi-Fi Direct Connection (\(ssid))"], totalBytes: 0, forcePrompt: true) {
+    let settings = loadMacSettings()
+    let autoAccept = settings.autoAccept
+    if !autoAccept && !waitForMacUserAccept(senderName: incomingPeerName, fileNames: ["5 GHz Wi-Fi Direct Connection (\(ssid))"], totalBytes: 0, forcePrompt: false) {
         print("[BLE-Daemon] User declined incoming WP2P connection request from \(incomingPeerName)")
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
+    }
+
+    // Record authorized WP2P session so subsequent HTTP /Ask in mac-airdrop-p2p.sh accepts automatically without a 2nd prompt
+    let authSessionFile = STATE_DIR.appendingPathComponent("wp2p_authorized_session.json")
+    let authPayload: [String: Any] = [
+        "senderName": incomingPeerName,
+        "ssid": ssid,
+        "authorizedAt": Date().timeIntervalSince1970
+    ]
+    if let authData = try? JSONSerialization.data(withJSONObject: authPayload) {
+        try? authData.write(to: authSessionFile, options: [.atomic])
     }
 
     let uploadDoneFile = STATE_DIR.appendingPathComponent("upload_completed.flag")
@@ -1047,6 +1070,14 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     let startDeadline = Date().addingTimeInterval(30.0)
     var transferDetected = false
     while Date() < startDeadline {
+        if isTransferCancelled() {
+            print("[BLE-Daemon] Transfer cancelled by user during Phase 1 handshake — restoring Wi-Fi")
+            fflush(stdout)
+            writeProgressJson(active: false)
+            restoreMacInternetWifi(ssid: ssid)
+            try? FileManager.default.removeItem(at: authSessionFile)
+            return
+        }
         let detected = autoreleasepool { () -> Bool in
             if FileManager.default.fileExists(atPath: askFile.path) ||
                hasActiveTcpReceiverConnection() {
@@ -1081,6 +1112,11 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     var lastWarpCheck = Date()
 
     while true {
+        if isTransferCancelled() {
+            print("[BLE-Daemon] Transfer cancelled by user during Phase 2 stream — restoring Wi-Fi")
+            fflush(stdout)
+            break
+        }
         let shouldBreak = autoreleasepool { () -> Bool in
             if Date().timeIntervalSince(lastKeepAlivePing) >= 2.0 {
                 lastKeepAlivePing = Date()
@@ -1444,7 +1480,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
     }
 
     func stopAdvertisingAndScanning() {
-        if pm?.state == .poweredOn && pm?.isAdvertising == true {
+        if pm?.state == .poweredOn {
             pm?.stopAdvertising()
             print("[BLE-Daemon] Stopped BLE advertising (Incoming radio turned off)")
         }
@@ -1452,6 +1488,9 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
             cm?.stopScan()
             print("[BLE-Daemon] Stopped BLE scanning (Incoming radio turned off)")
         }
+        cancelActivePing()
+        discoveredPeerPeripheral = nil
+        discoveredPeerPsm = 0
         try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("active_peers.json"))
         try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("p2p_status"))
     }
@@ -1516,6 +1555,9 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
+        let settings = loadMacSettings()
+        guard settings.visible else { return }
+
         let rssiVal = RSSI.intValue
         // Ignore invalid CoreBluetooth RSSI (127 = unavailable)
         if rssiVal == 127 || rssiVal < -98 { return }
@@ -1579,6 +1621,16 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
     }
 
     func pingPeerIfNeeded() {
+        let settings = loadMacSettings()
+        guard settings.visible else {
+            if cm?.state == .poweredOn && cm?.isScanning == true {
+                cm?.stopScan()
+            }
+            if isPingingPeer {
+                cancelActivePing()
+            }
+            return
+        }
         let now = Date().timeIntervalSince1970
         let txLock = STATE_DIR.appendingPathComponent("tx_in_progress.lock")
         let txProgress = STATE_DIR.appendingPathComponent("transfer_progress.json")
@@ -2828,6 +2880,7 @@ final class MacAirDropViewModel: ObservableObject {
     @Published var transferStatus: String = "Select files to review, then click Send"
     @Published var isTransferring: Bool = false
     @Published var liveProgress: MacLiveProgress? = nil
+    private var cancelRequestedUntil: TimeInterval = 0
     @Published var pendingAsk: MacPendingAsk? = nil
     @Published var urlInput: String = ""
     @Published var isDropTargeted: Bool = false
@@ -2899,6 +2952,7 @@ final class MacAirDropViewModel: ObservableObject {
     init() {
         let s = loadMacSettings()
         self.autoAccept = s.autoAccept
+        self.receiverRunning = s.visible
         self.macDeviceName = s.deviceName
         self.editingDeviceName = s.deviceName
         self.themeMode = s.themeMode
@@ -2931,7 +2985,7 @@ final class MacAirDropViewModel: ObservableObject {
         let normalized = ["light", "dark", "system"].contains(mode) ? mode : "system"
         themeMode = normalized
         systemIsDark = Self.detectSystemDark()
-        saveMacSettings(autoAccept: autoAccept, visible: receiverRunning, deviceName: macDeviceName, themeMode: normalized)
+        saveMacSettings(autoAccept: autoAccept, visible: loadMacSettings().visible, deviceName: macDeviceName, themeMode: normalized)
         onThemeChanged?(palette)
     }
 
@@ -2971,6 +3025,11 @@ final class MacAirDropViewModel: ObservableObject {
         }
 
         // 1. Poll real-time transfer progress JSON (22s freshness covers 12s Wi-Fi Direct join)
+        if Date().timeIntervalSince1970 < cancelRequestedUntil {
+            if isTransferring { isTransferring = false }
+            if liveProgress != nil { liveProgress = nil }
+            return
+        }
         let pf = STATE_DIR.appendingPathComponent("transfer_progress.json")
         if let d = try? Data(contentsOf: pf),
            let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
@@ -3040,18 +3099,19 @@ final class MacAirDropViewModel: ObservableObject {
 
     func setReceiveMode(directGet: Bool) {
         autoAccept = directGet
-        saveMacSettings(autoAccept: directGet, visible: receiverRunning, deviceName: macDeviceName, themeMode: themeMode)
+        saveMacSettings(autoAccept: directGet, visible: loadMacSettings().visible, deviceName: macDeviceName, themeMode: themeMode)
     }
 
     func saveDeviceName() {
         let clean = editingDeviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
         macDeviceName = clean
-        saveMacSettings(autoAccept: autoAccept, visible: receiverRunning, deviceName: clean, themeMode: themeMode)
+        saveMacSettings(autoAccept: autoAccept, visible: loadMacSettings().visible, deviceName: clean, themeMode: themeMode)
     }
 
     func refreshSlow() {
-        receiverRunning = isPidAlive("daemon.pid")
+        let s = loadMacSettings()
+        receiverRunning = s.visible && isPidAlive("daemon.pid")
         mdnsRunning = isPidAlive("mdns.pid")
         awdlProxyRunning = isPidAlive("awdl-mdns.pid")
         bleRunning = true
@@ -3141,6 +3201,7 @@ final class MacAirDropViewModel: ObservableObject {
 
     func toggleDaemons(_ turnOn: Bool) {
         transferStatus = turnOn ? "Starting P2P radio…" : "Pausing P2P radio…"
+        receiverRunning = turnOn
         saveMacSettings(autoAccept: autoAccept, visible: turnOn, deviceName: macDeviceName, themeMode: themeMode)
         if turnOn {
             BleAirDropDaemon.shared?.startAdvertisingAndScanning()
@@ -3158,13 +3219,15 @@ final class MacAirDropViewModel: ObservableObject {
                 try? p.run()
                 p.waitUntilExit()
             } else {
-                for pf in ["daemon.pid", "mdns.pid", "awdl-mdns.pid"] {
+                for pf in ["daemon.pid", "mdns.pid", "awdl-mdns.pid", "ble-daemon.pid"] {
                     let f = STATE_DIR.appendingPathComponent(pf)
                     if let s = try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-                       let pid = Int32(s) {
+                       let pid = Int32(s), pid != getpid() {
                         kill(pid, SIGTERM)
                     }
-                    try? FileManager.default.removeItem(at: f)
+                    if pf != "ble-daemon.pid" || (try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) != String(getpid()) {
+                        try? FileManager.default.removeItem(at: f)
+                    }
                 }
             }
             DispatchQueue.main.async {
@@ -3177,13 +3240,19 @@ final class MacAirDropViewModel: ObservableObject {
     }
 
     func cancelActiveTransfer() {
-        try? Data("1".utf8).write(to: STATE_DIR.appendingPathComponent("cancel_transfer.flag"))
+        cancelRequestedUntil = Date().timeIntervalSince1970 + 3.0
+        let flag = STATE_DIR.appendingPathComponent("cancel_transfer.flag")
+        try? String(Date().timeIntervalSince1970).write(to: flag, atomically: true, encoding: .utf8)
+        BleAirDropDaemon.shared?.cancelActivePing()
         if let proc = activeSendProcess, proc.isRunning {
             proc.terminate()
         }
         activeSendProcess = nil
         try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("transfer_progress.json"))
         try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("rx_in_progress.lock"))
+        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("wp2p_authorized_session.json"))
+        writeProgressJson(active: false)
         isTransferring = false
         liveProgress = nil
         transferStatus = "Transfer cancelled"
@@ -5467,7 +5536,8 @@ if args.count >= 2 && args[1] == "restore-wifi" {
                   let p = Int32(s) else { return false }
             return kill(p, 0) == 0
         }()
-        if !httpsAlive {
+        let s = loadMacSettings()
+        if s.visible && !httpsAlive {
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
