@@ -33,6 +33,7 @@ import android.media.MediaScannerConnection
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import java.util.Base64
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pManager
@@ -79,20 +80,26 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Socket
 import java.nio.charset.StandardCharsets
+import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.PrivateKey
+import java.security.PublicKey
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.X509EncodedKeySpec
 import java.util.Collections
 import java.util.Date
 import java.util.UUID
 import javax.crypto.Cipher
+import javax.crypto.KeyAgreement
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLPeerUnverifiedException
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManager
@@ -157,14 +164,54 @@ class AirDropNode(private val context: Context) {
         val MAC_BLE_PSM_CHAR_UUID: UUID = UUID.fromString("52300002-a12d-4000-8000-523a12d00002")
         val P2P_BLE_SERVICE_UUID: UUID = UUID.fromString("52300003-a12d-4000-8000-523a12d00003")
         val P2P_BLE_PSM_CHAR_UUID: UUID = UUID.fromString("52300004-a12d-4000-8000-523a12d00004")
-        val P2P_BLE_DATA_UUID: ParcelUuid = ParcelUuid.fromString("0000cafe-0000-1000-8000-00805f9b34fb")
-        val MAC_BLE_DATA_UUID: ParcelUuid = ParcelUuid.fromString("0000caff-0000-1000-8000-00805f9b34fb")
+        val P2P_BLE_DATA_UUID: ParcelUuid by lazy { ParcelUuid.fromString("0000cafe-0000-1000-8000-00805f9b34fb") }
+        val MAC_BLE_DATA_UUID: ParcelUuid by lazy { ParcelUuid.fromString("0000caff-0000-1000-8000-00805f9b34fb") }
 
         fun defaultHardwareName(): String {
             val mfr = Build.MANUFACTURER?.trim().orEmpty().replaceFirstChar { it.uppercase() }
             val mod = Build.MODEL?.trim().orEmpty()
             val combined = if (mod.startsWith(mfr, ignoreCase = true)) mod else "$mfr $mod".trim()
             return combined.ifEmpty { "Android Device" }
+        }
+
+        data class EphemeralEcdhKeyPair(val privateKey: PrivateKey, val publicKey: PublicKey)
+
+        fun generateEphemeralEcdhKeyPair(): EphemeralEcdhKeyPair {
+            val kpg = KeyPairGenerator.getInstance("EC")
+            kpg.initialize(ECGenParameterSpec("secp256r1"))
+            val kp = kpg.generateKeyPair()
+            return EphemeralEcdhKeyPair(kp.private, kp.public)
+        }
+
+        fun deriveSessionKey(privateKey: PrivateKey, peerPublicKeyDer: ByteArray): ByteArray {
+            val kf = KeyFactory.getInstance("EC")
+            val peerPublic = kf.generatePublic(X509EncodedKeySpec(peerPublicKeyDer))
+            val ka = KeyAgreement.getInstance("ECDH")
+            ka.init(privateKey)
+            ka.doPhase(peerPublic, true)
+            val rawSecret = ka.generateSecret()
+            val md = MessageDigest.getInstance("SHA-256")
+            md.update(rawSecret)
+            md.update("AirDropP2P-v2-SessionKey".toByteArray(StandardCharsets.UTF_8))
+            return md.digest()
+        }
+
+        fun encryptAesGcm(plain: ByteArray, sessionKeyBytes: ByteArray): ByteArray {
+            val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(sessionKeyBytes, "AES"), GCMParameterSpec(128, iv))
+            val sealed = cipher.doFinal(plain)
+            val out = ByteArray(12 + sealed.size)
+            System.arraycopy(iv, 0, out, 0, 12)
+            System.arraycopy(sealed, 0, out, 12, sealed.size)
+            return out
+        }
+
+        fun decryptAesGcm(packet: ByteArray, sessionKeyBytes: ByteArray): ByteArray {
+            if (packet.size < 28) throw IOException("Encrypted frame too short")
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(sessionKeyBytes, "AES"), GCMParameterSpec(128, packet, 0, 12))
+            return cipher.doFinal(packet, 12, packet.size - 12)
         }
 
         fun formatBytes(bytes: Long): String {
@@ -1076,10 +1123,26 @@ class AirDropNode(private val context: Context) {
         SecretKeySpec(digest, "AES")
     }
 
-    private fun encryptBlePayload(plain: ByteArray): ByteArray {
+
+    fun getLocalTlsFingerprint(): String {
+        return try {
+            val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            val cert = (ks.getCertificate(KEYSTORE_ALIAS) ?: run {
+                buildSslContext()
+                ks.getCertificate(KEYSTORE_ALIAS)
+            }) as? X509Certificate ?: return ""
+            val md = MessageDigest.getInstance("SHA-256").digest(cert.encoded)
+            md.joinToString("") { "%02x".format(it) }
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    private fun encryptBlePayload(plain: ByteArray, sessionKey: ByteArray? = null): ByteArray {
+        val key = if (sessionKey != null) SecretKeySpec(sessionKey, "AES") else bleAesKey
         val iv = ByteArray(12).also { random.nextBytes(it) }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, bleAesKey, GCMParameterSpec(128, iv))
+        cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(128, iv))
         val sealed = cipher.doFinal(plain)
         return ByteArray(12 + sealed.size).also { out ->
             System.arraycopy(iv, 0, out, 0, 12)
@@ -1087,10 +1150,11 @@ class AirDropNode(private val context: Context) {
         }
     }
 
-    private fun decryptBlePayload(packet: ByteArray): ByteArray {
+    private fun decryptBlePayload(packet: ByteArray, sessionKey: ByteArray? = null): ByteArray {
         if (packet.size < 28) throw IOException("Encrypted BLE frame too short")
+        val key = if (sessionKey != null) SecretKeySpec(sessionKey, "AES") else bleAesKey
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, bleAesKey, GCMParameterSpec(128, packet, 0, 12))
+        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, packet, 0, 12))
         return cipher.doFinal(packet, 12, packet.size - 12)
     }
 
@@ -1162,31 +1226,76 @@ class AirDropNode(private val context: Context) {
                                     if (creds.isNotEmpty()) {
                                         val credParts = creds.split('\t')
                                         if (credParts.size >= 2) {
-                                            out.write("WP2P\t${credParts[0]}\t${credParts[1]}\n".toByteArray(StandardCharsets.UTF_8))
-                                            out.flush()
-                                            reportConnecting(tx.label, tx.totalRawBytes, tx.fileCount, isSending = true, phase = "Waiting for $macName to join 5GHz link…", peerName = macName)
-                                            val replyLine = readBleLineBounded(sock, dis, 22_000L).orEmpty()
-                                            if (replyLine.startsWith("OK ")) {
-                                                val macIp = replyLine.removePrefix("OK ").trim()
-                                                if (isValidPeerTransferIp(macIp)) {
-                                                    wp2pJoined = true
-                                                    if (macIp.startsWith("192.168.49.")) {
-                                                        lastMacP2pIp = macIp
-                                                    }
-                                                    log("Mac ready at $macIp:8772 — streaming over 5GHz Wi-Fi…")
-                                                    txOk = sendOverWifiDirectHttps(
-                                                        macIp,
-                                                        8772,
-                                                        tx.metaBytes,
-                                                        tx.archiveBytes,
-                                                        tx.entries,
-                                                        tx.url,
-                                                        tx.label,
-                                                        tx.fileCount
-                                                    )
-                                                    runCatching {
-                                                        out.write("DONE".toByteArray(StandardCharsets.US_ASCII))
+                                            var pinnedPeerFingerprint: String? = null
+                                            // 1. Attempt version 2 ECDH P-256 negotiation
+                                            try {
+                                                val ecdhPair = generateEphemeralEcdhKeyPair()
+                                                val localPubB64 = Base64.getEncoder().encodeToString(ecdhPair.publicKey.encoded)
+                                                val localTlsFp = getLocalTlsFingerprint()
+                                                out.write("W2P2\t$localPubB64\t$localTlsFp\n".toByteArray(StandardCharsets.UTF_8))
+                                                out.flush()
+                                                reportConnecting(tx.label, tx.totalRawBytes, tx.fileCount, isSending = true, phase = "Waiting for $macName to join 5GHz link…", peerName = macName)
+                                                val ecdhReply = readBleLineBounded(sock, dis, 22_000L).orEmpty()
+                                                if (ecdhReply.startsWith("OK\t")) {
+                                                    val replyParts = ecdhReply.removePrefix("OK\t").split('\t')
+                                                    if (replyParts.isNotEmpty()) {
+                                                        val macPubBytes = Base64.getDecoder().decode(replyParts[0])
+                                                        pinnedPeerFingerprint = replyParts.getOrNull(1)?.trim()
+                                                        val sessionKey = deriveSessionKey(ecdhPair.privateKey, macPubBytes)
+                                                        val encCreds = encryptAesGcm("${credParts[0]}\t${credParts[1]}".toByteArray(StandardCharsets.UTF_8), sessionKey)
+                                                        val encB64 = Base64.getEncoder().encodeToString(encCreds)
+                                                        out.write("JOIN\t$encB64\n".toByteArray(StandardCharsets.UTF_8))
                                                         out.flush()
+
+                                                        val joinReply = readBleLineBounded(sock, dis, 22_000L).orEmpty()
+                                                        if (joinReply.startsWith("OK ")) {
+                                                            val macIp = joinReply.removePrefix("OK ").trim()
+                                                            if (isValidPeerTransferIp(macIp)) {
+                                                                wp2pJoined = true
+                                                                if (macIp.startsWith("192.168.49.")) lastMacP2pIp = macIp
+                                                                log("Mac ready at $macIp:8772 (TLS pinned: $pinnedPeerFingerprint) — streaming over 5GHz Wi-Fi…")
+                                                                txOk = sendOverWifiDirectHttps(macIp, 8772, tx.metaBytes, tx.archiveBytes, tx.entries, tx.url, tx.label, tx.fileCount, pinnedPeerFingerprint)
+                                                                runCatching {
+                                                                    out.write("DONE".toByteArray(StandardCharsets.US_ASCII))
+                                                                    out.flush()
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } catch (t: Throwable) {
+                                                log("Piggyback W2P2 ECDH negotiation failed: ${t.message}")
+                                            }
+
+                                            // 2. Fallback to legacy v1 WP2P if v2 did not complete
+                                            if (!wp2pJoined) {
+                                                out.write("WP2P\t${credParts[0]}\t${credParts[1]}\n".toByteArray(StandardCharsets.UTF_8))
+                                                out.flush()
+                                                reportConnecting(tx.label, tx.totalRawBytes, tx.fileCount, isSending = true, phase = "Waiting for $macName to join 5GHz link…", peerName = macName)
+                                                val replyLine = readBleLineBounded(sock, dis, 22_000L).orEmpty()
+                                                if (replyLine.startsWith("OK ")) {
+                                                    val macIp = replyLine.removePrefix("OK ").trim()
+                                                    if (isValidPeerTransferIp(macIp)) {
+                                                        wp2pJoined = true
+                                                        if (macIp.startsWith("192.168.49.")) {
+                                                            lastMacP2pIp = macIp
+                                                        }
+                                                        log("Mac ready at $macIp:8772 — streaming over 5GHz Wi-Fi…")
+                                                        txOk = sendOverWifiDirectHttps(
+                                                            macIp,
+                                                            8772,
+                                                            tx.metaBytes,
+                                                            tx.archiveBytes,
+                                                            tx.entries,
+                                                            tx.url,
+                                                            tx.label,
+                                                            tx.fileCount,
+                                                            null
+                                                        )
+                                                        runCatching {
+                                                            out.write("DONE".toByteArray(StandardCharsets.US_ASCII))
+                                                            out.flush()
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1284,6 +1393,65 @@ class AirDropNode(private val context: Context) {
                         }
                     }
                     break
+                }
+                if (magicStr == "W2P2") {
+                    val reqLine = readHttpLine(dis).orEmpty()
+                    val rawParts = reqLine.trimStart('\t').split('\t')
+                    val parts = rawParts.filter { it.isNotEmpty() }
+                    val (macPubB64, macCertFingerprint) = when {
+                        parts.size >= 3 && (parts[0] == "2" || parts[0] == "1") -> parts[1] to parts[2]
+                        parts.size == 2 && (parts[0] == "2" || parts[0] == "1") -> parts[1] to null
+                        parts.size >= 2 -> parts[0] to parts[1]
+                        parts.size == 1 -> parts[0] to null
+                        else -> "" to null
+                    }
+                    if (macPubB64.isNotEmpty()) {
+                        try {
+                            val macPubBytes = Base64.getDecoder().decode(macPubB64)
+                            val macCertFingerprint = parts.getOrNull(1)?.trim()
+                            reportConnecting(
+                                label = "Incoming transfer",
+                                total = 0L,
+                                fileCount = 1,
+                                isSending = false,
+                                phase = "Opening 5GHz Wi-Fi Direct link…",
+                                peerName = learnedMacName ?: "MacBook Pro"
+                            )
+                            val creds = ensureWifiDirectCreds()
+                            if (creds.isNotEmpty()) {
+                                val ecdhPair = generateEphemeralEcdhKeyPair()
+                                val sessionKey = deriveSessionKey(ecdhPair.privateKey, macPubBytes)
+                                val localTlsFp = getLocalTlsFingerprint()
+                                val fullCreds = "$creds\t$localTlsFp"
+                                val encCreds = encryptAesGcm(fullCreds.toByteArray(StandardCharsets.UTF_8), sessionKey)
+                                val androidPubB64 = Base64.getEncoder().encodeToString(ecdhPair.publicKey.encoded)
+                                val encCredsB64 = Base64.getEncoder().encodeToString(encCreds)
+                                out.write("OK\t$androidPubB64\t$encCredsB64\n".toByteArray(StandardCharsets.UTF_8))
+                                out.flush()
+                                reportConnecting(
+                                    label = "Incoming transfer",
+                                    total = 0L,
+                                    fileCount = 1,
+                                    isSending = false,
+                                    phase = "Waiting for peer to join 5GHz link…",
+                                    peerName = learnedMacName ?: "MacBook Pro"
+                                )
+                                scope.launch {
+                                    kotlinx.coroutines.delay(18_000L)
+                                    if (_transferProgress.value?.isConnecting == true && activeTransferSocket == null) {
+                                        clearProgressNotification()
+                                    }
+                                }
+                                log("BLE W2P2 ECDH handshake with $remoteAddr -> 5GHz P2P Ready (TLS pinned: $macCertFingerprint)")
+                                continue
+                            }
+                        } catch (t: Throwable) {
+                            log("BLE W2P2 error with $remoteAddr: ${t.message}")
+                        }
+                    }
+                    out.write("NO\n".toByteArray(StandardCharsets.UTF_8))
+                    out.flush()
+                    continue
                 }
                 if (magicStr == "WP2P") {
                     val isAuthorized = (pendingMacTx != null && (pendingMacTx?.targetPeerAddress == null || pendingMacTx?.targetPeerAddress == remoteAddr)) ||
@@ -1613,6 +1781,53 @@ class AirDropNode(private val context: Context) {
                                     if (creds.isNotEmpty()) {
                                         val credParts = creds.split('\t')
                                         if (credParts.size >= 2) {
+                                            var pinnedPeerFingerprint: String? = null
+                                            // 1. Attempt version 2 ECDH P-256 negotiation
+                                            try {
+                                                val ecdhPair = generateEphemeralEcdhKeyPair()
+                                                val localPubB64 = Base64.getEncoder().encodeToString(ecdhPair.publicKey.encoded)
+                                                val localTlsFp = getLocalTlsFingerprint()
+                                                val w2p2Payload = "2\t$localPubB64\t$localTlsFp".toByteArray(StandardCharsets.UTF_8)
+                                                dos.write("W2P2".toByteArray(StandardCharsets.US_ASCII))
+                                                dos.writeInt(w2p2Payload.size)
+                                                dos.writeInt(0)
+                                                dos.write(w2p2Payload)
+                                                dos.flush()
+
+                                                reportConnecting(label, totalRawBytes, fileCount, isSending = true, phase = "Waiting for $targetPeerLabel to join 5GHz link…", peerName = targetPeerLabel)
+                                                val ecdhReply = readBleLineBounded(sock, inp, 22_000L).orEmpty()
+                                                if (ecdhReply.startsWith("OK\t")) {
+                                                    val replyParts = ecdhReply.removePrefix("OK\t").split('\t')
+                                                    if (replyParts.isNotEmpty()) {
+                                                        val macPubBytes = Base64.getDecoder().decode(replyParts[0])
+                                                        pinnedPeerFingerprint = replyParts.getOrNull(1)?.trim()
+                                                        val sessionKey = deriveSessionKey(ecdhPair.privateKey, macPubBytes)
+                                                        val encCreds = encryptAesGcm("${credParts[0]}\t${credParts[1]}".toByteArray(StandardCharsets.UTF_8), sessionKey)
+                                                        val encB64 = Base64.getEncoder().encodeToString(encCreds)
+                                                        dos.write("JOIN\t$encB64\n".toByteArray(StandardCharsets.UTF_8))
+                                                        dos.flush()
+
+                                                        val joinReply = readBleLineBounded(sock, inp, 22_000L).orEmpty()
+                                                        if (joinReply.startsWith("OK ")) {
+                                                            val macIp = joinReply.removePrefix("OK ").trim()
+                                                            if (isValidPeerTransferIp(macIp)) {
+                                                                if (macIp.startsWith("192.168.49.")) lastMacP2pIp = macIp
+                                                                log("Mac ready at $macIp:8772 (TLS pinned: $pinnedPeerFingerprint) — streaming over 5GHz Wi-Fi…")
+                                                                val p2pOk = sendOverWifiDirectHttps(macIp, 8772, metaBytes, archiveBytes, entries, url, label, fileCount, pinnedPeerFingerprint)
+                                                                runCatching {
+                                                                    dos.write("DONE".toByteArray(StandardCharsets.US_ASCII))
+                                                                    dos.flush()
+                                                                }
+                                                                return@withLock p2pOk
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } catch (t: Throwable) {
+                                                log("Direct W2P2 ECDH negotiation failed: ${t.message}")
+                                            }
+
+                                            // 2. Fallback to legacy v1 WP2P
                                             val wp2pPayload = "${credParts[0]}\t${credParts[1]}".toByteArray(StandardCharsets.UTF_8)
                                             dos.write("WP2P".toByteArray(StandardCharsets.US_ASCII))
                                             dos.writeInt(wp2pPayload.size)
@@ -1629,7 +1844,7 @@ class AirDropNode(private val context: Context) {
                                                         lastMacP2pIp = macIp
                                                     }
                                                     log("Mac ready at $macIp:8772 — streaming over 5GHz Wi-Fi…")
-                                                    val p2pOk = sendOverWifiDirectHttps(macIp, 8772, metaBytes, archiveBytes, entries, url, label, fileCount)
+                                                    val p2pOk = sendOverWifiDirectHttps(macIp, 8772, metaBytes, archiveBytes, entries, url, label, fileCount, null)
                                                     runCatching {
                                                         dos.write("DONE".toByteArray(StandardCharsets.US_ASCII))
                                                         dos.flush()
@@ -1776,7 +1991,8 @@ class AirDropNode(private val context: Context) {
         entries: List<AirDropCodec.OutgoingEntry>,
         url: String?,
         label: String,
-        fileCount: Int
+        fileCount: Int,
+        pinnedFingerprint: String? = null
     ): Boolean {
         acquireTransferLocks()
         wifiTeardownJob?.cancel()
@@ -1859,6 +2075,19 @@ class AirDropNode(private val context: Context) {
                     activeTransferSocket = tls
                     configureHighThroughputTls(tls)
                     tls.startHandshake()
+                    if (!pinnedFingerprint.isNullOrBlank()) {
+                        val peerCerts = tls.session.peerCertificates
+                        val serverCert = peerCerts.firstOrNull() as? X509Certificate
+                            ?: throw SSLPeerUnverifiedException("No server certificate presented by $host:$port")
+                        val sha256 = MessageDigest.getInstance("SHA-256").digest(serverCert.encoded)
+                        val actualFp = sha256.joinToString("") { "%02x".format(it) }.lowercase()
+                        val expectedFp = pinnedFingerprint.replace(":", "").replace("-", "").trim().lowercase()
+                        if (actualFp != expectedFp) {
+                            log("FATAL: TLS certificate fingerprint pinning mismatch! Expected: $expectedFp, Actual: $actualFp")
+                            throw SSLPeerUnverifiedException("Certificate fingerprint pinning failed! Expected $expectedFp, got $actualFp")
+                        }
+                        log("TLS certificate fingerprint pinned and verified: $actualFp")
+                    }
                     val inp = BufferedInputStream(tls.inputStream, 65536)
                     val rawOut = tls.outputStream
 

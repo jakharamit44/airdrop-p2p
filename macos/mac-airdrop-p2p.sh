@@ -995,10 +995,34 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     ask_approved = True
                     for it in items:
                         if isinstance(it, str) and (it.startswith("http://") or it.startswith("https://")):
+                            if not re.match(r"^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$", it):
+                                print(f"[-] Dropping malformed or suspicious URL: {it}")
+                                continue
                             append_history("URL", it, len(it), "received", last_sender)
-                            safe_notify(f"Received link: {it}", f"AirDrop from {last_sender}")
-                            if re.match(r"^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$", it):
-                                subprocess.Popen(["open", it])
+                            # Copy received URL to NSPasteboard via pbcopy
+                            try:
+                                p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                                p.communicate(input=it.encode("utf-8"), timeout=2.0)
+                            except Exception:
+                                pass
+                            safe_notify(f"Received link (copied to clipboard): {it}", f"AirDrop from {last_sender}")
+                            # Prompt user with an action button instead of auto-launching browser
+                            def prompt_user_url_action(target_url: str, sender_name: str):
+                                try:
+                                    escaped_url = target_url.replace('\\', '\\\\').replace('"', '\\"')
+                                    escaped_sender = sender_name.replace('\\', '\\\\').replace('"', '\\"')
+                                    apple_script = (
+                                        f'set res to display alert "AirDrop Link Received" '
+                                        f'message "Link from {escaped_sender}:\n{escaped_url}\n\n(Copied to clipboard)" '
+                                        f'buttons {{"Dismiss", "Open in Browser"}} default button "Dismiss"\n'
+                                        f'if button returned of res is "Open in Browser" then\n'
+                                        f'    open location "{escaped_url}"\n'
+                                        f'end if'
+                                    )
+                                    subprocess.run(["osascript", "-e", apple_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                except Exception:
+                                    pass
+                            threading.Thread(target=prompt_user_url_action, args=(it, last_sender), daemon=True).start()
                 resp = plistlib.dumps({
                     "ReceiverComputerName": active_peer_name if is_p2p_proxy else current_mac_name(),
                     "ReceiverModelName": "iPhone16,2" if is_p2p_proxy else "MacBookPro18,2",
@@ -1107,19 +1131,31 @@ def is_authorized_peer_ip(peer_ip: str) -> bool:
     return False
 
 def serve_port(bind_port: int, is_p2p_proxy: bool):
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-    set_high_throughput_sockbufs(sock)
-    sock.bind(("::", bind_port))
+    if is_p2p_proxy:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        set_high_throughput_sockbufs(sock)
+        sock.bind(("127.0.0.1", bind_port))
+    else:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        set_high_throughput_sockbufs(sock)
+        sock.bind(("::", bind_port))
     sock.listen(32)
     label = "Finder AirDrop Proxy" if is_p2p_proxy else f"5GHz Wi-Fi Direct P2P Receiver ('{current_mac_name()}')"
-    print(f"[+] {label} listening on *:{bind_port}")
+    bind_desc = f"127.0.0.1:{bind_port}" if is_p2p_proxy else f"*:{bind_port}"
+    print(f"[+] {label} listening on {bind_desc}")
     while True:
         raw, addr = sock.accept()
         try:
             peer_ip = str(addr[0]).replace("::ffff:", "")
-            if not is_p2p_proxy:
+            if is_p2p_proxy:
+                if peer_ip not in ("127.0.0.1", "localhost", "::1"):
+                    print(f"[-] Dropping non-loopback connection to internal proxy: {addr[0]}")
+                    raw.close()
+                    continue
+            else:
                 if not is_authorized_peer_ip(peer_ip):
                     print(f"[-] Dropping connection from unauthorized non-P2P address: {addr[0]}")
                     raw.close()
@@ -1295,9 +1331,27 @@ def safe_notify(message: str, title: str):
 
 args = sys.argv[1:]
 peer_override = None
-if len(args) >= 2 and args[0] == "--peer":
-    peer_override = args[1]
-    args = args[2:]
+peer_pin = None
+while args:
+    if args[0] == "--peer" and len(args) >= 2:
+        peer_override = args[1]
+        args = args[2:]
+    elif args[0] == "--pin" and len(args) >= 2:
+        peer_pin = args[1]
+        args = args[2:]
+    else:
+        break
+
+if not peer_pin:
+    pin_file = STATE_DIR / "pinned_peer_tls_fingerprint.txt"
+    if pin_file.exists():
+        try:
+            mtime = pin_file.stat().st_mtime
+            if time.time() - mtime < 60.0:
+                peer_pin = pin_file.read_text(encoding="utf-8").strip()
+            pin_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 urls = [a for a in args if a.startswith("http://") or a.startswith("https://")]
 file_args = [a for a in args if a not in urls]
@@ -1387,6 +1441,17 @@ try:
         raw.settimeout(300.0)
         with ctx.wrap_socket(raw, server_hostname=host) as s:
             s.settimeout(300.0)
+            der_cert = s.getpeercert(binary_form=True)
+            if peer_pin:
+                if not der_cert:
+                    raise ssl.SSLError("Android peer did not provide a TLS certificate")
+                import hashlib
+                actual_fp = hashlib.sha256(der_cert).hexdigest().lower()
+                expected_fp = peer_pin.replace(":", "").replace("-", "").strip().lower()
+                if actual_fp != expected_fp:
+                    print(f"[-] FATAL: Peer TLS certificate fingerprint mismatch! Expected {expected_fp}, got {actual_fp}")
+                    raise ssl.SSLError(f"Certificate fingerprint pinning failed! Expected {expected_fp}, got {actual_fp}")
+                print(f"[+] Verified peer TLS certificate fingerprint: {actual_fp}")
             f = s.makefile("rb", buffering=262144)
             disc = plistlib.dumps({"DeviceSupportFlags": 111611}, fmt=plistlib.FMT_BINARY)
             s.sendall(f"POST /Discover HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {len(disc)}\r\nConnection: keep-alive\r\n\r\n".encode() + disc)

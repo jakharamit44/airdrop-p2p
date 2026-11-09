@@ -10,17 +10,85 @@ import Darwin
 
 private let BLE_E2EE_KEY = SymmetricKey(data: SHA256.hash(data: Data("AirDropP2P-E2EE-AES256GCM-v2".utf8)))
 
-func encryptBlePayload(_ plain: Data) -> Data {
-    guard let sealed = try? AES.GCM.seal(plain, using: BLE_E2EE_KEY),
+func ensureLocalMacTlsCertFiles() {
+    let certPath = STATE_DIR.appendingPathComponent("cert.pem")
+    let keyPath = STATE_DIR.appendingPathComponent("key.pem")
+    if !FileManager.default.fileExists(atPath: certPath.path) || !FileManager.default.fileExists(atPath: keyPath.path) {
+        try? FileManager.default.createDirectory(at: STATE_DIR, withIntermediateDirectories: true)
+        _ = runProcessCapture("/usr/bin/openssl", [
+            "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+            "-keyout", keyPath.path, "-out", certPath.path,
+            "-days", "3650", "-nodes", "-subj", "/CN=airdrop"
+        ])
+    }
+}
+
+func getLocalMacTlsCertFingerprint() -> String {
+    let certPath = STATE_DIR.appendingPathComponent("cert.pem")
+    let keyPath = STATE_DIR.appendingPathComponent("key.pem")
+    if !FileManager.default.fileExists(atPath: certPath.path) || !FileManager.default.fileExists(atPath: keyPath.path) {
+        ensureLocalMacTlsCertFiles()
+    }
+    guard let pemStr = try? String(contentsOf: certPath, encoding: .utf8) else { return "" }
+    let lines = pemStr.components(separatedBy: .newlines)
+    let b64 = lines.filter { !$0.hasPrefix("-----") && !$0.isEmpty }.joined()
+    guard let der = Data(base64Encoded: b64) else { return "" }
+    let digest = SHA256.hash(data: der)
+    return digest.map { String(format: "%02x", $0) }.joined()
+}
+
+func readBleStreamLine(_ inp: InputStream, maxLen: Int = 4096) -> String? {
+    var lineBytes = Data()
+    var b: UInt8 = 0
+    while lineBytes.count < maxLen {
+        let r = inp.read(&b, maxLength: 1)
+        if r <= 0 {
+            return lineBytes.isEmpty ? nil : String(data: lineBytes, encoding: .utf8)
+        }
+        if b == UInt8(ascii: "\n") { break }
+        if b != UInt8(ascii: "\r") { lineBytes.append(b) }
+    }
+    return String(data: lineBytes, encoding: .utf8)
+}
+
+func deriveSessionKey(sharedSecret: SharedSecret) -> SymmetricKey {
+    let raw = sharedSecret.withUnsafeBytes { Data($0) }
+    var hasher = SHA256()
+    hasher.update(data: raw)
+    hasher.update(data: Data("AirDropP2P-v2-SessionKey".utf8))
+    let keyBytes = hasher.finalize()
+    return SymmetricKey(data: keyBytes)
+}
+
+func encryptAesGcm(plain: Data, using key: SymmetricKey) -> Data? {
+    guard let box = try? AES.GCM.seal(plain, using: key) else { return nil }
+    return box.combined
+}
+
+func decryptAesGcm(packet: Data, using key: SymmetricKey) -> Data? {
+    guard packet.count > 28,
+          let box = try? AES.GCM.SealedBox(combined: packet),
+          let opened = try? AES.GCM.open(box, using: key) else { return nil }
+    return opened
+}
+
+func encryptBlePayload(_ plain: Data, key: SymmetricKey? = nil) -> Data {
+    let k = key ?? BLE_E2EE_KEY
+    guard let sealed = try? AES.GCM.seal(plain, using: k),
           let combined = sealed.combined else {
         fatalError("[BLE-Security] BLE encryption failed - refusing to transmit unencrypted payload")
     }
     return combined
 }
 
-func decryptBlePayload(_ packet: Data) -> Data? {
+func decryptBlePayload(_ packet: Data, key: SymmetricKey? = nil) -> Data? {
     guard packet.count > 28 else { return nil }
+    let k = key ?? BLE_E2EE_KEY
     if let box = try? AES.GCM.SealedBox(combined: packet),
+       let opened = try? AES.GCM.open(box, using: k) {
+        return opened
+    }
+    if key != nil, let box = try? AES.GCM.SealedBox(combined: packet),
        let opened = try? AES.GCM.open(box, using: BLE_E2EE_KEY) {
         return opened
     }
@@ -368,9 +436,9 @@ func saveMacSettings(autoAccept: Bool, visible: Bool, deviceName: String, themeM
     }
 }
 
-func waitForMacUserAccept(senderName: String, fileNames: [String], totalBytes: Int64) -> Bool {
+func waitForMacUserAccept(senderName: String, fileNames: [String], totalBytes: Int64, forcePrompt: Bool = false) -> Bool {
     let settings = loadMacSettings()
-    if settings.autoAccept { return true }
+    if settings.autoAccept && !forcePrompt { return true }
 
     let reqId = UUID().uuidString
     let askFile = STATE_DIR.appendingPathComponent("pending_ask.json")
@@ -537,6 +605,7 @@ func topPreferredWifiNetwork() -> String {
 
 func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     try? FileManager.default.removeItem(at: LAN_FALLBACK_FILE)
+    try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
 
     // 1. ALWAYS unconditionally remove any ephemeral P2P network from preferred list so macOS never stays stuck or reconnects to it
     let (_, prefOut) = runProcessCapture("/usr/sbin/networksetup", ["-listpreferredwirelessnetworks", "en0"])
@@ -758,7 +827,7 @@ func currentEn0P2pIp() -> String {
     return ""
 }
 
-func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
+func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerName: String? = nil) {
     guard ssid.hasPrefix("DIRECT-"), !pass.isEmpty else {
         print("[BLE-Daemon] Rejected invalid WP2P request: SSID '\(ssid)' does not start with DIRECT-")
         _ = writeAll(out, data: Data("ERR\n".utf8))
@@ -797,6 +866,15 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
         wp2pJoinLock.unlock()
     }
 
+    let incomingPeerName = peerName ?? (loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Nearby Device")
+
+    // Gate incoming WP2P join behind user confirmation/authorization
+    if !waitForMacUserAccept(senderName: incomingPeerName, fileNames: ["5 GHz Wi-Fi Direct Connection (\(ssid))"], totalBytes: 0, forcePrompt: true) {
+        print("[BLE-Daemon] User declined incoming WP2P connection request from \(incomingPeerName)")
+        _ = writeAll(out, data: Data("ERR\n".utf8))
+        return
+    }
+
     let uploadDoneFile = STATE_DIR.appendingPathComponent("upload_completed.flag")
     try? FileManager.default.removeItem(at: uploadDoneFile)
 
@@ -815,7 +893,6 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream) {
     }
 
     saveCurrentWifiSsid()
-    let incomingPeerName = loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Nearby Device"
     writeProgressJson(
         active: true,
         direction: "Receiving",
@@ -1572,10 +1649,58 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
                 return
             }
 
+            let targetPeerName = loadActivePeersFromDisk(maxAge: 30.0).first(where: { $0.id == targetPeerId })?.name ?? "Android Peer"
+
+            if replyLine.hasPrefix("W2P2\t") {
+                let rawParts = replyLine.dropFirst(5).split(separator: "\t").map(String.init)
+                let parts = rawParts.filter { !$0.isEmpty }
+                var androidPubB64 = ""
+                var androidTlsFingerprint = ""
+                if parts.count >= 3 && (parts[0] == "2" || parts[0] == "1") {
+                    androidPubB64 = parts[1]
+                    androidTlsFingerprint = parts[2]
+                } else if parts.count == 2 && (parts[0] == "2" || parts[0] == "1") {
+                    androidPubB64 = parts[1]
+                } else if parts.count >= 2 {
+                    androidPubB64 = parts[0]
+                    androidTlsFingerprint = parts[1]
+                } else if parts.count == 1 {
+                    androidPubB64 = parts[0]
+                }
+                if !androidPubB64.isEmpty,
+                   let androidPubDer = Data(base64Encoded: androidPubB64),
+                   let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer) {
+                    if !androidTlsFingerprint.isEmpty {
+                        try? androidTlsFingerprint.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
+                    }
+                    let macPriv = P256.KeyAgreement.PrivateKey()
+                    if let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) {
+                        let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
+                        let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
+                        let macTlsFingerprint = getLocalMacTlsCertFingerprint()
+                        let reply = "OK\t\(macPubB64)\t\(macTlsFingerprint)\n"
+                        if writeAll(out, data: Data(reply.utf8)) {
+                            if let joinLine = readBleStreamLine(inp), joinLine.hasPrefix("JOIN\t") {
+                                let encB64 = String(joinLine.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                                if let encData = Data(base64Encoded: encB64),
+                                   let decData = decryptAesGcm(packet: encData, using: sessionKey),
+                                   let decStr = String(data: decData, encoding: .utf8) {
+                                    let credParts = decStr.split(separator: "\t").map(String.init)
+                                    if credParts.count >= 2 {
+                                        handleIncomingWp2pJoin(ssid: credParts[0], pass: credParts[1], out: out, peerName: targetPeerName)
+                                        return
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if replyLine.hasPrefix("WP2P\t") {
                 let parts = replyLine.dropFirst(5).split(separator: "\t").map(String.init)
                 if parts.count >= 2 {
-                    handleIncomingWp2pJoin(ssid: parts[0], pass: parts[1], out: out)
+                    handleIncomingWp2pJoin(ssid: parts[0], pass: parts[1], out: out, peerName: targetPeerName)
                     return
                 }
             }
@@ -1731,12 +1856,76 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
                 return
             }
 
+            if magic == "W2P2" {
+                guard let reqData = readExact(inp, count: metaLen),
+                      let reqStr = String(data: reqData, encoding: .utf8) else { return }
+                let rawParts = reqStr.split(separator: "\t").map(String.init)
+                let parts = rawParts.filter { !$0.isEmpty }
+                var androidPubB64 = ""
+                var androidTlsFingerprint = ""
+                if parts.count >= 3 && (parts[0] == "2" || parts[0] == "1") {
+                    androidPubB64 = parts[1]
+                    androidTlsFingerprint = parts[2]
+                } else if parts.count == 2 && (parts[0] == "2" || parts[0] == "1") {
+                    androidPubB64 = parts[1]
+                } else if parts.count >= 2 {
+                    androidPubB64 = parts[0]
+                    androidTlsFingerprint = parts[1]
+                } else if parts.count == 1 {
+                    androidPubB64 = parts[0]
+                }
+                guard !androidPubB64.isEmpty,
+                      let androidPubDer = Data(base64Encoded: androidPubB64),
+                      let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer) else {
+                    _ = writeAll(out, data: Data("ERR\n".utf8))
+                    return
+                }
+                if !androidTlsFingerprint.isEmpty {
+                    try? androidTlsFingerprint.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
+                }
+
+                let macPriv = P256.KeyAgreement.PrivateKey()
+                guard let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) else {
+                    _ = writeAll(out, data: Data("ERR\n".utf8))
+                    return
+                }
+                let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
+                let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
+                let macTlsFingerprint = getLocalMacTlsCertFingerprint()
+                let reply = "OK\t\(macPubB64)\t\(macTlsFingerprint)\n"
+                guard writeAll(out, data: Data(reply.utf8)) else { return }
+
+                guard let joinLine = readBleStreamLine(inp), joinLine.hasPrefix("JOIN\t") else {
+                    _ = writeAll(out, data: Data("ERR\n".utf8))
+                    return
+                }
+                let encB64 = String(joinLine.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let encData = Data(base64Encoded: encB64),
+                      let decData = decryptAesGcm(packet: encData, using: sessionKey),
+                      let decStr = String(data: decData, encoding: .utf8) else {
+                    print("[BLE-Daemon] Failed to decrypt encrypted WP2P credentials with ECDH session key")
+                    _ = writeAll(out, data: Data("ERR\n".utf8))
+                    return
+                }
+                let credParts = decStr.split(separator: "\t").map(String.init)
+                guard credParts.count >= 2 else {
+                    _ = writeAll(out, data: Data("ERR\n".utf8))
+                    return
+                }
+                let activePeer = loadActivePeersFromDisk(maxAge: 30.0).first
+                let pName = activePeer?.name ?? "Android Peer"
+                handleIncomingWp2pJoin(ssid: credParts[0], pass: credParts[1], out: out, peerName: pName)
+                return
+            }
+
             if magic == "WP2P" {
                 guard let credData = readExact(inp, count: metaLen),
                       let credStr = String(data: credData, encoding: .utf8) else { return }
                 let parts = credStr.split(separator: "\t").map(String.init)
                 guard parts.count >= 2 else { return }
-                handleIncomingWp2pJoin(ssid: parts[0], pass: parts[1], out: out)
+                let activePeer = loadActivePeersFromDisk(maxAge: 30.0).first
+                let pName = activePeer?.name ?? "Android Peer"
+                handleIncomingWp2pJoin(ssid: parts[0], pass: parts[1], out: out, peerName: pName)
                 return
             }
 
@@ -1985,54 +2174,91 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
 
             // 5GHz Wi-Fi Direct P2P Negotiation for large files
             if self.totalRawBytes >= 65_536 && !self.files.isEmpty {
-                self.reportSenderConnecting("Requesting 5 GHz Wi-Fi Direct group…")
-                print("[BLE-Send] Negotiating 5GHz Wi-Fi Direct P2P over BLE L2CAP...")
+                self.reportSenderConnecting("Negotiating secure 5 GHz Wi-Fi Direct…")
+                print("[BLE-Send] Negotiating 5GHz Wi-Fi Direct P2P over BLE L2CAP (ECDH P-256)...")
                 fflush(stdout)
-                if writeAll(out, data: Data("WP2P".utf8)) {
-                    var lineBytes = Data()
-                    var b: UInt8 = 0
-                    while lineBytes.count < 256 {
-                        let r = inp.read(&b, maxLength: 1)
-                        if r <= 0 || b == UInt8(ascii: "\n") { break }
-                        if b != UInt8(ascii: "\r") { lineBytes.append(b) }
-                    }
-                    let reply = String(data: lineBytes, encoding: .utf8) ?? ""
-                    if reply.hasPrefix("OK\t") {
+
+                let macPriv = P256.KeyAgreement.PrivateKey()
+                let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
+                let macCertFingerprint = getLocalMacTlsCertFingerprint()
+                var p2pCreds: (ssid: String, pass: String, host: String, port: String, peerPin: String)? = nil
+
+                // Attempt v2 ECDH negotiation first
+                try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
+                if writeAll(out, data: Data("W2P2\t\(macPubB64)\t\(macCertFingerprint)\n".utf8)) {
+                    if let reply = readBleStreamLine(inp), reply.hasPrefix("OK\t") {
                         let parts = reply.dropFirst(3).split(separator: "\t").map(String.init)
-                        if parts.count >= 4 {
-                            let ssid = parts[0], pass = parts[1], host = parts[2], port = parts[3]
-                            _ = pauseCloudflareWarpIfNeeded()
-                            saveCurrentWifiSsid()
-                            self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
-                            print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(port))...")
-                            fflush(stdout)
-
-                            func hasEn0P2pIp() -> Bool {
-                                return !currentEn0P2pIp().isEmpty
-                            }
-
-                            if !hasEn0P2pIp() {
-                                _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", "en0", ssid, pass])
-
-                                // Wait up to 10s for macOS DHCP on en0 to assign 192.168.49.x before launching HTTPS transfer
-                                let deadline = Date().addingTimeInterval(10.0)
-                                var retriedJoin = false
-                                while Date() < deadline {
-                                    if hasEn0P2pIp() { break }
-                                    if !retriedJoin && deadline.timeIntervalSinceNow < 5.5 {
-                                        retriedJoin = true
-                                        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", "en0", ssid, pass])
-                                    }
-                                    Thread.sleep(forTimeInterval: 0.2)
+                        if parts.count >= 2,
+                           let androidPubDer = Data(base64Encoded: parts[0]),
+                           let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer),
+                           let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub),
+                           let encCreds = Data(base64Encoded: parts[1]) {
+                            let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
+                            if let decData = decryptAesGcm(packet: encCreds, using: sessionKey),
+                               let decStr = String(data: decData, encoding: .utf8) {
+                                let credParts = decStr.split(separator: "\t").map(String.init)
+                                if credParts.count >= 4 {
+                                    let pin = credParts.count >= 5 ? credParts[4] : ""
+                                    p2pCreds = (credParts[0], credParts[1], credParts[2], credParts[3], pin)
                                 }
                             }
+                        }
+                    }
+                }
 
-                            self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
-                            let txProc = Process()
-                            txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
-                            txProc.environment = ProcessInfo.processInfo.environment
-                            txProc.environment?["SKIP_BLE_RESTART"] = "1"
-                            txProc.arguments = ["send", "--peer", "\(host):\(port)"] + self.files.map { $0.path } + self.urls
+                // Fallback to legacy v1 negotiation if v2 was declined or unsupported
+                if p2pCreds == nil {
+                    if writeAll(out, data: Data("WP2P\n".utf8)) {
+                        if let reply = readBleStreamLine(inp, maxLen: 512), reply.hasPrefix("OK\t") {
+                            let parts = reply.dropFirst(3).split(separator: "\t").map(String.init)
+                            if parts.count >= 4 {
+                                p2pCreds = (parts[0], parts[1], parts[2], parts[3], "")
+                            }
+                        }
+                    }
+                }
+
+                if let creds = p2pCreds {
+                    let ssid = creds.ssid, pass = creds.pass, host = creds.host, port = creds.port, peerPin = creds.peerPin
+                    if !peerPin.isEmpty {
+                        try? peerPin.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
+                    }
+                    _ = pauseCloudflareWarpIfNeeded()
+                    saveCurrentWifiSsid()
+                    self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
+                    print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(port))...")
+                    fflush(stdout)
+
+                    func hasEn0P2pIp() -> Bool {
+                        return !currentEn0P2pIp().isEmpty
+                    }
+
+                    if !hasEn0P2pIp() {
+                        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", "en0", ssid, pass])
+
+                        // Wait up to 10s for macOS DHCP on en0 to assign 192.168.49.x before launching HTTPS transfer
+                        let deadline = Date().addingTimeInterval(10.0)
+                        var retriedJoin = false
+                        while Date() < deadline {
+                            if hasEn0P2pIp() { break }
+                            if !retriedJoin && deadline.timeIntervalSinceNow < 5.5 {
+                                retriedJoin = true
+                                _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", "en0", ssid, pass])
+                            }
+                            Thread.sleep(forTimeInterval: 0.2)
+                        }
+                    }
+
+                    self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
+                    let txProc = Process()
+                    txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                    txProc.environment = ProcessInfo.processInfo.environment
+                    txProc.environment?["SKIP_BLE_RESTART"] = "1"
+                    var sendArgs = ["send", "--peer", "\(host):\(port)"]
+                    if !peerPin.isEmpty {
+                        sendArgs += ["--pin", peerPin]
+                    }
+                    txProc.arguments = sendArgs + self.files.map { $0.path } + self.urls
                             try? txProc.run()
                             txProc.waitUntilExit()
                             restoreMacInternetWifi(ssid: ssid)
@@ -2065,8 +2291,6 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                             }
                         }
                     }
-                }
-            }
 
             var payloadFrame = self.frameData
             if payloadFrame.isEmpty && !self.files.isEmpty {
@@ -4447,18 +4671,19 @@ struct MacAirDropMainView: View {
     // Incoming Ask Approval Modal
     // ========================================================================
     private func incomingAskModal(_ ask: MacPendingAsk) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let isWifiRequest = ask.totalBytes == 0 && (ask.fileNames.first?.contains("Wi-Fi Direct") == true)
+        return VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 ZStack {
                     Circle()
                         .fill(p.indigo)
                         .frame(width: 44, height: 44)
-                    Image(systemName: "arrow.down.doc.fill")
+                    Image(systemName: isWifiRequest ? "wifi" : "arrow.down.doc.fill")
                         .font(.system(size: 20, weight: .bold))
                         .foregroundColor(.white)
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Incoming Files")
+                    Text(isWifiRequest ? "Wi-Fi Direct Connection" : "Incoming Files")
                         .font(.system(size: 16, weight: .heavy))
                         .foregroundColor(p.textPrimary)
                     Text("From \(ask.senderName)")
@@ -4469,9 +4694,15 @@ struct MacAirDropMainView: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("\(ask.fileNames.count) \(ask.fileNames.count == 1 ? "file" : "files") • \(formatByteSize(ask.totalBytes))")
-                    .font(.system(size: 12, weight: .bold).monospacedDigit())
-                    .foregroundColor(p.emerald)
+                if isWifiRequest {
+                    Text("Secure Peer-to-Peer Link")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(p.emerald)
+                } else {
+                    Text("\(ask.fileNames.count) \(ask.fileNames.count == 1 ? "file" : "files") • \(formatByteSize(ask.totalBytes))")
+                        .font(.system(size: 12, weight: .bold).monospacedDigit())
+                        .foregroundColor(p.emerald)
+                }
                 ForEach(ask.fileNames.prefix(4), id: \.self) { fname in
                     Text("• \(middleTruncateMacName(fname, maxChars: 38))")
                         .font(.system(size: 12, weight: .medium))
@@ -4821,17 +5052,45 @@ final class AwdlLoopbackBridge {
     init(listenPort: UInt16 = 8774, targetPort: UInt16 = 8773) throws {
         let params = NWParameters.tcp
         params.includePeerToPeer = true
+        // Restrict port 8774 strictly to peer-to-peer (AWDL); prohibit LAN interfaces
+        params.prohibitedInterfaceTypes = [.wifi, .wiredEthernet, .cellular]
         listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: listenPort)!)
         listener.stateUpdateHandler = { state in
             print("[AWDL-Bridge] NWListener(\(listenPort) -> 127.0.0.1:\(targetPort)) state: \(state)")
             fflush(stdout)
         }
         listener.newConnectionHandler = { incoming in
+            // Reject any unauthenticated connection from LAN interfaces
+            incoming.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if let path = incoming.currentPath {
+                        let isLan = path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet) || path.usesInterfaceType(.cellular)
+                        if isLan {
+                            print("[AWDL-Bridge] Dropping unauthorized connection on LAN interface")
+                            incoming.cancel()
+                            return
+                        }
+                    }
+                    let outgoing = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: targetPort)!, using: .tcp)
+                    outgoing.stateUpdateHandler = { outState in
+                        switch outState {
+                        case .failed(_), .cancelled:
+                            incoming.cancel()
+                        default:
+                            break
+                        }
+                    }
+                    outgoing.start(queue: .global(qos: .userInitiated))
+                    Self.pump(from: incoming, to: outgoing)
+                    Self.pump(from: outgoing, to: incoming)
+                case .failed(_), .cancelled:
+                    break
+                default:
+                    break
+                }
+            }
             incoming.start(queue: .global(qos: .userInitiated))
-            let outgoing = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: targetPort)!, using: .tcp)
-            outgoing.start(queue: .global(qos: .userInitiated))
-            Self.pump(from: incoming, to: outgoing)
-            Self.pump(from: outgoing, to: incoming)
         }
         listener.start(queue: .global(qos: .userInitiated))
     }
@@ -4839,15 +5098,18 @@ final class AwdlLoopbackBridge {
     static func pump(from src: NWConnection, to dst: NWConnection) {
         src.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) { data, _, isComplete, error in
             if let d = data, !d.isEmpty {
-                dst.send(content: d, completion: .contentProcessed { _ in
-                    if !isComplete && error == nil {
+                dst.send(content: d, completion: .contentProcessed { sendErr in
+                    if sendErr != nil {
+                        src.cancel()
+                        dst.cancel()
+                    } else if !isComplete && error == nil {
                         pump(from: src, to: dst)
                     } else {
                         src.cancel()
                         dst.cancel()
                     }
                 })
-            } else if isComplete || error != nil {
+            } else {
                 src.cancel()
                 dst.cancel()
             }

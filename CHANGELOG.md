@@ -2,6 +2,16 @@
 
 All notable changes to AirDrop P2P are documented in this file.
 
+## [v2.2.0] - 2026-11-09
+
+### Security & Protocol Hardening (Phase 1)
+- **Eliminated Remote Wi-Fi Hijacking (CVE-level fix)**: Gated `handleIncomingWp2pJoin` in `mac-ble-airdrop.swift` behind mandatory explicit user confirmation (`forcePrompt: true`). Even if `autoAccept` is enabled in settings, nearby unauthorized BLE devices can no longer silently force macOS to drop its Wi-Fi connection and join a rogue access point.
+- **Ephemeral ECDH P-256 Key Exchange & AES-256-GCM Credential Encryption**: Implemented real ephemeral ECDH (`secp256r1`) key negotiation over Bluetooth LE L2CAP. Wi-Fi Direct SSIDs and WPA2 passphrases are now encrypted using ephemeral AES-256-GCM session keys, replacing plaintext transmission and static symmetric keys.
+- **TLS Certificate Fingerprint Pinning**: Self-signed TLS certificate SHA-256 fingerprints are exchanged over the authenticated BLE control channel and pinned in both Android (`AirDropNode.kt`) and macOS (`mac-airdrop-p2p.sh`), neutralizing Man-in-the-Middle (MITM) attacks and ARP spoofing.
+- **Port 8773 & 8774 Confinement**: Restricted internal proxy port 8773 strictly to loopback (`127.0.0.1`), and restricted AWDL bridge port 8774 to verify non-LAN interfaces before pumping data, preventing unauthenticated remote LAN uploads to `/tmp`.
+- **Eliminated Drive-By URL Auto-Execution**: Safe URL handling in `mac-airdrop-p2p.sh` now validates URLs with strict regex, copies them to `NSPasteboard` (`pbcopy`), and displays an interactive dialog with "Open in Browser" and "Dismiss" buttons instead of auto-spawning the web browser.
+- **10 New Cryptographic & Protocol Security Unit Tests**: Added `AirDropSecurityTest.kt` verifying P-256 keypair generation, HKDF session key derivation, AES-GCM encryption/decryption, AEAD tampering rejection, and backward-compatible versioned/unversioned `W2P2` parsing.
+
 ## [v2.1.2] - 2026-11-08
 
 ### Fixed

@@ -3,6 +3,7 @@
 ._*
 .Spotlight-V100
 .Trashes
+.codegraph/
 
 # Security, Credentials & Secrets (NEVER COMMIT)
 *.pem
