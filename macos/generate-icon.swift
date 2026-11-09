@@ -1,4 +1,5 @@
 import AppKit
+import Foundation
 
 func drawIcon(in ctx: CGContext, size: CGFloat) {
     ctx.setAllowsAntialiasing(true)
@@ -7,22 +8,22 @@ func drawIcon(in ctx: CGContext, size: CGFloat) {
     let scale = size / 1024.0
 
     // Apple macOS Icon Grid (1024 x 1024 canvas)
-    // Body: 824 x 824 centered (100 pt margins)
+    // Standard icon body: 824 x 824 centered inside 100 pt margins
     let margin: CGFloat = 100.0 * scale
     let bodySize: CGFloat = size - 2 * margin
     let iconRect = CGRect(x: margin, y: margin, width: bodySize, height: bodySize)
     let cornerRadius: CGFloat = 185.0 * scale
     let squirclePath = CGPath(roundedRect: iconRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
 
-    // 1. Drop Shadow under Squircle
+    // 1. Native macOS Drop Shadow under Squircle
     ctx.saveGState()
     ctx.setShadow(
-        offset: CGSize(width: 0, height: -18.0 * scale),
-        blur: 28.0 * scale,
-        color: NSColor.black.withAlphaComponent(0.35).cgColor
+        offset: CGSize(width: 0, height: -22.0 * scale),
+        blur: 32.0 * scale,
+        color: NSColor.black.withAlphaComponent(0.42).cgColor
     )
     ctx.addPath(squirclePath)
-    ctx.setFillColor(NSColor(red: 0.03, green: 0.05, blue: 0.10, alpha: 1.0).cgColor)
+    ctx.setFillColor(NSColor(red: 0.015, green: 0.03, blue: 0.07, alpha: 1.0).cgColor)
     ctx.fillPath()
     ctx.restoreGState()
 
@@ -33,13 +34,13 @@ func drawIcon(in ctx: CGContext, size: CGFloat) {
 
     let colorSpace = CGColorSpaceCreateDeviceRGB()
 
-    // Oceanic Deep Navy / Midnight Gradient (Sonoma/Sequoia aesthetic)
+    // Oceanic Deep Midnight / Sapphire Gradient (macOS Sequoia / Sonoma aesthetic)
     let bgColors = [
-        NSColor(red: 0.08, green: 0.14, blue: 0.28, alpha: 1.0).cgColor, // Top
-        NSColor(red: 0.04, green: 0.07, blue: 0.16, alpha: 1.0).cgColor, // Mid
-        NSColor(red: 0.02, green: 0.03, blue: 0.08, alpha: 1.0).cgColor  // Bottom
+        NSColor(red: 0.06, green: 0.13, blue: 0.29, alpha: 1.0).cgColor, // Top
+        NSColor(red: 0.027, green: 0.075, blue: 0.20, alpha: 1.0).cgColor, // Mid
+        NSColor(red: 0.008, green: 0.024, blue: 0.08, alpha: 1.0).cgColor  // Bottom
     ] as CFArray
-    let bgLocations: [CGFloat] = [0.0, 0.55, 1.0]
+    let bgLocations: [CGFloat] = [0.0, 0.52, 1.0]
     if let bgGradient = CGGradient(colorsSpace: colorSpace, colors: bgColors, locations: bgLocations) {
         ctx.drawLinearGradient(
             bgGradient,
@@ -49,39 +50,92 @@ func drawIcon(in ctx: CGContext, size: CGFloat) {
         )
     }
 
-    // Ambient Cyan/Blue Core Glow
-    let glowCenter = CGPoint(x: size / 2.0, y: size * 0.46)
-    let glowColors = [
-        NSColor(red: 0.06, green: 0.65, blue: 0.98, alpha: 0.32).cgColor,
-        NSColor(red: 0.02, green: 0.38, blue: 0.85, alpha: 0.12).cgColor,
-        NSColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0).cgColor
-    ] as CFArray
-    if let glowGradient = CGGradient(colorsSpace: colorSpace, colors: glowColors, locations: [0.0, 0.45, 1.0]) {
-        ctx.drawRadialGradient(
-            glowGradient,
-            startCenter: glowCenter,
-            startRadius: 0,
-            endCenter: glowCenter,
-            endRadius: 380.0 * scale,
-            options: []
-        )
+    let centerX = size / 2.0
+    // Optical center: slightly adjusted so 270° arc visual weight is balanced
+    let centerY = size * 0.485
+
+    // 3. Multi-layer Ambient Lighting
+    if size >= 32 {
+        // Outer diffuse cyan glow
+        let outerGlowColors = [
+            NSColor(red: 0.05, green: 0.65, blue: 1.00, alpha: 0.28).cgColor,
+            NSColor(red: 0.00, green: 0.35, blue: 0.85, alpha: 0.10).cgColor,
+            NSColor.clear.cgColor
+        ] as CFArray
+        if let outerGlow = CGGradient(colorsSpace: colorSpace, colors: outerGlowColors, locations: [0.0, 0.5, 1.0]) {
+            ctx.drawRadialGradient(
+                outerGlow,
+                startCenter: CGPoint(x: centerX, y: centerY),
+                startRadius: 0,
+                endCenter: CGPoint(x: centerX, y: centerY),
+                endRadius: 420.0 * scale,
+                options: []
+            )
+        }
+
+        // Inner core beacon glow
+        let innerGlowColors = [
+            NSColor(red: 0.40, green: 0.88, blue: 1.00, alpha: 0.45).cgColor,
+            NSColor(red: 0.08, green: 0.55, blue: 0.95, alpha: 0.15).cgColor,
+            NSColor.clear.cgColor
+        ] as CFArray
+        if let innerGlow = CGGradient(colorsSpace: colorSpace, colors: innerGlowColors, locations: [0.0, 0.4, 1.0]) {
+            ctx.drawRadialGradient(
+                innerGlow,
+                startCenter: CGPoint(x: centerX, y: centerY),
+                startRadius: 0,
+                endCenter: CGPoint(x: centerX, y: centerY),
+                endRadius: 200.0 * scale,
+                options: []
+            )
+        }
     }
 
-    // 3. AirDrop Concentric Radiating Rings
-    let centerX = size / 2.0
-    let centerY = size * 0.44
+    // 4. Concentric AirDrop Radiating Waves
+    func drawAirDropRing(
+        radius: CGFloat,
+        strokeWidth: CGFloat,
+        color: NSColor,
+        glowColor: NSColor
+    ) {
+        let sw: CGFloat
+        if size <= 16 {
+            sw = 1.3
+        } else if size <= 32 {
+            sw = 1.6
+        } else if size <= 64 {
+            sw = max(2.2, strokeWidth * scale)
+        } else {
+            sw = strokeWidth * scale
+        }
 
-    func drawRing(radius: CGFloat, strokeWidth: CGFloat, strokeColor: NSColor, startDeg: CGFloat = 32.0, endDeg: CGFloat = 148.0) {
+        // Apple AirDrop standard 270° arc with 90° bottom gap (-45° to 225°)
+        let startAngle = -45.0 * .pi / 180.0
+        let endAngle = 225.0 * .pi / 180.0
+
+        // Soft outer glow pass for larger icon representations
+        if size >= 64 {
+            ctx.saveGState()
+            ctx.setLineCap(.round)
+            ctx.setLineWidth(sw)
+            ctx.setStrokeColor(glowColor.cgColor)
+            ctx.setShadow(offset: .zero, blur: 14.0 * scale, color: glowColor.cgColor)
+            ctx.addArc(
+                center: CGPoint(x: centerX, y: centerY),
+                radius: radius * scale,
+                startAngle: startAngle,
+                endAngle: endAngle,
+                clockwise: false
+            )
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
+
+        // Crisp primary wave stroke
         ctx.saveGState()
         ctx.setLineCap(.round)
-        let effectiveWidth = max(size <= 32 ? 2.5 : 1.5, strokeWidth * scale)
-        ctx.setLineWidth(effectiveWidth)
-        ctx.setStrokeColor(strokeColor.cgColor)
-
-        // In standard AppKit coords (y=0 bottom, y=size top), angles 0=right, 90=top, 180=left.
-        // Broadcast upward: startDeg ~32 to endDeg ~148
-        let startAngle = startDeg * .pi / 180.0
-        let endAngle = endDeg * .pi / 180.0
+        ctx.setLineWidth(sw)
+        ctx.setStrokeColor(color.cgColor)
         ctx.addArc(
             center: CGPoint(x: centerX, y: centerY),
             radius: radius * scale,
@@ -91,120 +145,171 @@ func drawIcon(in ctx: CGContext, size: CGFloat) {
         )
         ctx.strokePath()
         ctx.restoreGState()
+
+        // Subtle core specular highlight centerline on Retina displays
+        if size >= 128 {
+            ctx.saveGState()
+            ctx.setLineCap(.round)
+            ctx.setLineWidth(max(1.0, 3.8 * scale))
+            ctx.setStrokeColor(NSColor(white: 1.0, alpha: 0.45).cgColor)
+            let insetAngle: CGFloat = 6.0 * .pi / 180.0
+            ctx.addArc(
+                center: CGPoint(x: centerX, y: centerY),
+                radius: radius * scale,
+                startAngle: startAngle + insetAngle,
+                endAngle: endAngle - insetAngle,
+                clockwise: false
+            )
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
     }
 
-    // Outer Arc
-    drawRing(
-        radius: 260.0,
-        strokeWidth: 30.0,
-        strokeColor: NSColor(red: 0.22, green: 0.74, blue: 0.97, alpha: 0.95),
-        startDeg: 34.0,
-        endDeg: 146.0
-    )
-    // Middle Arc
-    drawRing(
-        radius: 182.0,
-        strokeWidth: 32.0,
-        strokeColor: NSColor(red: 0.05, green: 0.65, blue: 0.95, alpha: 0.98),
-        startDeg: 30.0,
-        endDeg: 150.0
-    )
-    // Inner Arc
-    drawRing(
-        radius: 108.0,
-        strokeWidth: 34.0,
-        strokeColor: NSColor(red: 0.49, green: 0.83, blue: 0.99, alpha: 1.0),
-        startDeg: 24.0,
-        endDeg: 156.0
-    )
-
-    // Center Transmitter Pulse Beacon (Arrow/Cone pointing UP towards radiating arcs)
-    let beaconPath = CGMutablePath()
-    let tip = CGPoint(x: centerX, y: centerY + 50.0 * scale)
-    let leftBase = CGPoint(x: centerX - 36.0 * scale, y: centerY - 95.0 * scale)
-    let rightBase = CGPoint(x: centerX + 36.0 * scale, y: centerY - 95.0 * scale)
-
-    beaconPath.move(to: tip)
-    beaconPath.addLine(to: rightBase)
-    beaconPath.addQuadCurve(to: leftBase, control: CGPoint(x: centerX, y: centerY - 105.0 * scale))
-    beaconPath.closeSubpath()
-
-    ctx.saveGState()
-    ctx.addPath(beaconPath)
-    let beaconColors = [
-        NSColor(red: 0.55, green: 0.90, blue: 1.0, alpha: 1.0).cgColor,
-        NSColor(red: 0.08, green: 0.65, blue: 0.95, alpha: 1.0).cgColor
-    ] as CFArray
-    if let bGrad = CGGradient(colorsSpace: colorSpace, colors: beaconColors, locations: [0.0, 1.0]) {
-        ctx.drawLinearGradient(bGrad, start: tip, end: CGPoint(x: centerX, y: centerY - 100.0 * scale), options: [])
+    if size <= 16 {
+        // High-contrast pixel-tuned 16x16: 2 clean arcs and a center dot
+        drawAirDropRing(
+            radius: 260.0,
+            strokeWidth: 36.0,
+            color: NSColor(red: 0.35, green: 0.80, blue: 1.0, alpha: 1.0),
+            glowColor: NSColor.clear
+        )
+        drawAirDropRing(
+            radius: 140.0,
+            strokeWidth: 38.0,
+            color: NSColor(red: 0.75, green: 0.95, blue: 1.0, alpha: 1.0),
+            glowColor: NSColor.clear
+        )
+    } else if size <= 32 {
+        // High-contrast 32x32: 2 rings with crisp contrast and central node
+        drawAirDropRing(
+            radius: 270.0,
+            strokeWidth: 36.0,
+            color: NSColor(red: 0.35, green: 0.80, blue: 1.0, alpha: 1.0),
+            glowColor: NSColor.clear
+        )
+        drawAirDropRing(
+            radius: 150.0,
+            strokeWidth: 38.0,
+            color: NSColor(red: 0.75, green: 0.95, blue: 1.0, alpha: 1.0),
+            glowColor: NSColor.clear
+        )
+    } else {
+        // Standard 3 concentric wave arcs (Apple AirDrop geometry)
+        // Outer Arc
+        drawAirDropRing(
+            radius: 285.0,
+            strokeWidth: 34.0,
+            color: NSColor(red: 0.30, green: 0.76, blue: 0.98, alpha: 0.95),
+            glowColor: NSColor(red: 0.05, green: 0.60, blue: 1.00, alpha: 0.60)
+        )
+        // Middle Arc
+        drawAirDropRing(
+            radius: 195.0,
+            strokeWidth: 36.0,
+            color: NSColor(red: 0.46, green: 0.86, blue: 1.00, alpha: 0.98),
+            glowColor: NSColor(red: 0.10, green: 0.70, blue: 1.00, alpha: 0.70)
+        )
+        // Inner Arc
+        drawAirDropRing(
+            radius: 108.0,
+            strokeWidth: 38.0,
+            color: NSColor(red: 0.74, green: 0.95, blue: 1.00, alpha: 1.00),
+            glowColor: NSColor(red: 0.25, green: 0.82, blue: 1.00, alpha: 0.80)
+        )
     }
-    ctx.restoreGState()
 
-    // Center Core Pulse Dot (White core with electric cyan halo)
-    let dotRadius: CGFloat = max(size <= 32 ? 2.5 : 2.0, 18.0 * scale)
-    let dotRect = CGRect(x: centerX - dotRadius, y: centerY + 36.0 * scale - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
+    // 5. Central Radiant Beacon Orb
+    let dotRadius: CGFloat
+    if size <= 16 {
+        dotRadius = 1.2
+    } else if size <= 32 {
+        dotRadius = 1.8
+    } else {
+        dotRadius = max(2.8, 28.0 * scale)
+    }
+
     ctx.saveGState()
     ctx.setFillColor(NSColor.white.cgColor)
-    ctx.setShadow(
-        offset: .zero,
-        blur: max(2.0, 16.0 * scale),
-        color: NSColor(red: 0.40, green: 0.86, blue: 1.0, alpha: 1.0).cgColor
-    )
-    ctx.fillEllipse(in: dotRect)
+    if size >= 64 {
+        ctx.setShadow(
+            offset: .zero,
+            blur: 20.0 * scale,
+            color: NSColor(red: 0.35, green: 0.88, blue: 1.0, alpha: 1.0).cgColor
+        )
+    }
+    ctx.fillEllipse(in: CGRect(x: centerX - dotRadius, y: centerY - dotRadius, width: dotRadius * 2, height: dotRadius * 2))
     ctx.restoreGState()
 
-    // 4. Subtle Specular Highlight Rim along the squircle border
+    // 6. Subtle Specular Highlight Rim along the squircle border (Glass edge reflection)
     ctx.addPath(squirclePath)
     ctx.setLineWidth(max(1.0, 2.0 * scale))
     let rimColors = [
-        NSColor(white: 1.0, alpha: 0.28).cgColor,
+        NSColor(white: 1.0, alpha: 0.32).cgColor,
         NSColor(white: 1.0, alpha: 0.06).cgColor
     ] as CFArray
     if let rimGrad = CGGradient(colorsSpace: colorSpace, colors: rimColors, locations: [0.0, 1.0]) {
-        ctx.saveGState()
         ctx.replacePathWithStrokedPath()
         ctx.clip()
-        ctx.drawLinearGradient(rimGrad, start: CGPoint(x: size / 2, y: size - margin), end: CGPoint(x: size / 2, y: margin), options: [])
-        ctx.restoreGState()
+        ctx.drawLinearGradient(
+            rimGrad,
+            start: CGPoint(x: size / 2, y: size - margin),
+            end: CGPoint(x: size / 2, y: margin),
+            options: []
+        )
     }
 
-    ctx.restoreGState() // End Squircle Clip
+    ctx.restoreGState() // restore squircle clip
 }
 
 func renderExactPng(pixels: Int) -> Data {
-    let rep = NSBitmapImageRep(
-        bitmapDataPlanes: nil,
-        pixelsWide: pixels,
-        pixelsHigh: pixels,
-        bitsPerSample: 8,
-        samplesPerPixel: 4,
-        hasAlpha: true,
-        isPlanar: false,
-        colorSpaceName: .deviceRGB,
-        bytesPerRow: 0,
-        bitsPerPixel: 0
-    )!
-    rep.size = NSSize(width: pixels, height: pixels)
-
-    let ctx = NSGraphicsContext(bitmapImageRep: rep)!
-    NSGraphicsContext.saveGraphicsState()
-    NSGraphicsContext.current = ctx
-    let cg = ctx.cgContext
-    cg.clear(CGRect(x: 0, y: 0, width: pixels, height: pixels))
-    drawIcon(in: cg, size: CGFloat(pixels))
-    NSGraphicsContext.restoreGraphicsState()
-
-    guard let pngData = rep.representation(using: .png, properties: [:]) else {
-        fatalError("Failed to encode PNG for size \(pixels)")
+    let size = CGFloat(pixels)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+    guard let ctx = CGContext(
+        data: nil,
+        width: pixels,
+        height: pixels,
+        bitsPerComponent: 8,
+        bytesPerRow: pixels * 4,
+        space: colorSpace,
+        bitmapInfo: bitmapInfo
+    ) else {
+        fatalError("Failed to create CGContext for \(pixels)x\(pixels)")
     }
+
+    drawIcon(in: ctx, size: size)
+
+    guard let cgImage = ctx.makeImage() else {
+        fatalError("Failed to create CGImage")
+    }
+
+    let rep = NSBitmapImageRep(cgImage: cgImage)
+    guard let pngData = rep.representation(using: .png, properties: [:]) else {
+        fatalError("Failed to export PNG data")
+    }
+
     return pngData
 }
 
-let iconsetDir = URL(fileURLWithPath: "/tmp/AppIcon.iconset")
-try? FileManager.default.removeItem(at: iconsetDir)
-try FileManager.default.createDirectory(at: iconsetDir, withIntermediateDirectories: true)
+// Determine target output path for AppIcon.icns
+let fileManager = FileManager.default
+let scriptURL = URL(fileURLWithPath: CommandLine.arguments[0])
+let scriptDir = scriptURL.deletingLastPathComponent().path
+let defaultIcnsPath: String
+if fileManager.fileExists(atPath: (scriptDir as NSString).appendingPathComponent("generate-icon.swift")) {
+    defaultIcnsPath = (scriptDir as NSString).appendingPathComponent("AppIcon.icns")
+} else if fileManager.fileExists(atPath: "macos/generate-icon.swift") {
+    defaultIcnsPath = "macos/AppIcon.icns"
+} else {
+    defaultIcnsPath = (scriptDir as NSString).appendingPathComponent("AppIcon.icns")
+}
+let targetIcnsPath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : defaultIcnsPath
 
-// Apple iconset canonical resolution specifications
+let iconsetDir = URL(fileURLWithPath: "/tmp/AppIcon.iconset")
+try? fileManager.removeItem(at: iconsetDir)
+try fileManager.createDirectory(at: iconsetDir, withIntermediateDirectories: true)
+
+// Canonical 10 Apple macOS Icon Resolutions
 let iconSizes: [(String, Int)] = [
     ("icon_16x16.png", 16),
     ("icon_16x16@2x.png", 32),
@@ -219,9 +324,23 @@ let iconSizes: [(String, Int)] = [
 ]
 
 for (name, pixels) in iconSizes {
-    let png = renderExactPng(pixels: pixels)
+    let pngData = renderExactPng(pixels: pixels)
     let destURL = iconsetDir.appendingPathComponent(name)
-    try png.write(to: destURL)
+    try pngData.write(to: destURL)
 }
 
 print("[+] Successfully generated all 10 canonical resolutions in /tmp/AppIcon.iconset")
+
+// Compile iconset into ICNS using iconutil
+let process = Process()
+process.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+process.arguments = ["-c", "icns", iconsetDir.path, "-o", targetIcnsPath]
+
+try process.run()
+process.waitUntilExit()
+
+if process.terminationStatus == 0 {
+    print("[+] Successfully compiled ICNS to: \(targetIcnsPath)")
+} else {
+    fatalError("[-] iconutil failed with exit code \(process.terminationStatus)")
+}

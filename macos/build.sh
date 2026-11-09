@@ -19,6 +19,10 @@ cp -f "$SCRIPT_DIR/mac-airdrop-p2p.sh" "$APP_RES/mac-airdrop-p2p.sh"
 cp -f "$SCRIPT_DIR/claude_processor.py" "$APP_RES/claude_processor.py"
 cp -f "$SCRIPT_DIR/mac-airdrop-p2p.sh" "$HOME/.airdrop-p2p/mac-airdrop-p2p.sh"
 cp -f "$SCRIPT_DIR/claude_processor.py" "$HOME/.airdrop-p2p/claude_processor.py"
+if [ ! -f "$SCRIPT_DIR/AppIcon.icns" ]; then
+  echo "[+] Generating AppIcon.icns..."
+  swift "$SCRIPT_DIR/generate-icon.swift" "$SCRIPT_DIR/AppIcon.icns"
+fi
 if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
   cp -f "$SCRIPT_DIR/AppIcon.icns" "$APP_RES/AppIcon.icns"
   cp -f "$SCRIPT_DIR/AppIcon.icns" "$HOME/.airdrop-p2p/AppIcon.icns"
@@ -63,6 +67,14 @@ echo "[+] Sealing and signing AirDrop P2P.app bundle..."
 xattr -cr "$APP_DIR"
 codesign --force --deep --sign - "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
+
+if [ -w "/Applications" ] || [ -w "/Applications/AirDrop P2P.app" ]; then
+  echo "[+] Updating /Applications/AirDrop P2P.app..."
+  rm -rf "/Applications/AirDrop P2P.app"
+  cp -R "$APP_DIR" "/Applications/AirDrop P2P.app"
+  xattr -cr "/Applications/AirDrop P2P.app"
+  codesign --force --deep --sign - "/Applications/AirDrop P2P.app"
+fi
 
 echo "[+] AirDrop P2P.app bundle created at: $APP_DIR"
 
