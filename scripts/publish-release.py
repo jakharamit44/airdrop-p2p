@@ -56,16 +56,20 @@ Pure peer-to-peer AirDrop between macOS and all modern Android devices.
 
 print(f"[+] Publishing GitHub Release {TAG} for {OWNER}/{REPO}...")
 
-# 1. Get OAuth / PAT Token from git credential-osxkeychain
-p = subprocess.Popen(["git", "credential-osxkeychain", "get"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-out, _ = p.communicate("protocol=https\nhost=github.com\n\n")
-token = ""
-for line in out.splitlines():
-    if line.startswith("password="):
-        token = line.split("=", 1)[1].strip()
+# 1. Get OAuth / PAT Token from environment or git credential-osxkeychain
+token = os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()
+if not token:
+    try:
+        p = subprocess.Popen(["git", "credential-osxkeychain", "get"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        out, _ = p.communicate("protocol=https\nhost=github.com\n\n")
+        for line in out.splitlines():
+            if line.startswith("password="):
+                token = line.split("=", 1)[1].strip()
+    except Exception:
+        pass
 
 if not token:
-    sys.exit("[-] Failed to retrieve GitHub token from keychain")
+    sys.exit("[-] Failed to retrieve GitHub token from environment (GITHUB_TOKEN/GH_TOKEN) or osxkeychain")
 
 headers = {
     "Authorization": f"token {token}",

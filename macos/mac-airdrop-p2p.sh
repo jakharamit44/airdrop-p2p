@@ -95,6 +95,8 @@ stop_daemons() {
   fi
   pkill -f "airdrop-p2p-daemon" 2>/dev/null || true
   pkill -f "mac-ble-airdrop daemon" 2>/dev/null || true
+  pkill -x "AirDropP2P" 2>/dev/null || true
+  rm -f "$STATE_DIR/tx_in_progress.lock" "$STATE_DIR/rx_in_progress.lock" "$STATE_DIR/transfer_progress.json" "$STATE_DIR/cancel_transfer.flag" "$STATE_DIR/lan_fallback_active.flag" "$STATE_DIR/pending_ask.json" 2>/dev/null || true
 }
 
 start_daemons() {

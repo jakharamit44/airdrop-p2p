@@ -4,6 +4,15 @@ All notable changes to AirDrop P2P are documented in this file.
 
 ## [v2.2.1] - 2026-11-09
 
+### Code Cleanup, Dead Code Removal & Modernization (Phase 3)
+- **Dead Dependency & Plugin Pruning**: Stripped unused `androidx.navigation3` (`navigation3-runtime`, `navigation3-ui`, `lifecycle-viewmodel-navigation3`) and `org.jetbrains.kotlin.plugin.serialization` from Gradle configurations and version catalogs.
+- **Permission Surface Minimization**: Removed `MANAGE_EXTERNAL_STORAGE` and redundant media permissions (`READ_MEDIA_IMAGES`, `READ_MEDIA_VIDEO`, `READ_MEDIA_AUDIO`, `READ_MEDIA_VISUAL_USER_SELECTED`), relying solely on Storage Access Framework (SAF) URI grants.
+- **Android 14+ FGS Compliance**: Replaced legacy `specialUse` foreground service type with `connectedDevice` (`FOREGROUND_SERVICE_CONNECTED_DEVICE`) across manifest and service lifecycle.
+- **macOS 15 Sequoia Local Network Access**: Added `NSLocalNetworkUsageDescription` to the macOS application bundle `Info.plist` to comply with Sequoia local socket privacy controls.
+- **Production Claude AI Model Alignment**: Migrated model identifiers to valid production endpoints (`claude-3-5-sonnet-latest`, `claude-3-5-haiku-latest`, `claude-3-opus-latest`) and implemented resilient cascading fallback across active models on retirement or error.
+- **Reliable Daemon & Process Teardown**: Added `AirDropP2P` process termination and state lock file purge to `stop_daemons()` in `mac-airdrop-p2p.sh`.
+- **CI / CD Publishing Portability**: Added `GITHUB_TOKEN` and `GH_TOKEN` environment variable fallbacks in `publish-release.py` for headless automated GitHub release publishing.
+
 ### Stability, Reliability & Performance Optimization (Phase 2)
 - **Eliminated Subprocess Flooding on macOS**: Replaced periodic 1.5s/250ms `/usr/sbin/lsof` and `/sbin/ifconfig` polling loops with `getifaddrs()` kernel queries and lock freshness verification, eliminating persistent MacBook CPU wakeups and background battery drain.
 - **Dynamic Wi-Fi Hardware Interface Resolution**: Replaced hardcoded `en0` assumptions across Swift and Shell with dynamic interface discovery via `CWWiFiClient` and `networksetup -listallhardwareports` with thread-safe caching, ensuring seamless operation on Mac mini, Mac Studio, Mac Pro, and docks.

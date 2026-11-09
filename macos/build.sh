@@ -52,6 +52,8 @@ cat > "$APP_DIR/Contents/Info.plist" << PLIST
   <true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
   <string>AirDrop P2P uses Bluetooth LE L2CAP to discover and transfer files with Android devices.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>AirDrop P2P requires local network access to discover nearby devices and transfer files over high-speed Wi-Fi Direct and local sockets.</string>
 </dict>
 </plist>
 PLIST

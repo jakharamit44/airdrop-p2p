@@ -80,7 +80,7 @@ class AirDropService : Service() {
             startForeground(
                 NOTIF_ID_STATUS,
                 statusNotif,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             )
         } else {
             startForeground(NOTIF_ID_STATUS, statusNotif)

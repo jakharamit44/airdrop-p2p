@@ -3,7 +3,7 @@
 ## Public Beta Advisory
 
 > [!WARNING]
-> **Active Public Beta Stage (v2.0.0)**
+> **Active Public Beta Stage (v2.2.1)**
 > AirDrop P2P is currently in active public beta. While the core peer-to-peer transport protocols (BLE L2CAP, 5GHz Wi-Fi Direct, TLS 1.3) are functional and hardened, protocol edge cases are being actively discovered and resolved.
 > 
 > * Do not use for transferring highly sensitive or unencrypted regulated data in hostile RF environments.
@@ -16,8 +16,8 @@
 
 | Version | Supported | Status |
 | :--- | :--- | :--- |
-| **2.0.x** | :white_check_mark: | Active Beta |
-| < 2.0.0 | :x: | Deprecated (Unsupported) |
+| **2.2.x** | :white_check_mark: | Active Beta |
+| < 2.2.0 | :x: | Deprecated (Unsupported) |
 
 ---
 

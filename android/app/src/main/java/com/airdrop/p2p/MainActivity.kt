@@ -479,9 +479,6 @@ fun AirDropScreen(
             if (Build.VERSION.SDK_INT >= 33) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
                 add(Manifest.permission.NEARBY_WIFI_DEVICES)
-                add(Manifest.permission.READ_MEDIA_IMAGES)
-                add(Manifest.permission.READ_MEDIA_VIDEO)
-                add(Manifest.permission.READ_MEDIA_AUDIO)
             } else {
                 add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }

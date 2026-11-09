@@ -22,9 +22,9 @@ import urllib.error
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-haiku-4-5")
-FALLBACK_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-sonnet-5-5"]
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-3-5-haiku-latest")
+FALLBACK_MODELS = ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-opus-latest"]
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 # Note: In Anthropic's Messages API specification, "2023-06-01" is the canonical protocol version identifier
 # required by the /v1/messages endpoint. Modern capabilities (caching, PDFs, fast reasoning)
@@ -128,9 +128,18 @@ def call_claude_api(
             return "\n\n".join(text_blocks).strip()
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        if ("not_found_error" in err_body or "retired" in err_body.lower() or e.code == 404) and model != FALLBACK_MODELS[0]:
-            print(f"[Claude-AI] Configured model '{model}' is retired or unavailable. Retrying with active model '{FALLBACK_MODELS[0]}'...")
-            return call_claude_api(messages, system_prompt, model=FALLBACK_MODELS[0], max_tokens=max_tokens, api_key=key)
+        if "not_found_error" in err_body or "retired" in err_body.lower() or e.code == 404:
+            next_model = None
+            if model in FALLBACK_MODELS:
+                idx = FALLBACK_MODELS.index(model)
+                if idx + 1 < len(FALLBACK_MODELS):
+                    next_model = FALLBACK_MODELS[idx + 1]
+            elif FALLBACK_MODELS:
+                next_model = FALLBACK_MODELS[0]
+
+            if next_model:
+                print(f"[Claude-AI] Configured model '{model}' is retired or unavailable. Retrying with active model '{next_model}'...")
+                return call_claude_api(messages, system_prompt, model=next_model, max_tokens=max_tokens, api_key=key)
         raise RuntimeError(f"Claude API HTTP {e.code}: {err_body}")
     except Exception as e:
         raise RuntimeError(f"Claude API request failed: {e}")
@@ -217,7 +226,7 @@ def analyze_text_file(file_path: Path, api_key: Optional[str] = None) -> str:
 
     user_text = f"File: {file_path.name}\n\n```\n{sample}\n```"
     if truncated:
-        user_text += "\n\n*(Note: Input truncated to first 100,000 characters)*"
+        user_text += f"\n\n*(Note: Input truncated to first {MAX_TEXT_CHARS:,} characters)*"
 
     messages = [{"role": "user", "content": user_text}]
     return call_claude_api(messages, system_prompt, model=DEFAULT_MODEL, max_tokens=2048, api_key=api_key)
