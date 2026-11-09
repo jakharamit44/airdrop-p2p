@@ -236,4 +236,45 @@ class AirDropSecurityTest {
         val remainder = buf.toString(StandardCharsets.ISO_8859_1.name())
         assertEquals("\tMEYCIQ...\tdeadbeef1234", remainder)
     }
+
+    @Test
+    fun encryptedBleArchiveLengthCapRejectsOversizedBuffers() {
+        // Valid bounds: Encrypted BLE (ADRE) with 30 MB is allowed
+        assertTrue(AirDropNode.isValidBleFrameBounds(512, 30_000_000, isEncryptedBle = true))
+
+        // Rejection: Encrypted BLE (ADRE) with 30 MB + 1 byte must be rejected to prevent JVM OOM
+        assertFalse(AirDropNode.isValidBleFrameBounds(512, 30_000_001, isEncryptedBle = true))
+
+        // Rejection: Encrypted BLE (ADRE) with 1.8 GB must be rejected
+        assertFalse(AirDropNode.isValidBleFrameBounds(512, 1_800_000_000, isEncryptedBle = true))
+
+        // Boundary tests for metaLen
+        assertFalse(AirDropNode.isValidBleFrameBounds(0, 1024, isEncryptedBle = true))
+        assertFalse(AirDropNode.isValidBleFrameBounds(-1, 1024, isEncryptedBle = true))
+        assertTrue(AirDropNode.isValidBleFrameBounds(AirDropNode.MAX_BLE_META_BYTES, 1024, isEncryptedBle = true))
+        assertFalse(AirDropNode.isValidBleFrameBounds(AirDropNode.MAX_BLE_META_BYTES + 1, 1024, isEncryptedBle = true))
+
+        // Negative archive length rejection
+        assertFalse(AirDropNode.isValidBleFrameBounds(512, -1, isEncryptedBle = true))
+
+        // Unencrypted BLE (ADRP) streaming bounds
+        assertTrue(AirDropNode.isValidBleFrameBounds(512, 50_000_000, isEncryptedBle = false))
+        assertTrue(AirDropNode.isValidBleFrameBounds(512, 1_800_000_000, isEncryptedBle = false))
+        assertFalse(AirDropNode.isValidBleFrameBounds(512, 1_800_000_001, isEncryptedBle = false))
+    }
+
+    @Test
+    fun multiFileStagingCalculatesAggregateSize() {
+        val testSizes = listOf(4_500_000L, 3_200_000L, 45_000_000L)
+        val aggregateBytes = AirDropNode.calculateAggregateStagedBytes(testSizes)
+        assertEquals(52_700_000L, aggregateBytes)
+
+        // Robustness: Negative sizes from non-seekable streams (-1L) are coerced to 0L without skewing total
+        val mixedSizes = listOf(10_000_000L, -1L, 5_000_000L)
+        assertEquals(15_000_000L, AirDropNode.calculateAggregateStagedBytes(mixedSizes))
+
+        // Multi-file label formatting
+        assertEquals("photo.jpg", AirDropNode.formatMultiFileDisplayLabel("photo.jpg", 1))
+        assertEquals("photo.jpg (+2 more)", AirDropNode.formatMultiFileDisplayLabel("photo.jpg", 3))
+    }
 }

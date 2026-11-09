@@ -175,11 +175,12 @@ func currentMacLanIp() -> String {
     var ifaddr: UnsafeMutablePointer<ifaddrs>?
     guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return "" }
     defer { freeifaddrs(ifaddr) }
+    let wifiIface = getWifiInterfaceName()
     for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
         let flags = Int32(ptr.pointee.ifa_flags)
         if (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) {
             let name = String(cString: ptr.pointee.ifa_name)
-            if name == "en0" || name.starts(with: "en") {
+            if name == wifiIface || name.starts(with: "en") {
                 guard let sa = ptr.pointee.ifa_addr else { continue }
                 if sa.pointee.sa_family == UInt8(AF_INET) {
                     var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
@@ -216,8 +217,26 @@ func runProcessCapture(_ executablePath: String, _ arguments: [String]) -> (Int3
 }
 
 func hasActiveTcpReceiverConnection() -> Bool {
-    let (_, out) = runProcessCapture("/usr/sbin/lsof", ["-n", "-P", "-iTCP:8772"])
-    return out.contains("ESTABLISHED")
+    let rxLock = STATE_DIR.appendingPathComponent("rx_in_progress.lock")
+    guard FileManager.default.fileExists(atPath: rxLock.path) else { return false }
+    let now = Date().timeIntervalSince1970
+    var isActive = false
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: rxLock.path),
+       let mtime = attrs[.modificationDate] as? Date {
+        if now - mtime.timeIntervalSince1970 < 30.0 { isActive = true }
+    }
+    if !isActive, let content = try? String(contentsOf: rxLock, encoding: .utf8) {
+        let parts = content.split(separator: "\t")
+        if parts.count >= 3, let ts = Double(parts[2]) {
+            if (now - ts) < 30.0 { isActive = true }
+        }
+    }
+    if !isActive {
+        // Lock file is stale (> 30s old) - remove to prevent false positives and unblock radio operations
+        try? FileManager.default.removeItem(at: rxLock)
+        return false
+    }
+    return true
 }
 
 func formatByteSize(_ bytes: Int64) -> String {
@@ -569,8 +588,43 @@ func resumeCloudflareWarpIfNeeded() {
     fflush(stdout)
 }
 
+private var _cachedWifiInterface: String? = nil
+
+func getWifiInterfaceName() -> String {
+    if let cached = _cachedWifiInterface, !cached.isEmpty {
+        return cached
+    }
+    if let name = CWWiFiClient.shared().interface()?.interfaceName, !name.isEmpty {
+        _cachedWifiInterface = name
+        return name
+    }
+    if let names = CWWiFiClient.shared().interfaceNames(), let first = names.first, !first.isEmpty {
+        _cachedWifiInterface = first
+        return first
+    }
+    let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-listallhardwareports"])
+    let lines = out.components(separatedBy: "\n")
+    var isWifiPort = false
+    for line in lines {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("Hardware Port:") {
+            let portName = trimmed.replacingOccurrences(of: "Hardware Port:", with: "").trimmingCharacters(in: .whitespaces).lowercased()
+            isWifiPort = portName.contains("wi-fi") || portName.contains("airport")
+        } else if isWifiPort && trimmed.hasPrefix("Device:") {
+            let dev = trimmed.replacingOccurrences(of: "Device:", with: "").trimmingCharacters(in: .whitespaces)
+            if !dev.isEmpty {
+                _cachedWifiInterface = dev
+                return dev
+            }
+        }
+    }
+    _cachedWifiInterface = "en0"
+    return "en0"
+}
+
 func currentWifiSsid() -> String {
-    let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-getairportnetwork", "en0"])
+    let iface = getWifiInterfaceName()
+    let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-getairportnetwork", iface])
     if out.contains("Current Wi-Fi Network: ") {
         let name = out.components(separatedBy: "Current Wi-Fi Network: ").last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !name.isEmpty && !name.hasPrefix("DIRECT-") && !name.contains("not associated") {
@@ -593,7 +647,8 @@ func saveCurrentWifiSsid() {
 }
 
 func topPreferredWifiNetwork() -> String {
-    let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-listpreferredwirelessnetworks", "en0"])
+    let iface = getWifiInterfaceName()
+    let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-listpreferredwirelessnetworks", iface])
     for line in out.split(separator: "\n") {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty && !trimmed.hasPrefix("Preferred networks") && !trimmed.hasPrefix("DIRECT-") {
@@ -607,68 +662,89 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     try? FileManager.default.removeItem(at: LAN_FALLBACK_FILE)
     try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
 
+    let iface = getWifiInterfaceName()
     // 1. ALWAYS unconditionally remove any ephemeral P2P network from preferred list so macOS never stays stuck or reconnects to it
-    let (_, prefOut) = runProcessCapture("/usr/sbin/networksetup", ["-listpreferredwirelessnetworks", "en0"])
+    let (_, prefOut) = runProcessCapture("/usr/sbin/networksetup", ["-listpreferredwirelessnetworks", iface])
     for net in prefOut.components(separatedBy: "\n") {
         let trimmed = net.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("DIRECT-") {
-            _ = runProcessCapture("/usr/sbin/networksetup", ["-removepreferredwirelessnetwork", "en0", trimmed])
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-removepreferredwirelessnetwork", iface, trimmed])
         }
     }
 
-    func en0HasNormalIpv4() -> Bool {
-        let (_, outStr) = runProcessCapture("/sbin/ifconfig", ["en0"])
-        if outStr.contains("inet 192.168.49.") { return false }
-        return outStr.contains("inet 192.168.") || outStr.contains("inet 10.") || outStr.contains("inet 172.")
+    func wifiHasNormalIpv4() -> Bool {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return false }
+        defer { freeifaddrs(ifaddr) }
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(ptr.pointee.ifa_flags)
+            if (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) {
+                let name = String(cString: ptr.pointee.ifa_name)
+                if name == iface {
+                    guard let sa = ptr.pointee.ifa_addr else { continue }
+                    if sa.pointee.sa_family == UInt8(AF_INET) {
+                        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                        if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 {
+                            let ip = String(cString: hostname)
+                            if ip.starts(with: "192.168.49.") { return false }
+                            if ip.starts(with: "192.168.") || ip.starts(with: "10.") || ip.starts(with: "172.") {
+                                return true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false
     }
 
-    // 2. Check if en0 is already back on normal Wi-Fi
-    if en0HasNormalIpv4() {
-        print("[BLE-Daemon] en0 connected to normal Wi-Fi. P2P removed from preferred list.")
+    // 2. Check if iface is already back on normal Wi-Fi
+    if wifiHasNormalIpv4() {
+        print("[BLE-Daemon] \(iface) connected to normal Wi-Fi. P2P removed from preferred list.")
         fflush(stdout)
         try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
         resumeCloudflareWarpIfNeeded()
         return
     }
 
-    print("[BLE-Daemon] Restoring Mac Internet Wi-Fi (disconnecting P2P)...")
+    print("[BLE-Daemon] Restoring Mac Internet Wi-Fi (disconnecting P2P on \(iface))...")
     fflush(stdout)
 
     // 3. Resolve target home network to restore
     let savedSsid = (try? String(contentsOf: PREV_WIFI_FILE, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let targetSsid = (!savedSsid.isEmpty && !savedSsid.hasPrefix("DIRECT-")) ? savedSsid : topPreferredWifiNetwork()
 
-    // 4. Disassociate en0 using CoreWLAN to cleanly detach from P2P
-    if let iface = CWWiFiClient.shared().interface(withName: "en0") {
-        iface.disassociate()
+    // 4. Disassociate iface using CoreWLAN to cleanly detach from P2P
+    if let cwIface = CWWiFiClient.shared().interface(withName: iface) ?? CWWiFiClient.shared().interface() {
+        cwIface.disassociate()
     }
     Thread.sleep(forTimeInterval: 1.5)
 
     // 5. If target network is known and not yet reconnected, reassociate
     let activeNow = currentWifiSsid()
     if activeNow.isEmpty && !targetSsid.isEmpty {
-        print("[BLE-Daemon] Fast-reassociating en0 to home Wi-Fi '\(targetSsid)'...")
+        print("[BLE-Daemon] Fast-reassociating \(iface) to home Wi-Fi '\(targetSsid)'...")
         fflush(stdout)
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", "en0", targetSsid])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", iface, targetSsid])
     }
 
-    // 6. Wait synchronously up to 4.5s for en0 to obtain normal Wi-Fi IPv4 before resuming WARP
+    // 6. Wait synchronously up to 4.5s for iface to obtain normal Wi-Fi IPv4 before resuming WARP
     let waitDeadline = Date().addingTimeInterval(4.5)
     while Date() < waitDeadline {
-        if en0HasNormalIpv4() { break }
+        if wifiHasNormalIpv4() { break }
         Thread.sleep(forTimeInterval: 0.25)
     }
 
-    // 7. Fallback safety verification: only cycle power if en0 is still wedged without valid IPv4
-    if !en0HasNormalIpv4() {
-        print("[BLE-Daemon] Network did not reassociate automatically — power cycling radio as fallback...")
+    // 7. Fallback safety verification: only cycle power if iface is still wedged without valid IPv4
+    if !wifiHasNormalIpv4() {
+        print("[BLE-Daemon] Network did not reassociate automatically — power cycling radio on \(iface) as fallback...")
         fflush(stdout)
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportpower", "en0", "off"])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportpower", iface, "off"])
         Thread.sleep(forTimeInterval: 0.3)
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportpower", "en0", "on"])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportpower", iface, "on"])
         let cycleDeadline = Date().addingTimeInterval(4.0)
         while Date() < cycleDeadline {
-            if en0HasNormalIpv4() { break }
+            if wifiHasNormalIpv4() { break }
             Thread.sleep(forTimeInterval: 0.25)
         }
     }
@@ -815,17 +891,33 @@ func writeAll(
 private let wp2pJoinLock = NSLock()
 private var wp2pJoinActive = false
 
-func currentEn0P2pIp() -> String {
-    let (_, outStr) = runProcessCapture("/sbin/ifconfig", ["en0"])
-    for line in outStr.split(separator: "\n") {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("inet 192.168.49.") {
-            let toks = trimmed.split(separator: " ")
-            if toks.count >= 2 { return String(toks[1]) }
+func currentWifiP2pIp() -> String {
+    var ifaddr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return "" }
+    defer { freeifaddrs(ifaddr) }
+    let wifiIface = getWifiInterfaceName()
+    for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+        let flags = Int32(ptr.pointee.ifa_flags)
+        if (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) {
+            let name = String(cString: ptr.pointee.ifa_name)
+            if name == wifiIface {
+                guard let sa = ptr.pointee.ifa_addr else { continue }
+                if sa.pointee.sa_family == UInt8(AF_INET) {
+                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 {
+                        let ip = String(cString: hostname)
+                        if ip.starts(with: "192.168.49.") {
+                            return ip
+                        }
+                    }
+                }
+            }
         }
     }
     return ""
 }
+
+func currentEn0P2pIp() -> String { currentWifiP2pIp() }
 
 func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerName: String? = nil) {
     guard ssid.hasPrefix("DIRECT-"), !pass.isEmpty else {
@@ -885,7 +977,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         let lanIp = currentMacLanIp()
         if !lanIp.isEmpty {
             try? String(Date().timeIntervalSince1970).write(to: LAN_FALLBACK_FILE, atomically: true, encoding: .utf8)
-            print("[BLE-Daemon] WARP switch locked; keeping en0 on LAN (\(lanIp)) for Split-Tunnel transfer")
+            print("[BLE-Daemon] WARP switch locked; keeping Wi-Fi on LAN (\(lanIp)) for Split-Tunnel transfer")
             fflush(stdout)
             _ = writeAll(out, data: Data("OK \(lanIp)\n".utf8))
             return
@@ -906,18 +998,19 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     print("[BLE-Daemon] Incoming WP2P 5GHz Wi-Fi Direct request: joining \(ssid)...")
     fflush(stdout)
 
-    var macP2pIp = currentEn0P2pIp()
+    let wifiIface = getWifiInterfaceName()
+    var macP2pIp = currentWifiP2pIp()
     if macP2pIp.isEmpty {
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", "en0", ssid, pass])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
 
         let deadline = Date().addingTimeInterval(12.0)
         var retriedJoin = false
         while Date() < deadline {
-            macP2pIp = currentEn0P2pIp()
+            macP2pIp = currentWifiP2pIp()
             if !macP2pIp.isEmpty { break }
             if !retriedJoin && deadline.timeIntervalSinceNow < 6.0 {
                 retriedJoin = true
-                _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", "en0", ssid, pass])
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
             }
             Thread.sleep(forTimeInterval: 0.2)
         }
@@ -949,7 +1042,6 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
 
     let askFile = STATE_DIR.appendingPathComponent("pending_ask.json")
     let txFile = STATE_DIR.appendingPathComponent("transfer_progress.json")
-    let rxLock = STATE_DIR.appendingPathComponent("rx_in_progress.lock")
 
     // Phase 1: Wait up to 30s for the peer to initiate the HTTPS transfer
     let startDeadline = Date().addingTimeInterval(30.0)
@@ -957,7 +1049,6 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     while Date() < startDeadline {
         let detected = autoreleasepool { () -> Bool in
             if FileManager.default.fileExists(atPath: askFile.path) ||
-               FileManager.default.fileExists(atPath: rxLock.path) ||
                hasActiveTcpReceiverConnection() {
                 return true
             }
@@ -1014,20 +1105,6 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
             let isAsk = FileManager.default.fileExists(atPath: askFile.path)
             let now = Date().timeIntervalSince1970
 
-            var isRxLockActive = false
-            if FileManager.default.fileExists(atPath: rxLock.path) {
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: rxLock.path),
-                   let mtime = attrs[.modificationDate] as? Date {
-                    if now - mtime.timeIntervalSince1970 < 30.0 { isRxLockActive = true }
-                }
-                if !isRxLockActive, let content = try? String(contentsOf: rxLock, encoding: .utf8) {
-                    let parts = content.split(separator: "\t")
-                    if parts.count >= 3, let ts = Double(parts[2]) {
-                        if (now - ts) < 30.0 { isRxLockActive = true }
-                    }
-                }
-            }
-
             var isProgressActive = false
             if let data = try? Data(contentsOf: txFile),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1038,7 +1115,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
 
             let isActiveTcp = hasActiveTcpReceiverConnection()
 
-            if isAsk || isRxLockActive || isProgressActive || isActiveTcp {
+            if isAsk || isProgressActive || isActiveTcp {
                 lastActivity = Date()
                 idleCount = 0
             } else if Date().timeIntervalSince(lastActivity) > 30.0 {
@@ -1504,10 +1581,8 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
     func pingPeerIfNeeded() {
         let now = Date().timeIntervalSince1970
         let txLock = STATE_DIR.appendingPathComponent("tx_in_progress.lock")
-        let rxLock = STATE_DIR.appendingPathComponent("rx_in_progress.lock")
         let txProgress = STATE_DIR.appendingPathComponent("transfer_progress.json")
         if FileManager.default.fileExists(atPath: txLock.path) ||
-           FileManager.default.fileExists(atPath: rxLock.path) ||
            FileManager.default.fileExists(atPath: txProgress.path) ||
            hasActiveTcpReceiverConnection() {
             if cm.state == .poweredOn && cm.isScanning {
@@ -2229,21 +2304,22 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                     print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(port))...")
                     fflush(stdout)
 
-                    func hasEn0P2pIp() -> Bool {
-                        return !currentEn0P2pIp().isEmpty
+                    let wifiIface = getWifiInterfaceName()
+                    func hasWifiP2pIp() -> Bool {
+                        return !currentWifiP2pIp().isEmpty
                     }
 
-                    if !hasEn0P2pIp() {
-                        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", "en0", ssid, pass])
+                    if !hasWifiP2pIp() {
+                        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
 
-                        // Wait up to 10s for macOS DHCP on en0 to assign 192.168.49.x before launching HTTPS transfer
+                        // Wait up to 10s for macOS DHCP on Wi-Fi interface to assign 192.168.49.x before launching HTTPS transfer
                         let deadline = Date().addingTimeInterval(10.0)
                         var retriedJoin = false
                         while Date() < deadline {
-                            if hasEn0P2pIp() { break }
+                            if hasWifiP2pIp() { break }
                             if !retriedJoin && deadline.timeIntervalSinceNow < 5.5 {
                                 retriedJoin = true
-                                _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", "en0", ssid, pass])
+                                _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
                             }
                             Thread.sleep(forTimeInterval: 0.2)
                         }
@@ -2781,7 +2857,8 @@ final class MacAirDropViewModel: ObservableObject {
             bluetoothPoweredOn = (cmState != .poweredOff)
         }
 
-        let wifiOn = CWWiFiClient.shared().interface(withName: "en0")?.powerOn() ?? true
+        let wifiDev = getWifiInterfaceName()
+        let wifiOn = (CWWiFiClient.shared().interface(withName: wifiDev) ?? CWWiFiClient.shared().interface())?.powerOn() ?? true
         if wifiPoweredOn != wifiOn {
             wifiPoweredOn = wifiOn
         }
@@ -2916,10 +2993,11 @@ final class MacAirDropViewModel: ObservableObject {
     }
 
     func enableMacWifi() {
+        let wifiDev = getWifiInterfaceName()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
-            p.arguments = ["-setairportpower", "en0", "on"]
+            p.arguments = ["-setairportpower", wifiDev, "on"]
             try? p.run()
             p.waitUntilExit()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
@@ -4976,9 +5054,10 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func stopAllDaemonsAndQuit() {
-        guard !isShuttingDown else { return }
-        isShuttingDown = true
+    private func performCleanShutdown() {
+        restoreMacInternetWifi()
+        resumeCloudflareWarpIfNeeded()
+        BleAirDropDaemon.shared?.stopAdvertisingAndScanning()
         for pf in ["daemon.pid", "mdns.pid", "awdl-mdns.pid"] {
             let f = STATE_DIR.appendingPathComponent(pf)
             if let s = try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
@@ -4987,9 +5066,23 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
             }
             try? FileManager.default.removeItem(at: f)
         }
-        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("ble-daemon.pid"))
-        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("transfer_progress.json"))
-        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+        for cleanupFile in [
+            "ble-daemon.pid",
+            "transfer_progress.json",
+            "tx_in_progress.lock",
+            "rx_in_progress.lock",
+            "cancel_transfer.flag",
+            "lan_fallback_active.flag",
+            "pending_ask.json"
+        ] {
+            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent(cleanupFile))
+        }
+    }
+
+    private func stopAllDaemonsAndQuit() {
+        guard !isShuttingDown else { return }
+        isShuttingDown = true
+        performCleanShutdown()
         NSApp.terminate(nil)
     }
 
@@ -5012,15 +5105,10 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        for pf in ["daemon.pid", "mdns.pid", "awdl-mdns.pid"] {
-            let f = STATE_DIR.appendingPathComponent(pf)
-            if let s = try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-               let pid = Int32(s) {
-                kill(pid, SIGTERM)
-            }
-            try? FileManager.default.removeItem(at: f)
+        if !isShuttingDown {
+            isShuttingDown = true
+            performCleanShutdown()
         }
-        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("ble-daemon.pid"))
     }
 
     @objc func sendFinderSelection() {

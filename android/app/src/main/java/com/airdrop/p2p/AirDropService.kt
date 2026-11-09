@@ -181,9 +181,7 @@ class AirDropService : Service() {
         wakeLock = null
         instance?.onTransferProgress = null
         instance?.onItemReceived = null
-        if (instance?.isTransferInProgress != true) {
-            instance?.stop()
-        }
+        instance?.stop()
         runCatching {
             val nm = getSystemService(NotificationManager::class.java)
             nm.cancelAll()

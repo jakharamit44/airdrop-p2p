@@ -126,7 +126,7 @@ start_daemons() {
 
   # Start HTTPS AirDrop 1.0 receiver (8772) + Native Finder AirDrop Android proxy (8773)
   nohup python3 -u - "$STATE_DIR/cert.pem" "$STATE_DIR/key.pem" "$PORT" "$PROXY_PORT" "$SCRIPT_DIR/mac-airdrop-p2p.sh" >"$LOG_FILE" 2>&1 << 'PYEOF' &
-import gzip, io, json, os, plistlib, re, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, uuid, zlib
+import gzip, io, json, os, plistlib, queue, re, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, uuid, zlib
 from pathlib import Path
 
 CERT_FILE, KEY_FILE, PORT, PROXY_PORT, SCRIPT_PATH = (
@@ -137,6 +137,78 @@ CERT_FILE, KEY_FILE, PORT, PROXY_PORT, SCRIPT_PATH = (
     sys.argv[5],
 )
 STATE_DIR = Path(CERT_FILE).parent
+
+_CACHED_WIFI_IFACE = None
+
+def get_wifi_interface() -> str:
+    global _CACHED_WIFI_IFACE
+    if _CACHED_WIFI_IFACE:
+        return _CACHED_WIFI_IFACE
+    try:
+        out = subprocess.check_output(["/usr/sbin/networksetup", "-listallhardwareports"], text=True, stderr=subprocess.DEVNULL)
+        lines = out.splitlines()
+        is_wifi = False
+        for line in lines:
+            line_str = line.strip()
+            if line_str.startswith("Hardware Port:"):
+                port = line_str.split(":", 1)[1].strip().lower()
+                is_wifi = ("wi-fi" in port or "airport" in port)
+            elif is_wifi and line_str.startswith("Device:"):
+                dev = line_str.split(":", 1)[1].strip()
+                if dev:
+                    _CACHED_WIFI_IFACE = dev
+                    return dev
+    except Exception:
+        pass
+    _CACHED_WIFI_IFACE = "en0"
+    return "en0"
+
+CLAUDE_QUEUE = queue.Queue(maxsize=128)
+
+def _claude_processor_worker():
+    while True:
+        try:
+            item = CLAUDE_QUEUE.get()
+            if item is None:
+                break
+            claude_script, target_path = item
+            proc = None
+            try:
+                proc = subprocess.Popen([sys.executable, str(claude_script), str(target_path)],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                if proc:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                CLAUDE_QUEUE.task_done()
+        except Exception:
+            pass
+
+for _ in range(2):
+    threading.Thread(target=_claude_processor_worker, daemon=True).start()
+
+def enqueue_claude_processing(file_path: Path):
+    try:
+        candidates = [
+            Path(SCRIPT_PATH).resolve().parent / "claude_processor.py",
+            Path(SCRIPT_PATH).resolve().parent.parent / "macos" / "claude_processor.py",
+            STATE_DIR / "claude_processor.py",
+        ]
+        claude_py = next((p for p in candidates if p.exists()), None)
+        if claude_py:
+            try:
+                CLAUDE_QUEUE.put_nowait((claude_py, file_path))
+            except queue.Full:
+                print(f"[-] Claude processor queue full; skipping background processing for {file_path.name}")
+    except Exception:
+        pass
 DOWNLOADS = Path.home() / "Downloads"
 try:
     DEFAULT_MAC_NAME = subprocess.check_output(["scutil", "--get", "ComputerName"], text=True).strip() or "MacBook Pro"
@@ -340,28 +412,29 @@ def restore_internet_wifi():
                 target_ssid = prev_file.read_text(encoding="utf-8").strip()
             except Exception:
                 pass
+        wifi_iface = get_wifi_interface()
         # 1. Remove ephemeral P2P networks from preferred list so macOS never reconnects to them
         try:
-            pref_out = subprocess.check_output(["/usr/sbin/networksetup", "-listpreferredwirelessnetworks", "en0"], text=True, stderr=subprocess.DEVNULL)
+            pref_out = subprocess.check_output(["/usr/sbin/networksetup", "-listpreferredwirelessnetworks", wifi_iface], text=True, stderr=subprocess.DEVNULL)
             for line in pref_out.splitlines():
                 s = line.strip()
                 if s.startswith("DIRECT-"):
-                    subprocess.run(["/usr/sbin/networksetup", "-removepreferredwirelessnetwork", "en0", s], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                    subprocess.run(["/usr/sbin/networksetup", "-removepreferredwirelessnetwork", wifi_iface, s], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 elif not target_ssid and not s.startswith("Preferred networks"):
                     target_ssid = s
         except Exception:
             pass
         # 2. Fast reassociation directly to preferred home network without cycling card power
         if target_ssid and not target_ssid.startswith("DIRECT-"):
-            subprocess.run(["/usr/sbin/networksetup", "-setairportnetwork", "en0", target_ssid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            subprocess.run(["/usr/sbin/networksetup", "-setairportnetwork", wifi_iface, target_ssid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         else:
             subprocess.run(
-                ["/usr/sbin/networksetup", "-setairportpower", "en0", "off"],
+                ["/usr/sbin/networksetup", "-setairportpower", wifi_iface, "off"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
             )
             time.sleep(0.3)
             subprocess.run(
-                ["/usr/sbin/networksetup", "-setairportpower", "en0", "on"],
+                ["/usr/sbin/networksetup", "-setairportpower", wifi_iface, "on"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
             )
         if prev_file.exists():
@@ -830,7 +903,7 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
         if now - last_touch[0] >= 1.0:
             last_touch[0] = now
             try:
-                tmp_lock = STATE_DIR / "rx_in_progress.lock.tmp"
+                tmp_lock = STATE_DIR / f"rx_in_progress.lock.{threading.get_ident()}.tmp"
                 tmp_lock.write_text(f"{os.getpid()}\tactive\t{now}")
                 tmp_lock.replace(rx_lock)
             except Exception:
@@ -906,6 +979,8 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
             pass
 
     try:
+        if not is_p2p_proxy:
+            touch_rx_lock()
         conn.settimeout(30.0)
         f = conn.makefile("rb", buffering=1048576)
         while True:
@@ -1065,15 +1140,8 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                         print(f"[+] Saved to {p} ({sz} B)")
                         append_history("FILE", str(p), sz, "received", last_sender)
                         safe_notify(f"Saved {p.name} to Downloads", f"AirDrop from {last_sender}")
-                        # Automatic Claude AI Analysis & Ingestion Hook
-                        try:
-                            claude_py = Path(SCRIPT_PATH).resolve().parent / "claude_processor.py"
-                            if not claude_py.exists():
-                                claude_py = Path(SCRIPT_PATH).resolve().parent.parent / "macos" / "claude_processor.py"
-                            if claude_py.exists():
-                                subprocess.Popen([sys.executable, str(claude_py), str(p)])
-                        except Exception:
-                            pass
+                        # Automatic Claude AI Analysis & Ingestion Hook (concurrency bounded)
+                        enqueue_claude_processing(p)
                     send_resp(conn, 200, "OK", b"")
                     try:
                         upload_done_flag.write_text(str(time.time()))

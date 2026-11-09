@@ -2,6 +2,17 @@
 
 All notable changes to AirDrop P2P are documented in this file.
 
+## [v2.2.1] - 2026-11-09
+
+### Stability, Reliability & Performance Optimization (Phase 2)
+- **Eliminated Subprocess Flooding on macOS**: Replaced periodic 1.5s/250ms `/usr/sbin/lsof` and `/sbin/ifconfig` polling loops with `getifaddrs()` kernel queries and lock freshness verification, eliminating persistent MacBook CPU wakeups and background battery drain.
+- **Dynamic Wi-Fi Hardware Interface Resolution**: Replaced hardcoded `en0` assumptions across Swift and Shell with dynamic interface discovery via `CWWiFiClient` and `networksetup -listallhardwareports` with thread-safe caching, ensuring seamless operation on Mac mini, Mac Studio, Mac Pro, and docks.
+- **Unified Clean Teardown**: Consolidated app quit routines into `performCleanShutdown()`, ensuring Wi-Fi is restored to original networks, Cloudflare WARP is unpaused, BLE radios are stopped, and all lock and progress files are purged.
+- **Android Memory Pressure Lifecycle Fix**: `AirDropService.onDestroy()` now always calls `instance?.stop()` even during active transfers, preventing orphaned server sockets, BLE advertising, and Wi-Fi Direct groups on system kills.
+- **JVM Out-of-Memory Protection**: Strictly capped encrypted BLE fallback archives to 30 MB (`MAX_ENCRYPTED_BLE_ARCHIVE_BYTES`), preventing Android OOM crashes on multi-hundred-megabyte payloads.
+- **Multi-File Staging Telemetry**: Fixed staged transfer calculation in `AirDropNode.kt` to sum aggregate bytes across all URIs and format labels (`file.jpg (+N more)`), ensuring accurate sizes in the connecting notification.
+- **Bounded Claude Processing Concurrency**: Added bounded worker execution with strict 120s timeout and SIGKILL enforcement to prevent zombie processes during batch file transfers.
+
 ## [v2.2.0] - 2026-11-09
 
 ### Security & Protocol Hardening (Phase 1)

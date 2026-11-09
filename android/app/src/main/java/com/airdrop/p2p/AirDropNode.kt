@@ -166,6 +166,25 @@ class AirDropNode(private val context: Context) {
         val P2P_BLE_PSM_CHAR_UUID: UUID = UUID.fromString("52300004-a12d-4000-8000-523a12d00004")
         val P2P_BLE_DATA_UUID: ParcelUuid by lazy { ParcelUuid.fromString("0000cafe-0000-1000-8000-00805f9b34fb") }
         val MAC_BLE_DATA_UUID: ParcelUuid by lazy { ParcelUuid.fromString("0000caff-0000-1000-8000-00805f9b34fb") }
+        const val MAX_ENCRYPTED_BLE_ARCHIVE_BYTES = 30_000_000L
+        const val MAX_UNENCRYPTED_BLE_ARCHIVE_BYTES = 1_800_000_000L
+        const val MAX_BLE_META_BYTES = 1_048_576
+
+        fun isValidBleFrameBounds(metaLen: Int, archiveLen: Int, isEncryptedBle: Boolean): Boolean {
+            if (metaLen <= 0 || metaLen > MAX_BLE_META_BYTES) return false
+            if (archiveLen < 0) return false
+            if (isEncryptedBle && archiveLen.toLong() > MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) return false
+            if (!isEncryptedBle && archiveLen.toLong() > MAX_UNENCRYPTED_BLE_ARCHIVE_BYTES) return false
+            return true
+        }
+
+        fun calculateAggregateStagedBytes(sizes: Iterable<Long>): Long {
+            return sizes.sumOf { it.coerceAtLeast(0L) }
+        }
+
+        fun formatMultiFileDisplayLabel(firstFileName: String, totalCount: Int): String {
+            return if (totalCount > 1) "$firstFileName (+${totalCount - 1} more)" else firstFileName
+        }
 
         fun defaultHardwareName(): String {
             val mfr = Build.MANUFACTURER?.trim().orEmpty().replaceFirstChar { it.uppercase() }
@@ -1304,9 +1323,9 @@ class AirDropNode(private val context: Context) {
                                 }
                                 if (!wp2pJoined && !txOk && !transferCancelled) {
                                     val startedAt = System.currentTimeMillis()
-                                    val rawArchBytes = if (tx.archiveBytes.isNotEmpty()) {
+                                    val rawArchBytes = if (tx.archiveBytes.isNotEmpty() && tx.archiveBytes.size <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) {
                                         tx.archiveBytes
-                                    } else if (tx.entries.isNotEmpty() && tx.totalRawBytes < 30_000_000L) {
+                                    } else if (tx.entries.isNotEmpty() && tx.totalRawBytes <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) {
                                         ByteArrayOutputStream().also { AirDropCodec.writeDvzipCpio(tx.entries, it) }.toByteArray()
                                     } else {
                                         ByteArray(0)
@@ -1500,8 +1519,8 @@ class AirDropNode(private val context: Context) {
                 activeTransferSocket = sock
                 val metaLen = dis.readInt()
                 val archiveLen = dis.readInt()
-                if (metaLen <= 0 || metaLen > 1_048_576 || archiveLen < 0 || archiveLen > 1_800_000_000) {
-                    log("BLE L2CAP rejected invalid frame bounds from $remoteAddr (meta=$metaLen, arch=$archiveLen)")
+                if (!isValidBleFrameBounds(metaLen, archiveLen, isEncryptedBle)) {
+                    log("BLE L2CAP rejected invalid frame bounds from $remoteAddr (meta=$metaLen, arch=$archiveLen, e2ee=$isEncryptedBle)")
                     break
                 }
                 log("BLE L2CAP RX from $remoteAddr (meta=$metaLen B, archive=$archiveLen B, e2ee=$isEncryptedBle)")
@@ -1616,6 +1635,9 @@ class AirDropNode(private val context: Context) {
                     }
                     val extracted = try {
                         if (isEncryptedBle) {
+                            if (archiveLen.toLong() > MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) {
+                                throw IOException("Encrypted BLE archive exceeds 30 MB safe limit: $archiveLen bytes")
+                            }
                             val encBuf = ByteArrayOutputStream(archiveLen)
                             bounded.copyTo(encBuf)
                             val decArch = decryptBlePayload(encBuf.toByteArray())
@@ -1699,7 +1721,11 @@ class AirDropNode(private val context: Context) {
                     ByteArray(0)
                 }
 
-                val label = entries.firstOrNull()?.name ?: (url ?: "BLE Transfer")
+                val label = if (entries.isNotEmpty()) {
+                    formatMultiFileDisplayLabel(entries.first().name, entries.size)
+                } else {
+                    url ?: "BLE Transfer"
+                }
                 val fileCount = maxOf(1, entries.size)
                 val targetPeerLabel = learnedMacName ?: "MacBook Pro"
 
@@ -1858,9 +1884,9 @@ class AirDropNode(private val context: Context) {
                                 }
 
                                 val startedAt = System.currentTimeMillis()
-                                val rawArchBytes = if (archiveBytes.isNotEmpty()) {
+                                val rawArchBytes = if (archiveBytes.isNotEmpty() && archiveBytes.size <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) {
                                     archiveBytes
-                                } else if (entries.isNotEmpty() && totalRawBytes < 30_000_000L) {
+                                } else if (entries.isNotEmpty() && totalRawBytes <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) {
                                     ByteArrayOutputStream().also { AirDropCodec.writeDvzipCpio(entries, it) }.toByteArray()
                                 } else {
                                     ByteArray(0)
@@ -2697,10 +2723,13 @@ class AirDropNode(private val context: Context) {
         withContext(Dispatchers.IO) {
             if (uris.isEmpty()) return@withContext false
             val peerClean = peer.name.substringBefore(" (PSM").trim().ifEmpty { learnedMacName ?: "MacBook Pro" }
-            val firstMeta = inspectUriMeta(uris.first())
+            val stagedMetas = uris.map { inspectUriMeta(it) }
+            val firstMeta = stagedMetas.first()
+            val totalStagedBytes = calculateAggregateStagedBytes(stagedMetas.map { it.second })
+            val displayLabel = formatMultiFileDisplayLabel(firstMeta.first, uris.size)
             reportConnecting(
-                label = firstMeta.first,
-                total = firstMeta.second,
+                label = displayLabel,
+                total = totalStagedBytes,
                 fileCount = uris.size,
                 isSending = true,
                 phase = "Preparing ${uris.size} file(s)…",
