@@ -67,6 +67,7 @@ build/
 android/build/
 android/app/build/
 android/.gradle/
+android/.kotlin/
 android/local.properties
 android/.idea/
 android/*.iml

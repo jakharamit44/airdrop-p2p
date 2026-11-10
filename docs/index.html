@@ -6,7 +6,8 @@
   <title>AirDrop for Android and Mac over 5 GHz Wi-Fi | AirDrop P2P</title>
   <meta name="description" content="Send files, photos, videos, links, and notes between Android and macOS over BLE and 5 GHz Wi-Fi Direct. No shared router, USB cable, cloud, or size limit.">
   <meta name="robots" content="index,follow,max-image-preview:large">
-  <meta name="theme-color" content="#0B132B">
+  <meta name="theme-color" content="#070b14" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f4f7fc" media="(prefers-color-scheme: light)">
   <link rel="canonical" href="https://jakharamit44.github.io/airdrop-p2p/">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -18,6 +19,7 @@
   <meta property="og:description" content="Send files, photos, videos, links, and notes directly between Android and macOS at 45+ MB/s over BLE and 5 GHz Wi-Fi Direct. Free, open source, and encrypted.">
   <meta property="og:url" content="https://jakharamit44.github.io/airdrop-p2p/">
   <meta property="og:image" content="https://jakharamit44.github.io/airdrop-p2p/og-image.png">
+  <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="AirDrop P2P concentric wave emblem and key technical specifications">
@@ -26,6 +28,7 @@
   <meta name="twitter:title" content="AirDrop for Android and Mac over 5 GHz Wi-Fi | AirDrop P2P">
   <meta name="twitter:description" content="Direct peer-to-peer file sharing between Android 12+ and macOS 13+ over 5 GHz Wi-Fi Direct and BLE L2CAP. No cloud or shared router required.">
   <meta name="twitter:image" content="https://jakharamit44.github.io/airdrop-p2p/og-image.png">
+  <meta name="twitter:image:alt" content="AirDrop P2P concentric wave emblem and key technical specifications">
 
   <script type="application/ld+json">
   {
@@ -38,14 +41,21 @@
         "alternateName": "AirDrop P2P for Android and macOS",
         "description": "Open-source peer-to-peer file transfer app for Android and macOS using Bluetooth LE L2CAP discovery, ECDH P-256 key exchange, pinned TLS, and 5 GHz Wi-Fi Direct without a shared router or file size limit.",
         "applicationCategory": "UtilitiesApplication",
+        "applicationSubCategory": "Peer-to-Peer File Transfer",
         "operatingSystem": "Android 12+, macOS 13+",
         "softwareVersion": "2.4.1",
         "datePublished": "2026-11-10",
         "license": "https://opensource.org/license/mit",
         "isAccessibleForFree": true,
         "url": "https://jakharamit44.github.io/airdrop-p2p/",
-        "downloadUrl": "https://github.com/jakharamit44/airdrop-p2p/releases/tag/v2.4.1",
+        "image": "https://jakharamit44.github.io/airdrop-p2p/og-image.png",
+        "downloadUrl": [
+          "https://github.com/jakharamit44/airdrop-p2p/releases/download/v2.4.1/AirDrop-P2P-v2.4.1.apk",
+          "https://github.com/jakharamit44/airdrop-p2p/releases/download/v2.4.1/AirDrop-P2P-v2.4.1.pkg",
+          "https://github.com/jakharamit44/airdrop-p2p/releases/download/v2.4.1/AirDrop-P2P-v2.4.1.dmg"
+        ],
         "installUrl": "https://github.com/jakharamit44/airdrop-p2p/releases/latest",
+        "releaseNotes": "https://github.com/jakharamit44/airdrop-p2p/blob/main/CHANGELOG.md",
         "softwareRequirements": "Android 12 (API 31) or newer with BLE and 5 GHz Wi-Fi Direct; macOS 13 Ventura, 14 Sonoma, or 15 Sequoia on Apple Silicon or Intel.",
         "featureList": [
           "Bidirectional file, photo, video, link, and text note transfer between Android and macOS",
@@ -76,7 +86,7 @@
             "name": "How do I send files from Android to Mac without USB or the same Wi-Fi network?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "Install AirDrop P2P on both devices and open it. Android and Mac discover each other over Bluetooth Low Energy L2CAP, exchange Wi-Fi Direct credentials encrypted with ECDH P-256 and AES-256-GCM, and stream files over a temporary 5 GHz Wi-Fi Direct link."
+              "text": "Install AirDrop P2P on both devices and open it. Android and Mac discover each other over Bluetooth Low Energy L2CAP, negotiate temporary 5 GHz Wi-Fi Direct credentials encrypted with ECDH P-256 and AES-256-GCM, and transfer directly over pinned TLS without a shared router or cable."
             }
           },
           {
@@ -84,7 +94,7 @@
             "name": "Does AirDrop P2P work from Mac to Android too?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "Yes. Transfers work in both directions. From macOS you can drag files onto the menu bar icon or Send window, pick files by category, pull the current Finder selection or clipboard, compose a link or text note, or share from Finder over the local AWDL proxy."
+              "text": "Yes. Transfers work in both directions. From macOS you can drag files onto the menu bar icon or Send window, pick files by category, grab the current Finder selection or clipboard, compose a link or note, or send from Finder's AirDrop menu via the local AWDL proxy."
             }
           },
           {
@@ -92,7 +102,7 @@
             "name": "Is there a file size limit or cloud upload?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "There is no artificial file size cap and zero cloud relay. Files up to 8 GiB use standard POSIX CPIO headers, and larger files (such as 10 GB+ videos) automatically switch to 64-bit extended CPIO (070764) streaming over 5 GHz Wi-Fi Direct."
+              "text": "There is no file size limit and zero cloud upload. Transfers up to 8 GiB use standard POSIX CPIO headers, while larger files stream with 64-bit extended CPIO (070764) headers directly from file descriptors."
             }
           },
           {
@@ -100,7 +110,7 @@
             "name": "Will my Mac lose internet while connected to Wi-Fi Direct?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "When Mac temporarily leaves its home router to join Android's 5 GHz Wi-Fi Direct group, Android can run an embedded SOCKS5 and HTTP CONNECT proxy on port 1080 (enabled under Settings -> Mac Internet Sharing Proxy). macOS configures and restores system proxy settings automatically without sudo, and returns to your original Wi-Fi network once the transfer finishes."
+              "text": "During 5 GHz Wi-Fi Direct transfers, Android can run an embedded SOCKS5 and HTTP CONNECT proxy on port 1080 (under Settings -> Mac Internet Sharing Proxy) to share its active mobile data or upstream internet connection. macOS snapshots your previous proxy settings, applies the temporary proxy without sudo, and restores both your proxy config and home Wi-Fi once done."
             }
           },
           {
@@ -108,7 +118,7 @@
             "name": "How are transfers encrypted and protected against spoofing?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "Wi-Fi Direct credentials are negotiated over BLE L2CAP using ephemeral ECDH P-256 keys and AES-256-GCM, alongside SHA-256 TLS certificate fingerprints pinned for the subsequent HTTPS transfer. On macOS, joining a new Wi-Fi Direct SSID always prompts for explicit user approval."
+              "text": "Wi-Fi Direct credentials travel inside an ephemeral ECDH P-256 + AES-256-GCM handshake over BLE (W2P2), and both sides exchange SHA-256 TLS certificate fingerprints to pin the HTTPS transfer. Under the default Ask First mode on macOS, joining a new Wi-Fi Direct group prompts once for confirmation; enabling Auto-Accept skips prompts for unattended transfers."
             }
           },
           {
@@ -116,7 +126,7 @@
             "name": "Can I send entire folders directly?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "Currently both Android and macOS stage individual or multiple selected files, links, and text notes rather than raw directory trees. To send a folder, select the files inside it or compress the folder into a zip archive first."
+              "text": "Not directly yet. Both Android and macOS stage single or multiple selected files, links, and text notes rather than directory trees. Select the files inside a folder or create a zip archive first when moving folders."
             }
           },
           {
@@ -124,7 +134,7 @@
             "name": "How do I avoid macOS Gatekeeper warnings when installing?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "Use the AirDrop-P2P-v2.4.1.pkg installer, which places the app in /Applications and clears the quarantine extended attribute automatically. If you use the DMG, run the bundled bypass script or execute xattr -cr \"/Applications/AirDrop P2P.app\" in Terminal."
+              "text": "Install with AirDrop-P2P-v2.4.1.pkg, which installs into /Applications and runs xattr -cr during setup. If you downloaded the .dmg, run the bundled Gatekeeper helper script or run xattr -cr \"/Applications/AirDrop P2P.app\" in Terminal."
             }
           },
           {
@@ -132,7 +142,7 @@
             "name": "Does the AI summary feature send my private keys to the cloud?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "AI processing is turned off by default. When enabled, a local privacy guard blocks cloud upload for .pem, .key, .env, SSH keys, and files containing API tokens. You can also run entirely offline using macOS Apple Vision OCR and a local Ollama model."
+              "text": "No. AI ingestion is disabled by default. When enabled, the Privacy Guard blocks .pem, .key, .env*, SSH keys, and files containing API tokens from cloud upload, and local mode runs offline via Apple Vision OCR and Ollama."
             }
           }
         ]
@@ -174,8 +184,8 @@
         --border-strong: #b8c8e2;
         --text: #0f172a;
         --text-muted: #475569;
-        --text-dim: #64748b;
-        --accent: #0284c7;
+        --text-dim: #4e5d73;
+        --accent: #0369a1;
         --accent-strong: #434fe0;
         --accent-strong-hover: #3540c9;
         --green: #15803d;
@@ -254,8 +264,9 @@
       position: sticky;
       top: 0;
       z-index: 40;
-      backdrop-filter: blur(12px);
+      background: var(--bg);
       background: color-mix(in srgb, var(--bg) 86%, transparent);
+      backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--border);
     }
 
@@ -993,7 +1004,7 @@
             <div>
               <h3>Android App (Universal APK)</h3>
               <p>
-                Requires Android 12 (API 31) or newer with Bluetooth Low Energy and 5 GHz Wi-Fi Direct. Tested across Samsung, Google Pixel, OnePlus, Xiaomi, and Motorola builds using standard Android APIs. Includes Share Sheet targets and a toggleable SOCKS5/HTTP cellular sharing proxy.
+                Requires Android 12 (API 31) or newer with Bluetooth Low Energy and 5 GHz Wi-Fi Direct. Built on standard Android Jetpack and AOSP APIs for Samsung, Google Pixel, OnePlus, Xiaomi, Motorola, and AOSP devices. Includes Share Sheet targets and a toggleable SOCKS5/HTTP sharing proxy.
               </p>
             </div>
             <div class="dl-actions">
@@ -1007,7 +1018,7 @@
             <div>
               <h3>macOS App (PKG or DMG)</h3>
               <p>
-                Requires macOS 13 Ventura, 14 Sonoma, or 15 Sequoia (Apple Silicon or Intel). Runs as a native SwiftUI menu bar and radar window app. Pick the PKG installer to install into <code>/Applications</code> and clear Gatekeeper quarantine attributes automatically.
+                Requires macOS 13 Ventura, 14 Sonoma, or 15 Sequoia (Apple Silicon or Intel). Runs as a native SwiftUI menu bar and radar window app. Pick the PKG installer to place the app in <code>/Applications</code> and clear Gatekeeper quarantine attributes during installation.
               </p>
             </div>
             <div class="dl-actions">
@@ -1054,15 +1065,15 @@
           </article>
           <article class="card">
             <h3>Stay Online on Mac</h3>
-            <p>Android's embedded dual-protocol proxy (SOCKS5 and HTTP CONNECT on port 1080) routes Mac traffic over cellular data while Wi-Fi Direct is active.</p>
+            <p>Android's embedded dual-protocol proxy (SOCKS5 and HTTP CONNECT on port 1080) routes Mac traffic over your phone's active internet or cellular connection while Wi-Fi Direct is up.</p>
           </article>
           <article class="card">
             <h3>Pinned TLS + ECDH P-256</h3>
-            <p>Ephemeral P-256 keys encrypt Wi-Fi credentials over BLE, TLS certificate SHA-256 fingerprints are pinned, and Mac asks before joining any Wi-Fi Direct SSID.</p>
+            <p>Ephemeral P-256 keys encrypt Wi-Fi credentials over BLE, TLS certificate SHA-256 fingerprints are pinned, and the default Ask First mode confirms before Mac joins a Wi-Fi Direct SSID.</p>
           </article>
           <article class="card">
             <h3>No 35-Second Kernel Stalls</h3>
-            <p>Bidirectional 2.0s UDP keepalives reset Android's Linux neighbor cache state so 10 GB+ HTTP streams do not freeze mid-transfer.</p>
+            <p>Periodic 2.0s UDP keepalives reset Android's Linux neighbor cache state so 10 GB+ HTTP streams do not freeze mid-transfer.</p>
           </article>
           <article class="card">
             <h3>Files, Links, and Text Notes</h3>
@@ -1101,12 +1112,20 @@
                 <td>Mac can stay online via Android proxy; requires app on both devices</td>
               </tr>
               <tr>
-                <td><strong>LAN Apps (LocalSend / Web)</strong></td>
+                <td><strong>LAN Apps (LocalSend / PairDrop)</strong></td>
                 <td>Yes (shared router or hotspot)</td>
                 <td>No</td>
                 <td>Varies by router</td>
                 <td>Usually memory/device bound</td>
                 <td>Blocked on isolated guest/corporate Wi-Fi with AP client isolation</td>
+              </tr>
+              <tr>
+                <td><strong>Quick Share / Nearby Share</strong></td>
+                <td>No (Wi-Fi Direct / BLE)</td>
+                <td>No</td>
+                <td>Fast on Android / Windows</td>
+                <td>None</td>
+                <td>No official Google Quick Share client for macOS</td>
               </tr>
               <tr>
                 <td><strong>Android File Transfer / MTP</strong></td>
@@ -1188,23 +1207,23 @@
         <div class="faq-list">
           <details class="faq-item">
             <summary>How do I send files from Android to Mac without USB or the same Wi-Fi network?</summary>
-            <p>Install AirDrop P2P on both devices and open it. Android and Mac discover each other over Bluetooth Low Energy L2CAP, negotiate temporary 5 GHz Wi-Fi Direct credentials encrypted with ECDH P-256 and AES-256-GCM, and transfer directly over HTTPS without any router or cable.</p>
+            <p>Install AirDrop P2P on both devices and open it. Android and Mac discover each other over Bluetooth Low Energy L2CAP, negotiate temporary 5 GHz Wi-Fi Direct credentials encrypted with ECDH P-256 and AES-256-GCM, and transfer directly over pinned TLS without a shared router or cable.</p>
           </details>
           <details class="faq-item">
             <summary>Does AirDrop P2P work from Mac to Android too?</summary>
-            <p>Yes. Transfers work in both directions. From macOS you can drag files onto the menu bar icon or Send tab, pick files by category, grab the current Finder selection or clipboard, compose a link or note, or send from Finder's native AirDrop target via the local AWDL proxy.</p>
+            <p>Yes. Transfers work in both directions. From macOS you can drag files onto the menu bar icon or Send window, pick files by category, grab the current Finder selection or clipboard, compose a link or note, or send from Finder's AirDrop menu via the local AWDL proxy.</p>
           </details>
           <details class="faq-item">
             <summary>Is there a file size limit or cloud upload?</summary>
-            <p>There is no file size limit and zero cloud upload. Transfers under 8 GiB use standard POSIX CPIO headers, while larger files automatically stream with 64-bit extended CPIO (070764) headers directly from file descriptors.</p>
+            <p>There is no file size limit and zero cloud upload. Transfers up to 8 GiB use standard POSIX CPIO headers, while larger files stream with 64-bit extended CPIO (070764) headers directly from file descriptors.</p>
           </details>
           <details class="faq-item">
             <summary>Will my Mac lose internet while connected to Wi-Fi Direct?</summary>
-            <p>During 5 GHz Wi-Fi Direct transfers, Android can run an embedded SOCKS5 and HTTP CONNECT proxy on port 1080 (under Settings &rarr; Mac Internet Sharing Proxy) to share its active cellular connection. macOS snapshots your previous proxy settings, applies the temporary proxy without sudo, and restores both your proxy config and home Wi-Fi once done.</p>
+            <p>During 5 GHz Wi-Fi Direct transfers, Android can run an embedded SOCKS5 and HTTP CONNECT proxy on port 1080 (under Settings &rarr; Mac Internet Sharing Proxy) to share its active mobile data or upstream internet connection. macOS snapshots your previous proxy settings, applies the temporary proxy without sudo, and restores both your proxy config and home Wi-Fi once done.</p>
           </details>
           <details class="faq-item">
             <summary>How are transfers encrypted and protected against spoofing?</summary>
-            <p>Wi-Fi Direct credentials travel inside an ephemeral ECDH P-256 + AES-256-GCM handshake over BLE, and both sides exchange SHA-256 TLS certificate fingerprints to pin the HTTPS connection. On macOS, joining a new Wi-Fi Direct group requires explicit confirmation even if auto-accept is enabled for incoming files.</p>
+            <p>Wi-Fi Direct credentials travel inside an ephemeral ECDH P-256 + AES-256-GCM handshake over BLE (<code>W2P2</code>), and both sides exchange SHA-256 TLS certificate fingerprints to pin the HTTPS transfer. Under the default Ask First mode on macOS, joining a new Wi-Fi Direct group prompts once for confirmation; enabling Auto-Accept skips prompts for unattended transfers.</p>
           </details>
           <details class="faq-item">
             <summary>Can I send entire folders directly?</summary>
@@ -1212,11 +1231,11 @@
           </details>
           <details class="faq-item">
             <summary>How do I avoid macOS Gatekeeper warnings when installing?</summary>
-            <p>Install with <code>AirDrop-P2P-v2.4.1.pkg</code>, which installs into <code>/Applications</code> and runs <code>xattr -cr</code> automatically. If you downloaded the <code>.dmg</code>, run the bundled Gatekeeper helper script or run <code>xattr -cr "/Applications/AirDrop P2P.app"</code> in Terminal.</p>
+            <p>Install with <code>AirDrop-P2P-v2.4.1.pkg</code>, which installs into <code>/Applications</code> and runs <code>xattr -cr</code> during setup. If you downloaded the <code>.dmg</code>, run the bundled Gatekeeper helper script or run <code>xattr -cr "/Applications/AirDrop P2P.app"</code> in Terminal.</p>
           </details>
           <details class="faq-item">
             <summary>Does the AI summary feature send my private keys to the cloud?</summary>
-            <p>No. AI ingestion is disabled by default. Even when enabled, the Privacy Guard blocks <code>.pem</code>, <code>.key</code>, <code>.env*</code>, SSH keys, and files containing API tokens from cloud upload, and local mode runs completely offline via Apple Vision OCR and Ollama.</p>
+            <p>No. AI ingestion is disabled by default. When enabled, the Privacy Guard blocks <code>.pem</code>, <code>.key</code>, <code>.env*</code>, SSH keys, and files containing API tokens from cloud upload, and local mode runs offline via Apple Vision OCR and Ollama.</p>
           </details>
         </div>
       </div>
@@ -1242,10 +1261,37 @@
       var statusEl = document.getElementById('copy-status');
       function showStatus(btn, ok) {
         if (statusEl) {
-          statusEl.textContent = ok ? 'Copied command to clipboard.' : 'Select and copy the command manually.';
+          statusEl.textContent = ok ? 'Copied command to clipboard.' : 'Selected command. Press Cmd+C to copy.';
         }
-        btn.textContent = ok ? 'Copied' : 'Copy failed';
+        btn.textContent = ok ? 'Copied' : 'Selected';
         setTimeout(function () { btn.textContent = 'Copy Terminal command'; }, 1800);
+      }
+      function selectTarget(target) {
+        try {
+          var range = document.createRange();
+          range.selectNodeContents(target);
+          var sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+        } catch (e) {}
+      }
+      function fallbackCopy(btn, target, txt) {
+        var ta = document.createElement('textarea');
+        ta.value = txt;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, txt.length);
+        var ok = false;
+        try { ok = document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(ta);
+        if (!ok) {
+          selectTarget(target);
+        }
+        showStatus(btn, ok);
       }
       btns.forEach(function (btn) {
         btn.addEventListener('click', function () {
@@ -1256,20 +1302,10 @@
             navigator.clipboard.writeText(txt).then(function () {
               showStatus(btn, true);
             }).catch(function () {
-              showStatus(btn, false);
+              fallbackCopy(btn, target, txt);
             });
           } else {
-            var ta = document.createElement('textarea');
-            ta.value = txt;
-            ta.setAttribute('readonly', '');
-            ta.style.position = 'fixed';
-            ta.style.opacity = '0';
-            document.body.appendChild(ta);
-            ta.select();
-            var ok = false;
-            try { ok = document.execCommand('copy'); } catch (e) {}
-            document.body.removeChild(ta);
-            showStatus(btn, ok);
+            fallbackCopy(btn, target, txt);
           }
         });
       });
