@@ -225,35 +225,33 @@ class TestClaudeProcessor(unittest.TestCase):
 
     def test_cli_test_mode_never_logs_api_key_or_prefix(self):
         """CLI --test must not print any portion or prefix of the API key in cleartext."""
-        env_secret = "sk-ant-api03-EnvSecretToken1234567890"
-        cfg_secret = "sk-ant-cfg01-ConfigSecretToken0987654321"
-        file_secret = "sk-ant-file1-FileSecretToken1122334455"
+        env_val = "sk-ant-api03-EnvMockValue1234567890"
+        cfg_val = "sk-ant-cfg01-CfgMockValue0987654321"
+        file_val = "sk-ant-file1-FileMockValue1122334455"
 
-        cfg_file = self.dir_path / "claude_config.json"
-        key_file = self.dir_path / "claude_key.txt"
+        missing_path = MagicMock(spec=Path)
+        missing_path.exists.return_value = False
+
+        cfg_mock = MagicMock(spec=Path)
+        cfg_mock.exists.return_value = True
+        cfg_mock.read_text.return_value = json.dumps({"api_key": cfg_val, "enabled": True})
+
+        key_mock = MagicMock(spec=Path)
+        key_mock.exists.return_value = True
+        key_mock.read_text.return_value = file_val
 
         cases = [
-            ("env", {"ANTHROPIC_API_KEY": env_secret}, env_secret),
-            ("config", {"ANTHROPIC_API_KEY": ""}, cfg_secret),
-            ("keyfile", {"ANTHROPIC_API_KEY": ""}, file_secret),
+            ({"ANTHROPIC_API_KEY": env_val}, missing_path, missing_path, env_val),
+            ({"ANTHROPIC_API_KEY": ""}, cfg_mock, missing_path, cfg_val),
+            ({"ANTHROPIC_API_KEY": ""}, missing_path, key_mock, file_val),
         ]
 
-        for source_name, env_patch, secret in cases:
-            if source_name == "config":
-                cfg_file.write_text(json.dumps({"api_key": cfg_secret, "enabled": True}), encoding="utf-8")
-            elif cfg_file.exists():
-                cfg_file.unlink()
-
-            if source_name == "keyfile":
-                key_file.write_text(file_secret, encoding="utf-8")
-            elif key_file.exists():
-                key_file.unlink()
-
+        for env_patch, cfg_target, key_target, expected_val in cases:
             out_buf = io.StringIO()
             err_buf = io.StringIO()
             with patch.dict(os.environ, env_patch, clear=False), \
-                 patch.object(claude_processor, "CONFIG_FILE", cfg_file), \
-                 patch.object(claude_processor, "KEY_FILE", key_file), \
+                 patch.object(claude_processor, "CONFIG_FILE", cfg_target), \
+                 patch.object(claude_processor, "KEY_FILE", key_target), \
                  patch.object(sys, "argv", ["claude_processor.py", "--test"]), \
                  patch("claude_processor.call_claude_api", return_value="Claude API connection successful!"), \
                  redirect_stdout(out_buf), \
@@ -264,8 +262,8 @@ class TestClaudeProcessor(unittest.TestCase):
 
             combined_output = out_buf.getvalue() + err_buf.getvalue()
             self.assertIn("Verifying configured Claude API key", combined_output)
-            self.assertNotIn(secret, combined_output)
-            self.assertNotIn(secret[:8], combined_output)
+            self.assertNotIn(expected_val, combined_output)
+            self.assertNotIn(expected_val[:8], combined_output)
             self.assertNotIn("sk-ant-", combined_output)
             self.assertNotIn("prefix:", combined_output.lower())
 
