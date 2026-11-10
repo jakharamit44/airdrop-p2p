@@ -5,20 +5,40 @@
       <stop offset="55%" stop-color="#071333"/>
       <stop offset="100%" stop-color="#020614"/>
     </linearGradient>
-    <radialGradient id="glow" cx="50%" cy="48%" r="48%">
-      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.38"/>
-      <stop offset="60%" stop-color="#0284C7" stop-opacity="0.12"/>
+    <radialGradient id="glow" cx="50%" cy="50%" r="46%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.34"/>
+      <stop offset="52%" stop-color="#3B68F5" stop-opacity="0.14"/>
       <stop offset="100%" stop-color="#020614" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="beam" x1="0" y1="0.5" x2="1" y2="0.5">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0"/>
+      <stop offset="30%" stop-color="#7DD3FC" stop-opacity="0.48"/>
+      <stop offset="50%" stop-color="#E0F7FF" stop-opacity="0.72"/>
+      <stop offset="70%" stop-color="#7DD3FC" stop-opacity="0.48"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="wingTop" x1="1" y1="0" x2="0" y2="0.7">
+      <stop offset="0%" stop-color="#F5FCFF"/>
+      <stop offset="52%" stop-color="#6BDEFF"/>
+      <stop offset="100%" stop-color="#0FA1F7"/>
+    </linearGradient>
+    <linearGradient id="wingBot" x1="0" y1="1" x2="1" y2="0.3">
+      <stop offset="0%" stop-color="#8FEBFF"/>
+      <stop offset="52%" stop-color="#29A8FA"/>
+      <stop offset="100%" stop-color="#616EF7"/>
+    </linearGradient>
+    <radialGradient id="nodeHalo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#99F5FF" stop-opacity="0.85"/>
+      <stop offset="55%" stop-color="#2EC2FF" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#2EC2FF" stop-opacity="0"/>
     </radialGradient>
   </defs>
   <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#bg)"/>
   <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#glow)"/>
   <rect x="6.75" y="6.75" width="114.5" height="114.5" rx="25.25" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
-  <g fill="none" stroke-linecap="round">
-    <path d="M36.5 89.5 A38.5 38.5 0 1 1 91.5 89.5" stroke="#4DC2FA" stroke-width="4.8"/>
-    <path d="M45.8 80.2 A25.5 25.5 0 1 1 82.2 80.2" stroke="#75DBFF" stroke-width="5"/>
-    <path d="M55 71 A13 13 0 1 1 73 71" stroke="#BDF2FF" stroke-width="5.2"/>
-  </g>
-  <circle cx="64" cy="62" r="4.8" fill="#FFFFFF"/>
-  <circle cx="95" cy="36" r="4" fill="#22C55E"/>
+  <path d="M31.52 64 Q48.92 62.6 64 62.6 Q79.08 62.6 96.48 64 Q79.08 65.4 64 65.4 Q48.92 65.4 31.52 64 Z" fill="url(#beam)"/>
+  <path d="M28.04 51.82 Q62.84 32.68 97.64 36.16 Q91.26 51.24 79.66 64.58 Q72.70 56.46 65.74 50.66 Q46.60 49.50 28.04 51.82 Z" fill="url(#wingTop)" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="0.9"/>
+  <path d="M99.96 76.18 Q65.16 95.32 30.36 91.84 Q36.74 76.76 48.34 63.42 Q55.30 71.54 62.26 77.34 Q81.40 78.50 99.96 76.18 Z" fill="url(#wingBot)" stroke="#B8F0FF" stroke-opacity="0.3" stroke-width="0.9"/>
+  <circle cx="64" cy="64" r="14" fill="url(#nodeHalo)"/>
+  <circle cx="64" cy="64" r="5.6" fill="#FFFFFF"/>
 </svg>

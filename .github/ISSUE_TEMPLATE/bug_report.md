@@ -9,7 +9,7 @@ labels: bug
 Describe what happened and what you expected.
 
 ## Environment
-- **AirDrop P2P version**: (e.g., `v2.4.1`)
+- **GlideDrop version**: (e.g., `v2.5.0`)
 - **macOS version & hardware**: (e.g., macOS 15.1, Apple Silicon or Intel)
 - **Android version & device model**: (e.g., Android 14, Pixel / Galaxy)
 - **Transfer direction**: Android to Mac / Mac to Android

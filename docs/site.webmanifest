@@ -1,8 +1,8 @@
 {
-  "name": "AirDrop P2P",
-  "short_name": "AirDrop P2P",
+  "name": "GlideDrop",
+  "short_name": "GlideDrop",
   "description": "Direct peer-to-peer file transfer between Android and macOS over BLE and 5 GHz Wi-Fi Direct.",
-  "start_url": "/airdrop-p2p/",
+  "start_url": "/glidedrop/",
   "display": "standalone",
   "background_color": "#0B132B",
   "theme_color": "#0B132B",

@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://jakharamit44.github.io/airdrop-p2p/sitemap.xml
+Sitemap: https://jakharamit44.github.io/glidedrop/sitemap.xml

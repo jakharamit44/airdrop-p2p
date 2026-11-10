@@ -1,34 +1,34 @@
-# AirDrop P2P: AirDrop Between Android and Mac
+# GlideDrop: Open-Source AirDrop Alternative for Android and Mac
 
-Send files, photos, videos, links, and text notes directly between Android and macOS over Bluetooth Low Energy and 5 GHz Wi-Fi Direct. AirDrop P2P is an open-source AirDrop and Quick Share alternative that runs peer-to-peer without a shared Wi-Fi router, USB cable, cloud account, or file size limit.
+Send files, photos, videos, links, and text notes directly between Android and Mac over Bluetooth Low Energy and 5 GHz Wi-Fi Direct. GlideDrop is an open-source alternative to Apple AirDrop® and Google Quick Share™ that lets you send files between Android and Mac without Wi-Fi, USB cables, cloud accounts, or file size limits.
 
-**Website & Documentation:** [jakharamit44.github.io/airdrop-p2p](https://jakharamit44.github.io/airdrop-p2p/)
+**Website & Documentation:** [jakharamit44.github.io/glidedrop](https://jakharamit44.github.io/glidedrop/)
 
-[![Release: v2.4.1](https://img.shields.io/badge/Release-v2.4.1-5360F5.svg)](https://github.com/jakharamit44/airdrop-p2p/releases/latest)
-[![Platform: Android 12+](https://img.shields.io/badge/Android-12%2B%20%28API%2031%2B%29-16A34A.svg)](https://github.com/jakharamit44/airdrop-p2p/releases/latest)
-[![Platform: macOS 13+](https://img.shields.io/badge/macOS-13%2B%20%28Apple%20Silicon%20%26%20Intel%29-0284C7.svg)](https://github.com/jakharamit44/airdrop-p2p/releases/latest)
+[![Release: v2.5.0](https://img.shields.io/badge/Release-v2.5.0-5360F5.svg)](https://github.com/jakharamit44/glidedrop/releases/latest)
+[![Platform: Android 12+](https://img.shields.io/badge/Android-12%2B%20%28API%2031%2B%29-16A34A.svg)](https://github.com/jakharamit44/glidedrop/releases/latest)
+[![Platform: macOS 13+](https://img.shields.io/badge/macOS-13%2B%20%28Apple%20Silicon%20%26%20Intel%29-0284C7.svg)](https://github.com/jakharamit44/glidedrop/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-334155.svg)](LICENSE)
 [![Status: Public Beta](https://img.shields.io/badge/Status-Public%20Beta-D97706.svg)](SECURITY.md)
 
 > [!WARNING]
-> **Public Beta (v2.4.1)**
+> **Public Beta (v2.5.0)**
 > Core BLE L2CAP, 5 GHz Wi-Fi Direct, and TLS transport layers are functional and covered by unit tests, while OEM Wi-Fi chipset and macOS edge cases continue to be refined. Review [SECURITY.md](SECURITY.md) before transferring sensitive data in untrusted RF spaces, and open issues via [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Downloads (v2.4.1)
+## Downloads (v2.5.0)
 
-Pre-compiled binaries and SHA-256 verification hashes are available on the [latest GitHub Release](https://github.com/jakharamit44/airdrop-p2p/releases/latest).
+Pre-compiled binaries and SHA-256 verification hashes are available on the [latest GitHub Release](https://github.com/jakharamit44/glidedrop/releases/latest).
 
 | Platform | Package | Target Requirements | Notes |
 | :--- | :--- | :--- | :--- |
-| **Android** | [`AirDrop-P2P-v2.4.1.apk`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.apk) | Android 12+ (API 31+) | Universal APK for Samsung, Pixel, OnePlus, Xiaomi, Motorola, and AOSP devices |
-| **macOS (PKG)** | [`AirDrop-P2P-v2.4.1.pkg`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.pkg) | macOS 13+ (Ventura, Sonoma, Sequoia) | Recommended installer; places the app in `/Applications` and removes Gatekeeper quarantine flags |
-| **macOS (DMG)** | [`AirDrop-P2P-v2.4.1.dmg`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.dmg) | macOS 13+ (Apple Silicon & Intel) | Drag-and-drop image containing a helper script for Gatekeeper (`xattr -cr`) |
-| **Checksums** | [`SHA256SUMS.txt`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/SHA256SUMS.txt) | All | SHA-256 hashes for verifying downloaded packages |
+| **Android** | [`GlideDrop-v2.5.0.apk`](https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.5.0.apk) | Android 12+ (API 31+) | Universal APK for Samsung, Pixel, OnePlus, Xiaomi, Motorola, and AOSP devices |
+| **macOS (PKG)** | [`GlideDrop-v2.5.0.pkg`](https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.5.0.pkg) | macOS 13+ (Ventura, Sonoma, Sequoia) | Recommended installer; places the app in `/Applications` and removes Gatekeeper quarantine flags |
+| **macOS (DMG)** | [`GlideDrop-v2.5.0.dmg`](https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.5.0.dmg) | macOS 13+ (Apple Silicon & Intel) | Drag-and-drop image containing a helper script for Gatekeeper (`xattr -cr`) |
+| **Checksums** | [`SHA256SUMS.txt`](https://github.com/jakharamit44/glidedrop/releases/latest/download/SHA256SUMS.txt) | All | SHA-256 hashes for verifying downloaded packages |
 
-If you install from the `.dmg` and macOS reports that the unsigned app cannot be opened, run the included `Open AirDrop P2P (Bypass Gatekeeper).command` script or clear the quarantine attribute in Terminal:
+If you install from the `.dmg` and macOS reports that the unsigned app cannot be opened, run the included `Open GlideDrop (Bypass Gatekeeper).command` script or clear the quarantine attribute in Terminal:
 
 ```bash
-xattr -cr "/Applications/AirDrop P2P.app"
+xattr -cr "/Applications/GlideDrop.app"
 ```
 
 ## What It Transfers and How It Works
@@ -58,19 +58,19 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for wire framing, CPIO headers,
 
 ## Key Technical Details
 
-| Component | Behavior in v2.4.1 | Source |
+| Component | Behavior in v2.5.0 | Source |
 | :--- | :--- | :--- |
-| **Radio Discovery & Fallback** | Discovers peers over Bluetooth Low Energy L2CAP CoC without a router. Transfers of 64 KiB or more negotiate a 5 GHz Band 4 Wi-Fi Direct group; smaller items, URLs, or unreachable Wi-Fi Direct peers fall back to AES-256-GCM `ADRE` frames over BLE L2CAP (capped at 30 MB on Android). | [`AirDropNode.kt`](android/app/src/main/java/com/airdrop/p2p/AirDropNode.kt), [`mac-ble-airdrop.swift`](macos/mac-ble-airdrop.swift) |
-| **64-bit Large File Streaming** | Streams files up to 8 GiB with POSIX `070707` CPIO headers and switches to 64-bit extended `070764` CPIO headers above 8 GiB so 10 GB+ files move directly from file descriptors without memory buffering. | [`AirDropCodec.kt`](android/app/src/main/java/com/airdrop/p2p/AirDropCodec.kt), [`mac-airdrop-p2p.sh`](macos/mac-airdrop-p2p.sh) |
-| **Mac Internet Sharing Proxy** | Because macOS temporarily switches off its router Wi-Fi to join Android's `DIRECT-*` network, Android runs an embedded dual-protocol SOCKS5 and HTTP `CONNECT` proxy on port `1080` (toggleable under Settings) over its active internet or cellular connection. macOS snapshots prior proxy settings under an advisory file lock, applies the proxy without `sudo`, and restores everything afterward. | [`EmbeddedProxyServer.kt`](android/app/src/main/java/com/airdrop/p2p/EmbeddedProxyServer.kt), [`mac-ble-airdrop.swift`](macos/mac-ble-airdrop.swift) |
-| **Kernel Stall & VPN Handling** | Periodic 2.0s UDP keepalives from Android reset its Linux neighbor cache (`NUD_REACHABLE`) so multi-gigabyte streams do not stall around 35 seconds. On macOS, Cloudflare WARP (`warp-cli`) is paused cleanly before joining the offline P2P SSID and resumed after completion. | [`AirDropNode.kt`](android/app/src/main/java/com/airdrop/p2p/AirDropNode.kt), [`mac-ble-airdrop.swift`](macos/mac-ble-airdrop.swift) |
-| **Cryptography & Pinning** | `W2P2` negotiates ephemeral ECDH P-256 (`secp256r1`) session keys to encrypt Wi-Fi Direct credentials with AES-256-GCM and exchanges SHA-256 TLS certificate fingerprints for pinning on `TLSv1.3`/`TLSv1.2` transfers. Under the default `Ask First` mode, Mac prompts before joining a new Wi-Fi Direct group. | [`AirDropNode.kt`](android/app/src/main/java/com/airdrop/p2p/AirDropNode.kt), [`AirDropSecurityTest.kt`](android/app/src/test/java/com/airdrop/p2p/AirDropSecurityTest.kt) |
+| **Radio Discovery & Fallback** | Discovers peers over Bluetooth Low Energy L2CAP CoC without a router. Transfers of 64 KiB or more negotiate a 5 GHz Band 4 Wi-Fi Direct group; smaller items, URLs, or unreachable Wi-Fi Direct peers fall back to AES-256-GCM `ADRE` frames over BLE L2CAP (capped at 30 MB on Android). | [`GlideDropNode.kt`](android/app/src/main/java/io/github/jakharamit44/glidedrop/GlideDropNode.kt), [`glidedrop-daemon.swift`](macos/glidedrop-daemon.swift) |
+| **64-bit Large File Streaming** | Streams files up to 8 GiB with POSIX `070707` CPIO headers and switches to 64-bit extended `070764` CPIO headers above 8 GiB so 10 GB+ files move directly from file descriptors without memory buffering. | [`GlideDropCodec.kt`](android/app/src/main/java/io/github/jakharamit44/glidedrop/GlideDropCodec.kt), [`glidedrop.sh`](macos/glidedrop.sh) |
+| **Mac Internet Sharing Proxy** | Because macOS temporarily switches off its router Wi-Fi to join Android's `DIRECT-*` network, Android runs an embedded dual-protocol SOCKS5 and HTTP `CONNECT` proxy on port `1080` (toggleable under Settings) over its active internet or cellular connection. macOS snapshots prior proxy settings under an advisory file lock, applies the proxy without `sudo`, and restores everything afterward. | [`EmbeddedProxyServer.kt`](android/app/src/main/java/io/github/jakharamit44/glidedrop/EmbeddedProxyServer.kt), [`glidedrop-daemon.swift`](macos/glidedrop-daemon.swift) |
+| **Kernel Stall & VPN Handling** | Periodic 2.0s UDP keepalives from Android reset its Linux neighbor cache (`NUD_REACHABLE`) so multi-gigabyte streams do not stall around 35 seconds. On macOS, Cloudflare WARP (`warp-cli`) is paused cleanly before joining the offline P2P SSID and resumed after completion. | [`GlideDropNode.kt`](android/app/src/main/java/io/github/jakharamit44/glidedrop/GlideDropNode.kt), [`glidedrop-daemon.swift`](macos/glidedrop-daemon.swift) |
+| **Cryptography & Pinning** | `W2P2` negotiates ephemeral ECDH P-256 (`secp256r1`) session keys to encrypt Wi-Fi Direct credentials with AES-256-GCM and exchanges SHA-256 TLS certificate fingerprints for pinning on `TLSv1.3`/`TLSv1.2` transfers. Under the default `Ask First` mode, Mac prompts before joining a new Wi-Fi Direct group. | [`GlideDropNode.kt`](android/app/src/main/java/io/github/jakharamit44/glidedrop/GlideDropNode.kt), [`GlideDropSecurityTest.kt`](android/app/src/test/java/io/github/jakharamit44/glidedrop/GlideDropSecurityTest.kt) |
 
 ## Comparison With Other Transfer Methods
 
 | Method | Shared Wi-Fi Required | USB Cable | Typical Speed | File Size Cap | Trade-offs |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **AirDrop P2P** | No | No | 45+ MB/s (5 GHz) | None (64-bit CPIO) | Requires installing the app on Android and Mac |
+| **GlideDrop** | No | No | 45+ MB/s (5 GHz) | None (64-bit CPIO) | Requires installing the app on Android and Mac |
 | **LAN Tools (LocalSend / PairDrop)** | Yes | No | Router dependent | Device memory / app dependent | Fails when devices sit on different networks or AP client isolation is on |
 | **Quick Share / Nearby Share** | No (Android/Windows) | No | Wi-Fi Direct / BLE | None | No official Google Quick Share client for macOS |
 | **USB / MTP (Android File Transfer)** | No | Yes | 20 to 40 MB/s | None | Needs a cable and third-party MTP software on macOS |
@@ -96,21 +96,21 @@ Measured on pure 5 GHz Wi-Fi Direct (Band 4, 80 MHz channel width) with 1 MiB ch
 
 ### 1. macOS App & CLI Daemon
 
-Compile `AirDrop P2P.app` and install the local binary into `~/.airdrop-p2p`:
+Compile `GlideDrop.app` and install the local binary into `~/.glidedrop`:
 
 ```bash
 cd macos
-chmod +x build.sh mac-airdrop-p2p.sh
+chmod +x build.sh glidedrop.sh
 ./build.sh
 ```
 
 Control the background receiver from the terminal if preferred over the GUI app:
 
 ```bash
-./mac-airdrop-p2p.sh on      # start receiver and BLE daemon
-./mac-airdrop-p2p.sh status  # inspect running ports and PIDs
-./mac-airdrop-p2p.sh send    # send Finder selection or pick files
-./mac-airdrop-p2p.sh off     # stop all daemons
+./glidedrop.sh on      # start receiver and BLE daemon
+./glidedrop.sh status  # inspect running ports and PIDs
+./glidedrop.sh send    # send Finder selection or pick files
+./glidedrop.sh off     # stop all daemons
 ```
 
 ### 2. Android Client
@@ -157,14 +157,14 @@ Optional model overrides (`ANTHROPIC_MODEL`, `ANTHROPIC_FAST_MODEL`, `ANTHROPIC_
 **Can I transfer files from Mac to Android as well as Android to Mac?**
 Yes. Both apps act as sender and receiver. On Mac, drag files onto the menu bar icon or the Send tab, click a file category, import the current Finder selection or clipboard, or share through Finder's AirDrop menu when an Android peer is nearby.
 
-**Why does AirDrop P2P ask before joining a Wi-Fi network on Mac?**
+**Why does GlideDrop ask before joining a Wi-Fi network on Mac?**
 Leaving your home Wi-Fi to join an unknown `DIRECT-*` hotspot without confirmation would let a nearby BLE broadcaster redirect your Mac's Wi-Fi interface. Under the default `Ask First` mode, Mac prompts once before joining the Wi-Fi Direct SSID (and reuses that approval for the HTTP transfer so you are not asked twice). If you switch macOS to `Auto-Accept`, incoming Wi-Fi Direct joins and transfers run without a prompt.
 
 **How do I keep internet access on my Mac during a large transfer?**
 Open **Settings** on the Android app and make sure **Mac Internet Sharing Proxy** is set to **Share Internet**. Android starts an SSRF-filtered SOCKS5 and HTTP `CONNECT` proxy on port `1080` bound to your active upstream mobile data or internet interface, while macOS configures and restores system proxy settings without `sudo`.
 
 **Where do received files go?**
-macOS writes received files to `~/Downloads` (with duplicate filename numbering and `com.apple.quarantine` attributes set). Android writes received files to `Downloads/AirDrop` and triggers Android's MediaScanner so photos and videos show up in your gallery.
+macOS writes received files to `~/Downloads` (with duplicate filename numbering and `com.apple.quarantine` attributes set). Android writes received files to `Downloads/GlideDrop` and triggers Android's MediaScanner so photos and videos show up in your gallery.
 
 ## Security & Contributing
 
@@ -175,3 +175,7 @@ macOS writes received files to `~/Downloads` (with duplicate filename numbering 
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+---
+
+*AirDrop and macOS are trademarks of Apple Inc., registered in the U.S. and other countries and regions. Android and Quick Share are trademarks of Google LLC. GlideDrop is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Apple Inc. or Google LLC.*

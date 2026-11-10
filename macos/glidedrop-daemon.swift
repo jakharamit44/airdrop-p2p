@@ -8,7 +8,7 @@ import CryptoKit
 import CoreWLAN
 import Darwin
 
-private let BLE_E2EE_KEY = SymmetricKey(data: SHA256.hash(data: Data("AirDropP2P-E2EE-AES256GCM-v2".utf8)))
+private let BLE_E2EE_KEY = SymmetricKey(data: SHA256.hash(data: Data("GlideDrop-E2EE-AES256GCM-v2".utf8)))
 
 func ensureLocalMacTlsCertFiles() {
     let certPath = STATE_DIR.appendingPathComponent("cert.pem")
@@ -18,7 +18,7 @@ func ensureLocalMacTlsCertFiles() {
         _ = runProcessCapture("/usr/bin/openssl", [
             "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
             "-keyout", keyPath.path, "-out", certPath.path,
-            "-days", "3650", "-nodes", "-subj", "/CN=airdrop"
+            "-days", "3650", "-nodes", "-subj", "/CN=glidedrop"
         ])
     }
 }
@@ -55,7 +55,7 @@ func deriveSessionKey(sharedSecret: SharedSecret) -> SymmetricKey {
     let raw = sharedSecret.withUnsafeBytes { Data($0) }
     var hasher = SHA256()
     hasher.update(data: raw)
-    hasher.update(data: Data("AirDropP2P-v2-SessionKey".utf8))
+    hasher.update(data: Data("GlideDrop-v2-SessionKey".utf8))
     let keyBytes = hasher.finalize()
     return SymmetricKey(data: keyBytes)
 }
@@ -108,65 +108,64 @@ let MAC_PSM_CHAR_UUID = CBUUID(string: "52300002-A12D-4000-8000-523A12D00002")
 let P2P_SERVICE_UUID = CBUUID(string: "52300003-A12D-4000-8000-523A12D00003")
 let P2P_PSM_CHAR_UUID = CBUUID(string: "52300004-A12D-4000-8000-523A12D00004")
 let P2P_DATA_UUID = CBUUID(string: "CAFE")
-let SHOW_UI_NOTIFICATION = Notification.Name("com.airdrop.p2p.showWindow")
+let SHOW_UI_NOTIFICATION = Notification.Name("io.github.jakharamit44.glidedrop.showWindow")
 
 func resolveRepoRoot() -> URL {
-    if let env = ProcessInfo.processInfo.environment["AIRDROP_P2P_HOME"],
-       (FileManager.default.fileExists(atPath: "\(env)/macos/mac-airdrop-p2p.sh") || FileManager.default.fileExists(atPath: "\(env)/mac-airdrop-p2p.sh")) {
+    if let env = ProcessInfo.processInfo.environment["GLIDEDROP_HOME"],
+       (FileManager.default.fileExists(atPath: "\(env)/macos/glidedrop.sh") || FileManager.default.fileExists(atPath: "\(env)/glidedrop.sh")) {
         return URL(fileURLWithPath: env)
     }
-    // 1. If running inside AirDrop P2P.app bundle, check Resources
+    // 1. If running inside GlideDrop.app bundle, check Resources
     if let res = Bundle.main.resourceURL,
-       (FileManager.default.fileExists(atPath: res.appendingPathComponent("mac-airdrop-p2p.sh").path) ||
-        FileManager.default.fileExists(atPath: res.appendingPathComponent("macos/mac-airdrop-p2p.sh").path)) {
+       (FileManager.default.fileExists(atPath: res.appendingPathComponent("glidedrop.sh").path) ||
+        FileManager.default.fileExists(atPath: res.appendingPathComponent("macos/glidedrop.sh").path)) {
         return res
     }
     // 2. Check enclosing directory
     let enclosing = Bundle.main.bundleURL.deletingLastPathComponent()
-    if FileManager.default.fileExists(atPath: enclosing.appendingPathComponent("macos/mac-airdrop-p2p.sh").path) ||
-       FileManager.default.fileExists(atPath: enclosing.appendingPathComponent("mac-airdrop-p2p.sh").path) {
+    if FileManager.default.fileExists(atPath: enclosing.appendingPathComponent("macos/glidedrop.sh").path) ||
+       FileManager.default.fileExists(atPath: enclosing.appendingPathComponent("glidedrop.sh").path) {
         return enclosing
     }
     // 3. Argument 0 walking
     var url = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
     for _ in 0..<6 {
-        if FileManager.default.fileExists(atPath: url.appendingPathComponent("macos/mac-airdrop-p2p.sh").path) ||
-           FileManager.default.fileExists(atPath: url.appendingPathComponent("mac-airdrop-p2p.sh").path) ||
-           FileManager.default.fileExists(atPath: url.appendingPathComponent("mac-airdrop-lan.sh").path) {
+        if FileManager.default.fileExists(atPath: url.appendingPathComponent("macos/glidedrop.sh").path) ||
+           FileManager.default.fileExists(atPath: url.appendingPathComponent("glidedrop.sh").path) {
             return url
         }
         url.deleteLastPathComponent()
     }
     let pwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    if FileManager.default.fileExists(atPath: pwd.appendingPathComponent("macos/mac-airdrop-p2p.sh").path) {
+    if FileManager.default.fileExists(atPath: pwd.appendingPathComponent("macos/glidedrop.sh").path) {
         return pwd
     }
-    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p")
+    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop")
 }
 
 let REPO_ROOT = resolveRepoRoot()
 let STATE_DIR: URL = {
-    if let env = ProcessInfo.processInfo.environment["AIRDROP_P2P_STATE_DIR"], !env.isEmpty {
+    if let env = ProcessInfo.processInfo.environment["GLIDEDROP_STATE_DIR"], !env.isEmpty {
         let u = URL(fileURLWithPath: env)
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
         return u
     }
-    let u = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p")
+    let u = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop")
     try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
     return u
 }()
 let SCRIPT_PATH: String = {
-    if let p = Bundle.main.path(forResource: "mac-airdrop-p2p", ofType: "sh"), FileManager.default.fileExists(atPath: p) {
+    if let p = Bundle.main.path(forResource: "glidedrop", ofType: "sh"), FileManager.default.fileExists(atPath: p) {
         return p
     }
-    if let res = Bundle.main.resourceURL?.appendingPathComponent("mac-airdrop-p2p.sh").path, FileManager.default.fileExists(atPath: res) {
+    if let res = Bundle.main.resourceURL?.appendingPathComponent("glidedrop.sh").path, FileManager.default.fileExists(atPath: res) {
         return res
     }
-    let p0 = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p/mac-airdrop-p2p.sh").path
+    let p0 = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop/glidedrop.sh").path
     if FileManager.default.fileExists(atPath: p0) { return p0 }
-    let p1 = REPO_ROOT.appendingPathComponent("macos/mac-airdrop-p2p.sh").path
+    let p1 = REPO_ROOT.appendingPathComponent("macos/glidedrop.sh").path
     if FileManager.default.fileExists(atPath: p1) { return p1 }
-    let p2 = REPO_ROOT.appendingPathComponent("mac-airdrop-p2p.sh").path
+    let p2 = REPO_ROOT.appendingPathComponent("glidedrop.sh").path
     if FileManager.default.fileExists(atPath: p2) { return p2 }
     return p1
 }()
@@ -948,7 +947,7 @@ func disableMacInternetProxy() {
             }
             try? FileManager.default.removeItem(at: PREV_PROXY_FILE)
         } else {
-            // Fallback: If no snapshot file exists, only clear stale P2P / AirDrop proxy state (never unrelated local proxies)
+            // Fallback: If no snapshot file exists, only clear stale P2P proxy state (never unrelated local proxies)
             let (_, socksOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsocksfirewallproxy", targetService])
             let socksCfg = parseProxyOutput(socksOut)
             if socksCfg.server.starts(with: "192.168.49.") || (socksCfg.enabled && socksCfg.server == "127.0.0.1" && socksCfg.port == 1080) {
@@ -1284,7 +1283,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         return
     }
 
-    // Record authorized WP2P session so subsequent HTTP /Ask in mac-airdrop-p2p.sh accepts automatically without a 2nd prompt
+    // Record authorized WP2P session so subsequent HTTP /Ask in glidedrop.sh accepts automatically without a 2nd prompt
     let authSessionFile = STATE_DIR.appendingPathComponent("wp2p_authorized_session.json")
     let authPayload: [String: Any] = [
         "senderName": incomingPeerName,
@@ -1568,14 +1567,14 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                     pb.clearContents()
                     pb.setString(s, forType: .string)
                 }
-                safeMacNotification(message: "\(s)\n(Copied to clipboard)", title: "AirDrop link from \(sender)")
+                safeMacNotification(message: "\(s)\n(Copied to clipboard)", title: "GlideDrop link from \(sender)")
             }
         }
     }
 
     var savedFiles: [String] = []
     if !archiveData.isEmpty {
-        let tmpBin = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("airdrop_ble_\(UUID().uuidString).dvzip")
+        let tmpBin = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("glidedrop_ble_\(UUID().uuidString).dvzip")
         try? archiveData.write(to: tmpBin)
         let py = Process()
         py.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -1679,7 +1678,7 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                     if name == "TRAILER!!!":
                         break
                     if (mode & 0o170000) == 0o100000:
-                        sn = os.path.basename(name.replace("\\\\", "/")).lstrip(".") or "airdrop_file"
+                        sn = os.path.basename(name.replace("\\\\", "/")).lstrip(".") or "glidedrop_file"
                         t = (dest / sn).resolve()
                         if t.parent == dest:
                             orig_stem = t.stem
@@ -1706,7 +1705,7 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                                     part_t.rename(t)
                                     try:
                                         import subprocess
-                                        subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;AirDrop;", str(t)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;GlideDrop;", str(t)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                                     except Exception:
                                         pass
                                     print(t)
@@ -1750,15 +1749,15 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
         let target = downloads.appendingPathComponent(first)
         print("[BLE-RX] Saved to \(target.path)")
         fflush(stdout)
-        safeMacNotification(message: "Saved \(first) to Downloads", title: "AirDrop from \(sender)")
+        safeMacNotification(message: "Saved \(first) to Downloads", title: "GlideDrop from \(sender)")
     }
 }
 
 // ============================================================================
-// Daemon Mode: Mac BLE L2CAP AirDrop Receiver (Peripheral) + Live Peer BLE Scanner
+// Daemon Mode: Mac BLE L2CAP Receiver (Peripheral) + Live Peer BLE Scanner
 // ============================================================================
-final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralManagerDelegate, CBPeripheralDelegate {
-    static weak var shared: BleAirDropDaemon?
+final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralManagerDelegate, CBPeripheralDelegate {
+    static weak var shared: BleGlideDropDaemon?
     var pm: CBPeripheralManager!
     var cm: CBCentralManager!
     var activeChannels: [CBL2CAPChannel] = []
@@ -2420,7 +2419,7 @@ final class BleAirDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentralMa
 // ============================================================================
 // Sender Mode: Mac -> Android Direct BLE L2CAP Sender (Central)
 // ============================================================================
-final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var cm: CBCentralManager!
     var targetPeripheral: CBPeripheral?
     var activeChannel: CBL2CAPChannel?
@@ -3178,7 +3177,7 @@ struct MacPendingAsk: Equatable {
     let totalBytes: Int64
 }
 
-final class MacAirDropViewModel: ObservableObject {
+final class MacGlideDropViewModel: ObservableObject {
     @Published var selectedTab: Int = 0 // 0 = Send, 1 = Receive, 2 = History, 3 = Settings
     @Published var stagedItems: [MacStagedItem] = []
     @Published var showLinkComposer: Bool = false
@@ -3218,7 +3217,7 @@ final class MacAirDropViewModel: ObservableObject {
             return
         }
         let cfgPath = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".airdrop-p2p")
+            .appendingPathComponent(".glidedrop")
             .appendingPathComponent("claude_config.json")
         if let data = try? Data(contentsOf: cfgPath),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -3231,7 +3230,7 @@ final class MacAirDropViewModel: ObservableObject {
 
     func toggleAiSubsystem(_ enabled: Bool) {
         aiSubsystemEnabled = enabled
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p")
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let cfgPath = dir.appendingPathComponent("claude_config.json")
         var dict: [String: Any] = [:]
@@ -3437,7 +3436,7 @@ final class MacAirDropViewModel: ObservableObject {
 
         let auth = CBManager.authorization
         bluetoothAuthorized = (auth != .denied && auth != .restricted)
-        if let cmState = BleAirDropDaemon.shared?.cm.state {
+        if let cmState = BleGlideDropDaemon.shared?.cm.state {
             bluetoothPoweredOn = (cmState != .poweredOff)
         }
 
@@ -3490,7 +3489,7 @@ final class MacAirDropViewModel: ObservableObject {
 
     func rescanNow() {
         transferStatus = "Scanning BLE + 5 GHz Wi-Fi Direct for nearby devices…"
-        BleAirDropDaemon.shared?.rescanNow()
+        BleGlideDropDaemon.shared?.rescanNow()
         if !receiverRunning {
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
@@ -3523,10 +3522,10 @@ final class MacAirDropViewModel: ObservableObject {
         receiverRunning = turnOn
         saveMacSettings(autoAccept: autoAccept, visible: turnOn, deviceName: macDeviceName, themeMode: themeMode)
         if turnOn {
-            BleAirDropDaemon.shared?.startAdvertisingAndScanning()
-            BleAirDropDaemon.shared?.rescanNow()
+            BleGlideDropDaemon.shared?.startAdvertisingAndScanning()
+            BleGlideDropDaemon.shared?.rescanNow()
         } else {
-            BleAirDropDaemon.shared?.stopAdvertisingAndScanning()
+            BleGlideDropDaemon.shared?.stopAdvertisingAndScanning()
         }
         DispatchQueue.global(qos: .userInitiated).async {
             if turnOn {
@@ -3562,7 +3561,7 @@ final class MacAirDropViewModel: ObservableObject {
         cancelRequestedUntil = Date().timeIntervalSince1970 + 3.0
         let flag = STATE_DIR.appendingPathComponent("cancel_transfer.flag")
         try? String(Date().timeIntervalSince1970).write(to: flag, atomically: true, encoding: .utf8)
-        BleAirDropDaemon.shared?.cancelActivePing()
+        BleGlideDropDaemon.shared?.cancelActivePing()
         if let proc = activeSendProcess, proc.isRunning {
             proc.terminate()
         }
@@ -3576,7 +3575,7 @@ final class MacAirDropViewModel: ObservableObject {
         liveProgress = nil
         transferStatus = "Transfer cancelled"
         DispatchQueue.global(qos: .userInitiated).async {
-            for pattern in ["AirDropP2P send", "airdrop-p2p-daemon send", "mac-ble-airdrop send", "mac-airdrop-p2p.sh send"] {
+            for pattern in ["GlideDrop send", "glidedrop-daemon send", "glidedrop.sh send"] {
                 let killProc = Process()
                 killProc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
                 killProc.arguments = ["-f", pattern]
@@ -3792,7 +3791,7 @@ final class MacAirDropViewModel: ObservableObject {
         )
         transferStatus = "Connecting to \(targetName)…"
         try? Data("1".utf8).write(to: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-        BleAirDropDaemon.shared?.cancelActivePing()
+        BleGlideDropDaemon.shared?.cancelActivePing()
 
         DispatchQueue.global(qos: .userInitiated).async {
             let p = Process()
@@ -3826,7 +3825,7 @@ final class MacAirDropViewModel: ObservableObject {
                     self.stagedItems.removeAll()
                     self.transferStatus = "Sent \(summaryLabel) to \(targetName)"
                 } else {
-                    self.transferStatus = "Transfer failed: \(lastLine.isEmpty ? "Open AirDrop P2P on the receiving device and try again" : lastLine)"
+                    self.transferStatus = "Transfer failed: \(lastLine.isEmpty ? "Open GlideDrop on the receiving device and try again" : lastLine)"
                 }
                 self.refreshSlow()
             }
@@ -3834,8 +3833,8 @@ final class MacAirDropViewModel: ObservableObject {
     }
 }
 
-struct MacAirDropMainView: View {
-    @ObservedObject var vm: MacAirDropViewModel
+struct MacGlideDropMainView: View {
+    @ObservedObject var vm: MacGlideDropViewModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var p: MacThemePalette { vm.palette }
@@ -3916,7 +3915,7 @@ struct MacAirDropMainView: View {
     }
 
     // ========================================================================
-    // Top Header Bar (AirDrop Title + Radio Status + Day/Dark Toggle + Scan)
+    // Top Header Bar (GlideDrop Title + Radio Status + Day/Dark Toggle + Scan)
     // ========================================================================
     private var topHeaderBar: some View {
         HStack(spacing: 12) {
@@ -3932,7 +3931,7 @@ struct MacAirDropMainView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 7) {
-                    Text("AirDrop")
+                    Text("GlideDrop")
                         .font(.system(size: 19, weight: .bold, design: .rounded))
                         .foregroundColor(p.textPrimary)
                     HStack(spacing: 4) {
@@ -4764,7 +4763,7 @@ struct MacAirDropMainView: View {
                         Text("Scanning for nearby phones and Macs…")
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundColor(p.textPrimary)
-                        Text("Open AirDrop P2P on your Android phone with Bluetooth enabled.")
+                        Text("Open GlideDrop on your Android phone with Bluetooth enabled.")
                             .font(.system(size: 11))
                             .foregroundColor(p.textSecondary)
                     }
@@ -5549,7 +5548,7 @@ final class StatusBarDropView: NSView {
 
 final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let viewModel = MacAirDropViewModel()
+    let viewModel = MacGlideDropViewModel()
     var window: NSWindow?
     private var isShuttingDown = false
 
@@ -5563,12 +5562,12 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
         }
 
         if let btn = statusItem.button {
-            if let img = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: "AirDrop P2P") {
+            if let img = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: "GlideDrop") {
                 img.isTemplate = true
                 btn.image = img
                 btn.imagePosition = .imageLeading
             }
-            btn.title = " AirDrop"
+            btn.title = " GlideDrop"
             let dropView = StatusBarDropView(frame: btn.bounds)
             dropView.autoresizingMask = [.width, .height]
             dropView.onDropFiles = { [weak self] paths in
@@ -5578,7 +5577,7 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
         }
 
         let menu = NSMenu()
-        let openWin = NSMenuItem(title: "Open AirDrop P2P…", action: #selector(showMainWindow), keyEquivalent: "s")
+        let openWin = NSMenuItem(title: "Open GlideDrop…", action: #selector(showMainWindow), keyEquivalent: "s")
         openWin.target = self
         menu.addItem(openWin)
         menu.addItem(NSMenuItem.separator())
@@ -5597,7 +5596,7 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
         menu.addItem(openDl)
 
         menu.addItem(NSMenuItem.separator())
-        let quitItem = NSMenuItem(title: "Quit AirDrop P2P", action: #selector(quitApp), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit GlideDrop", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
 
@@ -5637,14 +5636,14 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
                 backing: .buffered,
                 defer: false
             )
-            win.title = "AirDrop P2P"
+            win.title = "GlideDrop"
             win.titleVisibility = .hidden
             win.titlebarAppearsTransparent = true
             win.isMovableByWindowBackground = true
             win.center()
             win.isReleasedWhenClosed = false
             win.delegate = self
-            win.contentView = NSHostingView(rootView: MacAirDropMainView(vm: viewModel))
+            win.contentView = NSHostingView(rootView: MacGlideDropMainView(vm: viewModel))
             window = win
         }
         applyWindowAppearance(viewModel.palette)
@@ -5656,7 +5655,7 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
 
     private func performCleanShutdown() {
         restoreMacInternetWifi()
-        BleAirDropDaemon.shared?.stopAdvertisingAndScanning()
+        BleGlideDropDaemon.shared?.stopAdvertisingAndScanning()
         for pf in ["daemon.pid", "mdns.pid", "awdl-mdns.pid"] {
             let f = STATE_DIR.appendingPathComponent(pf)
             if let s = try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
@@ -5862,10 +5861,10 @@ if args.count >= 2 && args[1] == "restore-wifi" {
         .map { URL(fileURLWithPath: $0) }
         .filter { FileManager.default.fileExists(atPath: $0.path) }
     guard !fileUrls.isEmpty || !urls.isEmpty else {
-        print("Usage: mac-ble-airdrop send <file_or_url1> [file_or_url2 ...]")
+        print("Usage: glidedrop-daemon send <file_or_url1> [file_or_url2 ...]")
         exit(1)
     }
-    let sender = try BleAirDropSender(files: fileUrls, urls: urls)
+    let sender = try BleGlideDropSender(files: fileUrls, urls: urls)
     withExtendedLifetime(sender) {
         DispatchQueue.global().asyncAfter(deadline: .now() + 300.0) {
             writeProgressJson(active: false)
@@ -5928,12 +5927,12 @@ if args.count >= 2 && args[1] == "restore-wifi" {
     if let icns = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
        let iconImg = NSImage(contentsOf: icns) {
         app.applicationIconImage = iconImg
-    } else if let iconImg = NSImage(contentsOfFile: REPO_ROOT.appendingPathComponent("AirDrop P2P.app/Contents/Resources/AppIcon.icns").path) {
+    } else if let iconImg = NSImage(contentsOfFile: REPO_ROOT.appendingPathComponent("GlideDrop.app/Contents/Resources/AppIcon.icns").path) {
         app.applicationIconImage = iconImg
-    } else if let iconImg = NSImage(contentsOfFile: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".airdrop-p2p/AppIcon.icns").path) {
+    } else if let iconImg = NSImage(contentsOfFile: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop/AppIcon.icns").path) {
         app.applicationIconImage = iconImg
     }
-    let daemon = BleAirDropDaemon()
+    let daemon = BleGlideDropDaemon()
     let bar = StatusBarController(openWindowOnLaunch: !isBackgroundDaemon)
     app.delegate = bar
     let awdlBridge = try? AwdlLoopbackBridge(listenPort: 8774, targetPort: 8773)

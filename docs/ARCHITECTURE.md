@@ -1,6 +1,6 @@
-# AirDrop P2P Architecture & Protocol Specification
+# GlideDrop Architecture & Protocol Specification
 
-AirDrop P2P transfers files, links, and text notes directly between Android (API 31+) and macOS (13+) without a shared Wi-Fi router, local area network (LAN), cloud relay, or USB cable.
+GlideDrop transfers files, links, and text notes directly between Android (API 31+) and macOS (13+) without a shared Wi-Fi router, local area network (LAN), cloud relay, or USB cable.
 
 ## 1. Bidirectional Transfer Flow
 
@@ -56,19 +56,19 @@ AirDrop P2P transfers files, links, and text notes directly between Android (API
 
 * **Autonomous 5 GHz Group**: Android creates a temporary Wi-Fi Direct Group Owner (GO) on 5 GHz (Band 4 / UNII-3) with a per-session random 12-hex-character WPA2 passphrase.
 * **DVZip + Extended 64-bit CPIO**: Archives stream directly from source file descriptors over HTTP/1.1 chunked encoding to `/Upload` (`port 8772` on macOS, `port 8771` on Android). Files up to 8 GiB use standard POSIX `070707` headers; files 8 GiB and larger switch to extended `070764` headers with 64-bit hex sizes, writing safely via `.part` staging and canonical destination checks.
-* **macOS Finder AirDrop Proxy (`awdl0`)**: When an Android peer is nearby, macOS advertises `_airdrop._tcp` on `awdl0:8774`, receives drops on `127.0.0.1:8773`, and forwards them to the Android peer.
+* **macOS Finder Share Proxy (`awdl0`)**: When an Android peer is nearby, macOS advertises internal `_airdrop._tcp` on `awdl0:8774` (`glidedrop.local.`), receives drops on `127.0.0.1:8773`, and forwards them to the Android peer.
 
 ### C. Kernel Neighbor Cache Keepalive
 
-Unidirectional HTTP uploads at 45+ MB/s can starve reverse ARP traffic, causing the Linux neighbor table on Android to mark the peer `STALE` after roughly 30 seconds and drop packets. During active 5 GHz sessions, `AirDropNode` emits UDP keepalive pulses every 2.0 seconds to port `8774` over the `p2p-wlan0-*` network so the neighbor entry stays in `NUD_REACHABLE` throughout multi-gigabyte transfers.
+Unidirectional HTTP uploads at 45+ MB/s can starve reverse ARP traffic, causing the Linux neighbor table on Android to mark the peer `STALE` after roughly 30 seconds and drop packets. During active 5 GHz sessions, `GlideDropNode` emits UDP keepalive pulses every 2.0 seconds to port `8774` over the `p2p-wlan0-*` network so the neighbor entry stays in `NUD_REACHABLE` throughout multi-gigabyte transfers.
 
 ### D. Embedded Dual-Protocol Internet Proxy (`port 1080`)
 
-When macOS switches Wi-Fi to the offline `DIRECT-*` SSID, [`EmbeddedProxyServer.kt`](../android/app/src/main/java/com/airdrop/p2p/EmbeddedProxyServer.kt) can serve SOCKS5 (RFC 1928) and HTTP `CONNECT`/Forward traffic on port `1080`, binding outbound sockets to Android's active validated internet network or cellular fallback (`ConnectivityManager`).
+When macOS switches Wi-Fi to the offline `DIRECT-*` SSID, [`EmbeddedProxyServer.kt`](../android/app/src/main/java/io/github/jakharamit44/glidedrop/EmbeddedProxyServer.kt) can serve SOCKS5 (RFC 1928) and HTTP `CONNECT`/Forward traffic on port `1080`, binding outbound sockets to Android's active validated internet network or cellular fallback (`ConnectivityManager`).
 
 * Only `192.168.49.0/24` and loopback clients are accepted.
 * Post-DNS SSRF checks block connections back to loopback/P2P control ports (`8771`, `1080`) and the `192.168.49.0/24` subnet.
-* On macOS, `mac-ble-airdrop.swift` serializes snapshot and restore operations under an advisory file lock (`proxy_state.lock`) via `networksetup`, preserving existing proxy settings and bypass domains without `sudo`.
+* On macOS, `glidedrop-daemon.swift` serializes snapshot and restore operations under an advisory file lock (`proxy_state.lock`) via `networksetup`, preserving existing proxy settings and bypass domains without `sudo`.
 
 ### E. macOS Wi-Fi & VPN Recovery
 

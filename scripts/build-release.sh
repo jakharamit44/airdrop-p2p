@@ -7,7 +7,7 @@ VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || echo "2.0.0")"
 RELEASE_DIR="$ROOT_DIR/release"
 
 echo "====================================================="
-echo " Building AirDrop P2P Release v${VERSION}"
+echo " Building GlideDrop Release v${VERSION}"
 echo "====================================================="
 
 mkdir -p "$RELEASE_DIR"
@@ -28,7 +28,7 @@ if [ -z "${JAVA_HOME:-}" ] || [[ "$("${JAVA_HOME}/bin/java" -version 2>&1)" =~ "
 fi
 ./gradlew assembleDebug --no-daemon
 APK_SRC="$ROOT_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
-APK_DEST="$RELEASE_DIR/AirDrop-P2P-v${VERSION}.apk"
+APK_DEST="$RELEASE_DIR/GlideDrop-v${VERSION}.apk"
 cp -f "$APK_SRC" "$APK_DEST"
 echo "  -> Created: $APK_DEST ($(du -h "$APK_DEST" | cut -f1))"
 
@@ -39,13 +39,13 @@ cd "$ROOT_DIR"
 
 # 3. Create macOS DMG Package
 echo "[3/4] Creating macOS DMG installer..."
-DMG_DEST="$RELEASE_DIR/AirDrop-P2P-v${VERSION}.dmg"
-DMG_TMP="$(mktemp -d /tmp/airdrop_dmg_XXXXXX)"
-cp -R "$ROOT_DIR/AirDrop P2P.app" "$DMG_TMP/"
+DMG_DEST="$RELEASE_DIR/GlideDrop-v${VERSION}.dmg"
+DMG_TMP="$(mktemp -d /tmp/glidedrop_dmg_XXXXXX)"
+cp -R "$ROOT_DIR/GlideDrop.app" "$DMG_TMP/"
 ln -s /Applications "$DMG_TMP/Applications"
 if [ -f "$ROOT_DIR/macos/open-app.command" ]; then
-  cp -f "$ROOT_DIR/macos/open-app.command" "$DMG_TMP/Open AirDrop P2P (Bypass Gatekeeper).command"
-  chmod +x "$DMG_TMP/Open AirDrop P2P (Bypass Gatekeeper).command"
+  cp -f "$ROOT_DIR/macos/open-app.command" "$DMG_TMP/Open GlideDrop (Bypass Gatekeeper).command"
+  chmod +x "$DMG_TMP/Open GlideDrop (Bypass Gatekeeper).command"
 fi
 
 # Set custom volume icon
@@ -59,50 +59,50 @@ fi
 # Provide first-time user guidance for Gatekeeper bypass
 cat > "$DMG_TMP/READ ME - HOW TO OPEN.txt" << EOF
 ===========================================================
-  AirDrop P2P v${VERSION} - Installation & First Launch Guide
+  GlideDrop v${VERSION} - Installation & First Launch Guide
 ===========================================================
 
 1. INSTALLATION:
-   Drag "AirDrop P2P.app" into the "Applications" folder.
+   Drag "GlideDrop.app" into the "Applications" folder.
 
 2. FIRST TIME OPENING (macOS Gatekeeper):
    If macOS shows:
-   "AirDrop P2P.app is damaged and can't be opened"
+   "GlideDrop.app is damaged and can't be opened"
    This is macOS Gatekeeper blocking unsigned open-source apps downloaded via Safari.
 
    To open it instantly:
    Option A (Easiest):
-   Double-click: "Open AirDrop P2P (Bypass Gatekeeper).command"
+   Double-click: "Open GlideDrop (Bypass Gatekeeper).command"
 
    Option B (Terminal):
    Open Terminal and paste:
-   xattr -cr "/Applications/AirDrop P2P.app"
+   xattr -cr "/Applications/GlideDrop.app"
 
    Option C (System Settings):
    Go to System Settings -> Privacy & Security, scroll down and click "Open Anyway".
 
-3. Once opened, AirDrop P2P will live in your menu bar and radar window!
+3. Once opened, GlideDrop will live in your menu bar and radar window!
 ===========================================================
 EOF
 
 xattr -cr "$DMG_TMP"
 rm -f "$DMG_DEST"
-hdiutil create -volname "AirDrop P2P v${VERSION}" -srcfolder "$DMG_TMP" -ov -format UDZO "$DMG_DEST"
+hdiutil create -volname "GlideDrop v${VERSION}" -srcfolder "$DMG_TMP" -ov -format UDZO "$DMG_DEST"
 rm -rf "$DMG_TMP"
 echo "  -> Created: $DMG_DEST ($(du -h "$DMG_DEST" | cut -f1))"
 
 # 3b. Create macOS Native PKG installer (auto-unquarantines during install)
-PKG_DEST="$RELEASE_DIR/AirDrop-P2P-v${VERSION}.pkg"
+PKG_DEST="$RELEASE_DIR/GlideDrop-v${VERSION}.pkg"
 if command -v pkgbuild >/dev/null 2>&1; then
   echo "[+] Creating macOS PKG installer..."
-  PKG_SCRIPTS="$(mktemp -d /tmp/airdrop_pkg_scripts_XXXXXX)"
+  PKG_SCRIPTS="$(mktemp -d /tmp/glidedrop_pkg_scripts_XXXXXX)"
   cat > "$PKG_SCRIPTS/postinstall" << 'EOF'
 #!/bin/bash
-xattr -cr "/Applications/AirDrop P2P.app" 2>/dev/null || true
+xattr -cr "/Applications/GlideDrop.app" 2>/dev/null || true
 exit 0
 EOF
   chmod +x "$PKG_SCRIPTS/postinstall"
-  pkgbuild --component "$ROOT_DIR/AirDrop P2P.app" \
+  pkgbuild --component "$ROOT_DIR/GlideDrop.app" \
            --install-location "/Applications" \
            --scripts "$PKG_SCRIPTS" \
            "$PKG_DEST"
@@ -113,9 +113,9 @@ fi
 # 4. Generate SHA256 Checksums
 echo "[4/4] Calculating SHA-256 Checksums..."
 cd "$RELEASE_DIR"
-FILES_TO_SUM=("AirDrop-P2P-v${VERSION}.apk" "AirDrop-P2P-v${VERSION}.dmg")
+FILES_TO_SUM=("GlideDrop-v${VERSION}.apk" "GlideDrop-v${VERSION}.dmg")
 if [ -f "$PKG_DEST" ]; then
-  FILES_TO_SUM+=("AirDrop-P2P-v${VERSION}.pkg")
+  FILES_TO_SUM+=("GlideDrop-v${VERSION}.pkg")
 fi
 shasum -a 256 "${FILES_TO_SUM[@]}" > "$RELEASE_DIR/SHA256SUMS.txt"
 cat "$RELEASE_DIR/SHA256SUMS.txt"

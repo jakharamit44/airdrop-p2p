@@ -1,4 +1,4 @@
-package com.airdrop.p2p.theme
+package io.github.jakharamit44.glidedrop.theme
 
 import ds.tokens.DsDarkColors
 import ds.tokens.DsLightColors

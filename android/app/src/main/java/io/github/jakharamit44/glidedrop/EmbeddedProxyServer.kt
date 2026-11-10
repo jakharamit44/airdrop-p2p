@@ -1,4 +1,4 @@
-package com.airdrop.p2p
+package io.github.jakharamit44.glidedrop
 
 import android.content.Context
 import android.net.ConnectivityManager
@@ -118,7 +118,7 @@ class EmbeddedProxyServer(
                 .trimEnd('.')
             if (cleanHost.isEmpty()) return false
 
-            // Prevent SSRF loop back to local AirDrop or proxy daemon
+            // Prevent SSRF loop back to local GlideDrop or proxy daemon
             if (port == 8771 || port == DEFAULT_PROXY_PORT) {
                 if (cleanHost == "localhost" ||
                     cleanHost == "0.0.0.0" ||

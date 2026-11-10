@@ -1,6 +1,13 @@
 # Changelog
 
-All notable changes to AirDrop P2P are documented in this file.
+All notable changes to GlideDrop are documented in this file.
+
+## [v2.5.0] - 2026-11-10
+### Rebrand & Icon Redesign
+- **Rebranded Project to GlideDrop**: Renamed application ID (`io.github.jakharamit44.glidedrop` on Android, `io.github.jakharamit44.glidedrop.mac` on macOS), package namespaces, app bundles (`GlideDrop.app`, `GlideDrop-v2.5.0.apk/.dmg/.pkg`), daemon state directories (`~/.glidedrop`), Downloads subfolder (`Downloads/GlideDrop`), Wi-Fi Direct group prefix (`DIRECT-GlideDrop`), and mDNS proxy hostname (`glidedrop.local.`) cleanly across both platforms.
+- **Synchronized ECDH & BLE Domain Separation**: Updated P-256 HKDF session derivation (`GlideDrop-v2-SessionKey`) and BLE L2CAP AEAD framing keys (`GlideDrop-E2EE-AES256GCM-v2`) in lockstep across `GlideDropNode.kt`, `glidedrop-daemon.swift`, and cross-language unit test vectors.
+- **Original Directional Glide Emblem**: Replaced concentric radio wave icons across macOS (`AppIcon.icns`), Android adaptive and legacy launcher icons (`ic_launcher_foreground.xml`, `mipmap-*/ic_launcher*.webp`), and web assets (`favicon.svg`, `icon-512.png`, `apple-touch-icon.png`, `og-image.png`) with an original mirrored aerodynamic wing design.
+- **Repository & Trademark Attribution**: Migrated repository URLs and GitHub Pages site to `jakharamit44/glidedrop` and added nominative fair-use descriptions and trademark disclaimers in documentation and landing page.
 
 ## [v2.4.1] - 2026-11-10
 

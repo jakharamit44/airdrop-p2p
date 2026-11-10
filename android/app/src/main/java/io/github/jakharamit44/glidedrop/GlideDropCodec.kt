@@ -1,4 +1,4 @@
-package com.airdrop.p2p
+package io.github.jakharamit44.glidedrop
 
 import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
@@ -16,12 +16,12 @@ import java.util.zip.GZIPInputStream
 import java.util.zip.Inflater
 
 /**
- * AirDrop wire codecs ported from netmojo-systems/omdrop-plugin:
- * 1. Apple binary plist (bplist00) encoder/decoder for /Discover and /Ask
+ * GlideDrop wire codecs (compatible with Apple bplist00 & DVZip/CPIO):
+ * 1. Binary plist (bplist00) encoder/decoder for /Discover and /Ask
  * 2. DVZip + CPIO (070707 odc / 070701 newc / 070764 64-bit) streaming archive encoder/decoder for /Upload
  * 3. Apple Continuity BLE (0x004C, type 0x05) wake payload
  */
-object AirDropCodec {
+object GlideDropCodec {
 
     const val DVZIP_BLOCK_BYTES = 65536
     const val DVZIP_STORED_BLOCK_BYTES = 1_048_576
@@ -76,7 +76,7 @@ object AirDropCodec {
         val base = rawPath.replace('\\', '/').substringAfterLast('/').trim()
         val cleaned = base.replace(Regex("[\\x00-\\x1f\\x7f-\\x9f/\\\\]"), "_")
             .trimStart('.')
-        return cleaned.ifEmpty { "airdrop_file" }.take(240)
+        return cleaned.ifEmpty { "glidedrop_file" }.take(240)
     }
 
     // =========================================================================

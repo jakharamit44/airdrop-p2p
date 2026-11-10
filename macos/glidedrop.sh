@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pure P2P AirDrop Receiver & Daemon for macOS <-> Android
-# Speaks Apple AirDrop 1.0 (BLE L2CAP + 5GHz Wi-Fi Direct WP2P + mDNS AWDL bridge + TLS 1.2/1.3
+# Pure P2P GlideDrop Receiver & Daemon for macOS <-> Android
+# Speaks BLE L2CAP + 5GHz Wi-Fi Direct WP2P + internal AWDL proxy + TLS 1.2/1.3
 # /Discover, /Ask, /Upload with bplist00 and DVZip 070707/070701 CPIO streaming archives).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_DIR="${AIRDROP_P2P_STATE_DIR:-$HOME/.airdrop-p2p}"
+STATE_DIR="${GLIDEDROP_STATE_DIR:-$HOME/.glidedrop}"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 
@@ -16,50 +16,50 @@ AWDL_MDNS_PID_FILE="$STATE_DIR/awdl-mdns.pid"
 BLE_PID_FILE="$STATE_DIR/ble-daemon.pid"
 LOG_FILE="$STATE_DIR/daemon.log"
 BLE_LOG_FILE="$STATE_DIR/ble-daemon.log"
-if [[ -x "/Applications/AirDrop P2P.app/Contents/MacOS/AirDropP2P" ]]; then
-  BLE_BIN="/Applications/AirDrop P2P.app/Contents/MacOS/AirDropP2P"
-elif [[ -x "$SCRIPT_DIR/AirDrop P2P.app/Contents/MacOS/AirDropP2P" ]]; then
-  BLE_BIN="$SCRIPT_DIR/AirDrop P2P.app/Contents/MacOS/AirDropP2P"
+if [[ -x "/Applications/GlideDrop.app/Contents/MacOS/GlideDrop" ]]; then
+  BLE_BIN="/Applications/GlideDrop.app/Contents/MacOS/GlideDrop"
+elif [[ -x "$SCRIPT_DIR/GlideDrop.app/Contents/MacOS/GlideDrop" ]]; then
+  BLE_BIN="$SCRIPT_DIR/GlideDrop.app/Contents/MacOS/GlideDrop"
 else
-  BLE_BIN="$STATE_DIR/airdrop-p2p-daemon"
+  BLE_BIN="$STATE_DIR/glidedrop-daemon"
 fi
 PORT=8772
 PROXY_PORT=8773
-MAC_SERVICE_ID="airdrop77a8b9c0"
+MAC_SERVICE_ID="glidedrop77a8b9c0"
 
 ensure_cert() {
   if [[ ! -f "$STATE_DIR/cert.pem" || ! -f "$STATE_DIR/key.pem" ]]; then
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
       -keyout "$STATE_DIR/key.pem" -out "$STATE_DIR/cert.pem" \
-      -days 3650 -nodes -subj "/CN=airdrop" >/dev/null 2>&1
+      -days 3650 -nodes -subj "/CN=glidedrop" >/dev/null 2>&1
   fi
 }
 
 ensure_ble_bin() {
-  if [[ -f "$SCRIPT_DIR/mac-ble-airdrop.swift" ]] && [[ ! -x "$BLE_BIN" || "$SCRIPT_DIR/mac-ble-airdrop.swift" -nt "$BLE_BIN" ]]; then
-    xcrun swiftc -O "$SCRIPT_DIR/mac-ble-airdrop.swift" -o "$BLE_BIN" >/dev/null 2>&1 || true
-    APP_MACOS="$SCRIPT_DIR/AirDrop P2P.app/Contents/MacOS"
-    APP_RES="$SCRIPT_DIR/AirDrop P2P.app/Contents/Resources"
+  if [[ -f "$SCRIPT_DIR/glidedrop-daemon.swift" ]] && [[ ! -x "$BLE_BIN" || "$SCRIPT_DIR/glidedrop-daemon.swift" -nt "$BLE_BIN" ]]; then
+    xcrun swiftc -O "$SCRIPT_DIR/glidedrop-daemon.swift" -o "$BLE_BIN" >/dev/null 2>&1 || true
+    APP_MACOS="$SCRIPT_DIR/GlideDrop.app/Contents/MacOS"
+    APP_RES="$SCRIPT_DIR/GlideDrop.app/Contents/Resources"
     mkdir -p "$APP_MACOS" "$APP_RES"
-    cp -f "$BLE_BIN" "$APP_MACOS/AirDropP2P" 2>/dev/null || true
-    cp -f "$SCRIPT_DIR/mac-airdrop-p2p.sh" "$APP_RES/mac-airdrop-p2p.sh" 2>/dev/null || true
-    chmod +x "$APP_RES/mac-airdrop-p2p.sh" 2>/dev/null || true
+    cp -f "$BLE_BIN" "$APP_MACOS/GlideDrop" 2>/dev/null || true
+    cp -f "$SCRIPT_DIR/glidedrop.sh" "$APP_RES/glidedrop.sh" 2>/dev/null || true
+    chmod +x "$APP_RES/glidedrop.sh" 2>/dev/null || true
     APP_VER="$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "2.4.1")"
-    cat > "$SCRIPT_DIR/AirDrop P2P.app/Contents/Info.plist" << PLIST
+    cat > "$SCRIPT_DIR/GlideDrop.app/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>CFBundleExecutable</key>
-  <string>AirDropP2P</string>
+  <string>GlideDrop</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
-  <string>com.airdrop.p2p.mac</string>
+  <string>io.github.jakharamit44.glidedrop.mac</string>
   <key>CFBundleName</key>
-  <string>AirDrop P2P</string>
+  <string>GlideDrop</string>
   <key>CFBundleDisplayName</key>
-  <string>AirDrop P2P</string>
+  <string>GlideDrop</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -71,9 +71,9 @@ ensure_ble_bin() {
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
-  <string>AirDrop P2P uses Bluetooth LE L2CAP to discover and transfer files with Android devices.</string>
+  <string>GlideDrop uses Bluetooth LE L2CAP to discover and transfer files with Android devices.</string>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>AirDrop P2P requires local network access to discover nearby devices and transfer files over high-speed Wi-Fi Direct and local sockets.</string>
+  <string>GlideDrop requires local network access to discover nearby devices and transfer files over high-speed Wi-Fi Direct and local sockets.</string>
 </dict>
 </plist>
 PLIST
@@ -87,8 +87,7 @@ stop_http_daemons() {
       rm -f "$pf"
     fi
   done
-  pkill -f "airdropp2p.local." 2>/dev/null || true
-  pkill -f "airdrop-p2p.local." 2>/dev/null || true
+  pkill -f "glidedrop.local." 2>/dev/null || true
   pkill -f "$MAC_SERVICE_ID" 2>/dev/null || true
 }
 
@@ -98,9 +97,8 @@ stop_daemons() {
     kill "$(cat "$BLE_PID_FILE")" 2>/dev/null || true
     rm -f "$BLE_PID_FILE"
   fi
-  pkill -f "airdrop-p2p-daemon" 2>/dev/null || true
-  pkill -f "mac-ble-airdrop daemon" 2>/dev/null || true
-  pkill -x "AirDropP2P" 2>/dev/null || true
+  pkill -f "glidedrop-daemon" 2>/dev/null || true
+  pkill -x "GlideDrop" 2>/dev/null || true
   rm -f "$STATE_DIR/tx_in_progress.lock" "$STATE_DIR/rx_in_progress.lock" "$STATE_DIR/transfer_progress.json" "$STATE_DIR/cancel_transfer.flag" "$STATE_DIR/lan_fallback_active.flag" "$STATE_DIR/pending_ask.json" "$STATE_DIR/wp2p_authorized_session.json" 2>/dev/null || true
 }
 
@@ -121,8 +119,8 @@ start_daemons() {
   # Pure P2P Mode: Do NOT advertise on shared LAN router mDNS (_airdrop._tcp.local. without interface restriction).
   # Discovery is strictly over Direct Bluetooth LE L2CAP + 5GHz Wi-Fi Direct P2P (and local awdl0 for Finder integration).
 
-  # Start Direct Bluetooth LE L2CAP receiver only if AirDrop P2P app is not already running
-  if [[ "${SKIP_BLE_RESTART:-0}" != "1" ]] && ! pgrep -f "AirDrop P2P.app" >/dev/null 2>&1 && ! pgrep -x "AirDropP2P" >/dev/null 2>&1; then
+  # Start Direct Bluetooth LE L2CAP receiver only if GlideDrop app is not already running
+  if [[ "${SKIP_BLE_RESTART:-0}" != "1" ]] && ! pgrep -f "GlideDrop.app" >/dev/null 2>&1 && ! pgrep -x "GlideDrop" >/dev/null 2>&1; then
     if [[ ! -f "$BLE_PID_FILE" ]] || ! kill -0 "$(cat "$BLE_PID_FILE")" 2>/dev/null; then
       if [[ -x "$BLE_BIN" ]]; then
         nohup "$BLE_BIN" daemon >"$BLE_LOG_FILE" 2>&1 < /dev/null &
@@ -131,8 +129,8 @@ start_daemons() {
     fi
   fi
 
-  # Start HTTPS AirDrop 1.0 receiver (8772) + Native Finder AirDrop Android proxy (8773)
-  nohup python3 -u - "$STATE_DIR/cert.pem" "$STATE_DIR/key.pem" "$PORT" "$PROXY_PORT" "$SCRIPT_DIR/mac-airdrop-p2p.sh" >"$LOG_FILE" 2>&1 << 'PYEOF' &
+  # Start HTTPS receiver (8772) + Finder Share Android proxy (8773)
+  nohup python3 -u - "$STATE_DIR/cert.pem" "$STATE_DIR/key.pem" "$PORT" "$PROXY_PORT" "$SCRIPT_DIR/glidedrop.sh" >"$LOG_FILE" 2>&1 << 'PYEOF' &
 import gzip, io, json, os, plistlib, queue, re, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, uuid, zlib
 from pathlib import Path
 
@@ -369,10 +367,10 @@ def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int) -
             time.sleep(0.5)
             if dec_file.exists():
                 return
-            # If AirDrop P2P GUI is running, it renders the modal inside the window.
+            # If GlideDrop GUI is running, it renders the modal inside the window.
             # Do NOT prompt with osascript to prevent double accept prompts.
             try:
-                out = subprocess.check_output(["pgrep", "-f", "AirDrop P2P"], text=True)
+                out = subprocess.check_output(["pgrep", "-x", "GlideDrop"], text=True)
                 if out.strip():
                     return
             except Exception:
@@ -381,7 +379,7 @@ def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int) -
                 res = subprocess.check_output([
                     "osascript",
                     "-e", "on run argv",
-                    "-e", 'tell application "System Events" to display dialog ((item 1 of argv) & " wants to share " & (item 2 of argv) & " with you.") with title "AirDrop P2P" buttons {"Decline", "Accept"} default button "Accept" giving up after 40',
+                    "-e", 'tell application "System Events" to display dialog ((item 1 of argv) & " wants to share " & (item 2 of argv) & " with you.") with title "GlideDrop" buttons {"Decline", "Accept"} default button "Accept" giving up after 40',
                     "-e", "end run",
                     "--",
                     str(sender_name)[:80],
@@ -421,7 +419,7 @@ def read_line(f):
 
 def restore_internet_wifi():
     try:
-        for b_name in ["airdrop-p2p-daemon", "mac-ble-airdrop"]:
+        for b_name in ["glidedrop-daemon"]:
             ble_bin = STATE_DIR / b_name
             if ble_bin.exists() and os.access(str(ble_bin), os.X_OK):
                 subprocess.run([str(ble_bin), "restore-wifi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -862,7 +860,7 @@ def extract_cpio_stream(stream, dest_dir: Path):
                 if rem > 0:
                     raise IOError(f"Transfer stream truncated on metadata: expected {filesize} bytes, missing {rem} bytes")
             else:
-                safe_name = raw_base.lstrip(".") or "airdrop_file"
+                safe_name = raw_base.lstrip(".") or "glidedrop_file"
                 target = dest_dir / safe_name
                 if target.resolve().parent == dest_dir.resolve():
                     idx = 1
@@ -888,7 +886,7 @@ def extract_cpio_stream(stream, dest_dir: Path):
                             raise IOError(f"Transfer stream truncated: expected {filesize} bytes, missing {rem} bytes")
                         part_target.rename(target)
                         try:
-                            subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;AirDrop;", str(target)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;GlideDrop;", str(target)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         except Exception:
                             pass
                         saved.append(target)
@@ -1070,7 +1068,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     "ReceiverComputerName": active_peer_name if is_p2p_proxy else current_mac_name(),
                     "ReceiverModelName": "iPhone16,2" if is_p2p_proxy else "MacBookPro18,2",
                     "ReceiverMediaCapabilities": MEDIA_CAP,
-                    "IsAirDropable": True,
+                    "IsAirDropable": True,  # Apple AWDL Discover wire-protocol bplist key
                 }, fmt=plistlib.FMT_BINARY)
                 send_resp(conn, 200, "OK", resp)
             elif method == "POST" and path == "/Ask":
@@ -1119,14 +1117,14 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                                 p.communicate(input=it.encode("utf-8"), timeout=2.0)
                             except Exception:
                                 pass
-                            safe_notify(f"Received link (copied to clipboard): {it}", f"AirDrop from {last_sender}")
+                            safe_notify(f"Received link (copied to clipboard): {it}", f"GlideDrop from {last_sender}")
                             # Prompt user with an action button instead of auto-launching browser
                             def prompt_user_url_action(target_url: str, sender_name: str):
                                 try:
                                     escaped_url = target_url.replace('\\', '\\\\').replace('"', '\\"')
                                     escaped_sender = sender_name.replace('\\', '\\\\').replace('"', '\\"')
                                     apple_script = (
-                                        f'set res to display alert "AirDrop Link Received" '
+                                        f'set res to display alert "GlideDrop Link Received" '
                                         f'message "Link from {escaped_sender}:\n{escaped_url}\n\n(Copied to clipboard)" '
                                         f'buttons {{"Dismiss", "Open in Browser"}} default button "Dismiss"\n'
                                         f'if button returned of res is "Open in Browser" then\n'
@@ -1141,7 +1139,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     "ReceiverComputerName": active_peer_name if is_p2p_proxy else current_mac_name(),
                     "ReceiverModelName": "iPhone16,2" if is_p2p_proxy else "MacBookPro18,2",
                     "ReceiverMediaCapabilities": MEDIA_CAP,
-                    "IsAirDropable": True,
+                    "IsAirDropable": True,  # Apple AWDL Discover wire-protocol bplist key
                 }, fmt=plistlib.FMT_BINARY)
                 send_resp(conn, 200, "OK", resp)
             elif method == "POST" and path == "/Upload":
@@ -1151,7 +1149,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     break
                 conn.settimeout(30.0)
                 if is_p2p_proxy:
-                    tmp_dir = Path(tempfile.mkdtemp(prefix="airdrop_finder_proxy_"))
+                    tmp_dir = Path(tempfile.mkdtemp(prefix="glidedrop_finder_proxy_"))
                     saved, rx_len = stream_upload_to_dir(f, headers, tmp_dir, track_progress=False, file_label=last_label, expected_total=exp_tot, file_count=last_count)
                     print(f"[{role}] {method} {path} from {addr} ({rx_len} B)")
                     sig = tuple((p.name, p.stat().st_size) for p in saved)
@@ -1163,7 +1161,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     else:
                         if sig:
                             RECENT_UPLOADS[sig] = now
-                        print(f"[Finder-Proxy] Forwarding {len(saved)} file(s) from Finder AirDrop to {active_peer_name}: {[p.name for p in saved]}")
+                        print(f"[Finder-Proxy] Forwarding {len(saved)} file(s) from Finder Share Proxy to {active_peer_name}: {[p.name for p in saved]}")
                         threading.Thread(target=forward_to_peer_worker, args=(tmp_dir, saved), daemon=True).start()
                     break
                 else:
@@ -1178,7 +1176,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                         sz = p.stat().st_size
                         print(f"[+] Saved to {p} ({sz} B)")
                         append_history("FILE", str(p), sz, "received", last_sender)
-                        safe_notify(f"Saved {p.name} to Downloads", f"AirDrop from {last_sender}")
+                        safe_notify(f"Saved {p.name} to Downloads", f"GlideDrop from {last_sender}")
                         # Automatic Claude AI Analysis & Ingestion Hook (concurrency bounded)
                         enqueue_claude_processing(p)
                     send_resp(conn, 200, "OK", b"")
@@ -1258,7 +1256,7 @@ def serve_port(bind_port: int, is_p2p_proxy: bool):
         set_high_throughput_sockbufs(sock)
         sock.bind(("::", bind_port))
     sock.listen(32)
-    label = "Finder AirDrop Proxy" if is_p2p_proxy else f"5GHz Wi-Fi Direct P2P Receiver ('{current_mac_name()}')"
+    label = "Finder Share Proxy" if is_p2p_proxy else f"5GHz Wi-Fi Direct P2P Receiver ('{current_mac_name()}')"
     bind_desc = f"127.0.0.1:{bind_port}" if is_p2p_proxy else f"*:{bind_port}"
     print(f"[+] {label} listening on {bind_desc}")
     while True:
@@ -1322,7 +1320,8 @@ def watch_awdl_mdns():
                 if proc and proc.poll() is None:
                     proc.terminate()
                 proc = subprocess.Popen(
-                    ["dns-sd", "-i", "awdl0", "-P", "380d472980b9", "_airdrop._tcp", "local.", "8774", "airdropp2p.local.", new_ip, "flags=136"],
+                    # Required by Apple sharingd on awdl0 for Finder Share Sheet peer discovery
+                    ["dns-sd", "-i", "awdl0", "-P", "380d472980b9", "_airdrop._tcp", "local.", "8774", "glidedrop.local.", new_ip, "flags=136"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
                 pid_file.write_text(str(proc.pid))
@@ -1337,7 +1336,7 @@ threading.Thread(target=serve_port, args=(PROXY_PORT, True), daemon=True).start(
 serve_port(PORT, False)
 PYEOF
   echo $! >"$PID_FILE"
-  echo "[+] 5GHz Wi-Fi Direct P2P Receiver ($PORT) + Native Finder AirDrop Proxy (8774->8773) running."
+  echo "[+] 5GHz Wi-Fi Direct P2P Receiver ($PORT) + Native Finder Share Proxy (8774->8773) running."
 }
 
 MODE="${1:-status}"
@@ -1354,19 +1353,19 @@ case "$MODE" in
     defaults delete com.apple.NetworkBrowser BrowseAllInterfaces 2>/dev/null || true
     defaults delete com.apple.Sharing BrowseAllInterfaces 2>/dev/null || true
     defaults delete com.apple.Sharing DisableAWDL 2>/dev/null || true
-    echo "[+] Stopped AirDrop P2P daemons and restored defaults."
+    echo "[+] Stopped GlideDrop daemons and restored defaults."
     ;;
   status)
-    echo "=== AirDrop P2P (5GHz Wi-Fi Direct + BLE L2CAP + Native Finder AirDrop) Status ==="
+    echo "=== GlideDrop (5GHz Wi-Fi Direct + BLE L2CAP + Native Finder Share Bridge) Status ==="
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
       echo "5GHz P2P Receiver:    RUNNING (PID $(cat "$PID_FILE"), port $PORT -> ~/Downloads, Proxy $PROXY_PORT)"
     else
       echo "5GHz P2P Receiver:    STOPPED"
     fi
     if [[ -f "$AWDL_MDNS_PID_FILE" ]] && kill -0 "$(cat "$AWDL_MDNS_PID_FILE")" 2>/dev/null; then
-      echo "Finder AirDrop Proxy: ADVERTISING on awdl0 (380d472980b9._airdrop._tcp.local.:8774 -> Android Peer)"
+      echo "Finder Share Proxy: ADVERTISING on awdl0 (380d472980b9._airdrop._tcp.local.:8774 -> Android Peer)"
     else
-      echo "Finder AirDrop Proxy: STOPPED"
+      echo "Finder Share Proxy: STOPPED"
     fi
     if [[ -f "$BLE_PID_FILE" ]] && kill -0 "$(cat "$BLE_PID_FILE")" 2>/dev/null; then
       echo "Direct BLE L2CAP RX:  RUNNING (PID $(cat "$BLE_PID_FILE") -> ~/Downloads + AWDL 8774 Bridge)"
@@ -1383,7 +1382,7 @@ case "$MODE" in
         end if
       end tell' 2>/dev/null || true)"
       if [[ -z "$SELECTED" || ! -f "$SELECTED" ]]; then
-        SELECTED="$(osascript -e 'POSIX path of (choose file with prompt "Select a file to AirDrop to Android device:")' 2>/dev/null || true)"
+        SELECTED="$(osascript -e 'POSIX path of (choose file with prompt "Select a file to send via GlideDrop to Android device:")' 2>/dev/null || true)"
       fi
       if [[ -z "$SELECTED" ]]; then
         exit 0
@@ -1405,7 +1404,7 @@ case "$MODE" in
 import hashlib, hmac, json, os, plistlib, re, signal, socket, ssl, struct, subprocess, sys, time, zlib
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("AIRDROP_P2P_STATE_DIR") or os.environ.get("STATE_DIR") or (Path.home() / ".airdrop-p2p"))
+STATE_DIR = Path(os.environ.get("GLIDEDROP_STATE_DIR") or os.environ.get("STATE_DIR") or (Path.home() / ".glidedrop"))
 _active_raw_sock = [None]
 
 def write_progress(active: bool, direction: str = "", file_name: str = "", done_bytes: int = 0, total_bytes: int = 0, speed_bps: int = 0, eta_sec: int = 0, pct: int = 0, file_count: int = 1, phase: str = "", peer_name: str = "", is_connecting: bool = False):
@@ -1734,7 +1733,7 @@ try:
                 names = ", ".join(urls)
                 for u in urls:
                     append_history("URL", u, len(u), "sent", peer_name)
-            safe_notify(f"Sent {names} to {peer_name} in {elapsed:.1f}s", "AirDrop Complete")
+            safe_notify(f"Sent {names} to {peer_name} in {elapsed:.1f}s", "GlideDrop Complete")
 finally:
     _active_raw_sock[0] = None
     write_progress(False)
@@ -1755,7 +1754,7 @@ PYEOF
       fi
       echo "[*] Wi-Fi unreachable — switching to Direct Bluetooth LE L2CAP..."
       "$BLE_BIN" send "$@"
-      osascript -e "display notification \"Sent to Android device over Direct Bluetooth\" with title \"AirDrop Complete\"" 2>/dev/null || true
+      osascript -e "display notification \"Sent to Android device over Direct Bluetooth\" with title \"GlideDrop Complete\"" 2>/dev/null || true
     fi
     ;;
   ui)
@@ -1766,7 +1765,7 @@ PYEOF
     fi
     nohup "$BLE_BIN" >"$BLE_LOG_FILE" 2>&1 < /dev/null &
     echo $! >"$BLE_PID_FILE"
-    echo "[+] Opened AirDrop P2P macOS UI window (PID $!)."
+    echo "[+] Opened GlideDrop macOS UI window (PID $!)."
     ;;
   *)
     echo "Usage: $0 {on|off|status|ui|send [files_or_urls...]}"

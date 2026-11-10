@@ -6,65 +6,73 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Outer Radar Arc (AirDrop / Quick Share style) -->
-    <path
-        android:pathData="M30.5,67.5 A27,27 0 1,1 77.5,67.5"
-        android:strokeWidth="3.6"
-        android:strokeLineCap="round"
-        android:fillColor="#00000000">
-        <aapt:attr name="android:strokeColor">
-            <gradient
-                android:startX="27"
-                android:startY="27"
-                android:endX="81"
-                android:endY="72"
-                android:type="linear">
-                <item android:offset="0.0" android:color="#FF38BDF8" />
-                <item android:offset="0.5" android:color="#FF0EA5E9" />
-                <item android:offset="1.0" android:color="#FF6366F1" />
-            </gradient>
-        </aapt:attr>
-    </path>
-
-    <!-- Middle Radar Arc -->
-    <path
-        android:pathData="M36.8,63.2 A19.5,19.5 0 1,1 71.2,63.2"
-        android:strokeWidth="3.8"
-        android:strokeLineCap="round"
-        android:fillColor="#00000000"
-        android:strokeColor="#FF38BDF8" />
-
-    <!-- Inner Radar Arc -->
-    <path
-        android:pathData="M43.2,58.8 A12,12 0 1,1 64.8,58.8"
-        android:strokeWidth="4.0"
-        android:strokeLineCap="round"
-        android:fillColor="#00000000"
-        android:strokeColor="#FF7DD3FC" />
-
-    <!-- Center Quick Share / AirDrop Beacon & Upward Cone -->
-    <path
-        android:pathData="M54,48 L63.5,73.5 C64.2,75.3 62.9,77.2 61,77.2 L47,77.2 C45.1,77.2 43.8,75.3 44.5,73.5 Z">
+    <!-- Luminous horizontal bridge beam -->
+    <path android:pathData="M36.08,54 Q45.04,53.23 54,53.23 Q62.96,53.23 71.92,54 Q62.96,54.77 54,54.77 Q45.04,54.77 36.08,54 Z">
         <aapt:attr name="android:fillColor">
             <gradient
-                android:startX="54"
-                android:startY="48"
-                android:endX="54"
-                android:endY="77.2"
+                android:startX="36.08"
+                android:startY="54"
+                android:endX="71.92"
+                android:endY="54"
                 android:type="linear">
-                <item android:offset="0.0" android:color="#FFFFFFFF" />
-                <item android:offset="1.0" android:color="#FF38BDF8" />
+                <item android:offset="0.0" android:color="#0038BDF8" />
+                <item android:offset="0.28" android:color="#7A7DD3FC" />
+                <item android:offset="0.5" android:color="#B8E0F7FF" />
+                <item android:offset="0.72" android:color="#7A7DD3FC" />
+                <item android:offset="1.0" android:color="#0038BDF8" />
             </gradient>
         </aapt:attr>
     </path>
 
-    <!-- Core Glowing Orb -->
-    <path
-        android:pathData="M54,52m-5.2,0a5.2,5.2 0,1 1,10.4 0a5.2,5.2 0,1 1,-10.4 0"
-        android:fillColor="#FFFFFFFF" />
+    <!-- Upper Aerodynamic Glide Wing -->
+    <path android:pathData="M34.16,47.28 Q53.36,36.72 72.56,38.64 Q69.04,46.96 62.64,54.32 Q58.80,49.84 54.96,46.64 Q44.40,46.00 34.16,47.28 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="72.56"
+                android:startY="38.64"
+                android:endX="34.16"
+                android:endY="47.28"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FFF5FCFF" />
+                <item android:offset="0.52" android:color="#FF6BDEFF" />
+                <item android:offset="1.0" android:color="#FF0FA1F7" />
+            </gradient>
+        </aapt:attr>
+    </path>
 
-    <!-- Orbiting Satellite Peer Node (5GHz Direct indicator) -->
+    <!-- Lower Mirrored Glide Wing -->
+    <path android:pathData="M73.84,60.72 Q54.64,71.28 35.44,69.36 Q38.96,61.04 45.36,53.68 Q49.20,58.16 53.04,61.36 Q63.60,62.00 73.84,60.72 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="35.44"
+                android:startY="69.36"
+                android:endX="73.84"
+                android:endY="60.72"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF8FEBFF" />
+                <item android:offset="0.52" android:color="#FF29A8FA" />
+                <item android:offset="1.0" android:color="#FF616EF7" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Central Cyan-White Horizon Node Halo -->
+    <path android:pathData="M54,46.2 A7.8,7.8 0 1,1 53.99,46.2 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="54"
+                android:centerY="54"
+                android:gradientRadius="7.8"
+                android:type="radial">
+                <item android:offset="0.0" android:color="#D999F5FF" />
+                <item android:offset="0.55" android:color="#382EC2FF" />
+                <item android:offset="1.0" android:color="#002EC2FF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Core Horizon Node -->
     <path
-        android:pathData="M73.5,37.5m-3.6,0a3.6,3.6 0,1 1,7.2 0a3.6,3.6 0,1 1,-7.2 0"
-        android:fillColor="#FF10B981" />
+        android:pathData="M54,50.85 A3.15,3.15 0 1,1 53.99,50.85 Z"
+        android:fillColor="#FFFFFFFF" />
 </vector>

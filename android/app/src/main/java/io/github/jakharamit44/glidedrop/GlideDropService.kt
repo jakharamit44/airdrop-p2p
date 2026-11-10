@@ -1,4 +1,4 @@
-package com.airdrop.p2p
+package io.github.jakharamit44.glidedrop
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -13,22 +13,22 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
-class AirDropService : Service() {
+class GlideDropService : Service() {
 
     companion object {
-        const val ACTION_STOP = "com.airdrop.p2p.ACTION_STOP"
-        private const val CHANNEL_STATUS = "airdrop_status"
-        private const val CHANNEL_RX = "airdrop_rx"
+        const val ACTION_STOP = "io.github.jakharamit44.glidedrop.ACTION_STOP"
+        private const val CHANNEL_STATUS = "glidedrop_status"
+        private const val CHANNEL_RX = "glidedrop_rx"
         private const val NOTIF_ID_STATUS = 1001
         private var rxNotifId = 2000
 
         @Volatile
-        private var instance: AirDropNode? = null
+        private var instance: GlideDropNode? = null
         private var wakeLock: PowerManager.WakeLock? = null
 
-        fun getNode(context: Context): AirDropNode {
+        fun getNode(context: Context): GlideDropNode {
             return instance ?: synchronized(this) {
-                instance ?: AirDropNode(context.applicationContext).also { instance = it }
+                instance ?: GlideDropNode(context.applicationContext).also { instance = it }
             }
         }
     }
@@ -39,14 +39,14 @@ class AirDropService : Service() {
         nm.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_STATUS,
-                "AirDrop Receiver Status",
+                "GlideDrop Receiver Status",
                 NotificationManager.IMPORTANCE_LOW
             )
         )
         nm.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_RX,
-                "Incoming AirDrop Files",
+                "Incoming GlideDrop Files",
                 NotificationManager.IMPORTANCE_HIGH
             )
         )
@@ -63,13 +63,13 @@ class AirDropService : Service() {
         val stopIntent = PendingIntent.getService(
             this,
             1,
-            Intent(this, AirDropService::class.java).apply { action = ACTION_STOP },
+            Intent(this, GlideDropService::class.java).apply { action = ACTION_STOP },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
         val statusNotif = NotificationCompat.Builder(this, CHANNEL_STATUS)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("AirDrop P2P Active")
+            .setContentTitle("GlideDrop Active")
             .setContentText("Encrypted BLE L2CAP + 5GHz Wi-Fi Direct P2P")
             .setContentIntent(openAppIntent)
             .addAction(0, "Stop", stopIntent)
@@ -88,7 +88,7 @@ class AirDropService : Service() {
 
         runCatching {
             val pm = getSystemService(PowerManager::class.java)
-            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "airdropp2p:transfer_lock")?.apply {
+            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "glidedrop:transfer_lock")?.apply {
                 setReferenceCounted(false)
             }
         }
@@ -100,7 +100,7 @@ class AirDropService : Service() {
                 nm.cancel(1999)
             } else if (isConnecting) {
                 runCatching { wakeLock?.acquire(15 * 60 * 1000L) }
-                val connectTitle = if (isSending) "Connecting to AirDrop peer…" else "Incoming AirDrop connection…"
+                val connectTitle = if (isSending) "Connecting to GlideDrop peer…" else "Incoming GlideDrop connection…"
                 val connectBody = phase.ifEmpty { fileName }
                 val progressNotif = NotificationCompat.Builder(this, CHANNEL_RX)
                     .setSmallIcon(R.mipmap.ic_launcher)
@@ -114,12 +114,12 @@ class AirDropService : Service() {
                 nm.notify(1999, progressNotif)
             } else {
                 runCatching { wakeLock?.acquire(15 * 60 * 1000L) }
-                val speedStr = if (speedBps > 0L) " • ${AirDropNode.formatSpeed(speedBps)}" else ""
-                val actionTitle = if (isSending) "Sending via AirDrop" else "Receiving via AirDrop"
+                val speedStr = if (speedBps > 0L) " • ${GlideDropNode.formatSpeed(speedBps)}" else ""
+                val actionTitle = if (isSending) "Sending via GlideDrop" else "Receiving via GlideDrop"
                 val progressNotif = NotificationCompat.Builder(this, CHANNEL_RX)
                     .setSmallIcon(R.mipmap.ic_launcher)
                     .setContentTitle("$actionTitle ($pct%)$speedStr")
-                    .setContentText("$fileName (${AirDropNode.formatBytes(doneBytes)} / ${AirDropNode.formatBytes(totalBytes)})")
+                    .setContentText("$fileName (${GlideDropNode.formatBytes(doneBytes)} / ${GlideDropNode.formatBytes(totalBytes)})")
                     .setProgress(100, pct, false)
                     .setOngoing(true)
                     .setOnlyAlertOnce(true)
@@ -146,7 +146,7 @@ class AirDropService : Service() {
             )
             val rxNotif = NotificationCompat.Builder(this, CHANNEL_RX)
                 .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle("AirDrop Received: ${item.title}")
+                .setContentTitle("GlideDrop Received: ${item.title}")
                 .setContentText(item.pathOrUrl)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setAutoCancel(true)

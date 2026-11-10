@@ -1,4 +1,4 @@
-package com.airdrop.p2p
+package io.github.jakharamit44.glidedrop
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -9,10 +9,10 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
 
-class AirDropCodecTest {
+class GlideDropCodecTest {
     @Test
     fun roundTripBplistAndDvzipCpio() {
-        val sampleBytes = "hello-airdrop-p2p".toByteArray()
+        val sampleBytes = "hello-glidedrop".toByteArray()
         val payload = mapOf(
             "SenderComputerName" to "Android Phone",
             "SenderModelName" to "SM-S911B",
@@ -31,10 +31,10 @@ class AirDropCodecTest {
             )
         )
 
-        val encoded = AirDropCodec.encodeBplist(payload)
+        val encoded = GlideDropCodec.encodeBplist(payload)
         assertTrue(String(encoded, 0, 8, Charsets.US_ASCII) == "bplist00")
 
-        val decoded = AirDropCodec.decodeBplistDict(encoded)
+        val decoded = GlideDropCodec.decodeBplistDict(encoded)
         assertEquals("Android Phone", decoded["SenderComputerName"])
         assertEquals("SM-S911B", decoded["SenderModelName"])
         assertEquals(false, decoded["ConvertMediaFormats"])
@@ -49,9 +49,9 @@ class AirDropCodecTest {
 
         // Test DVZip (64 KiB zlib/stored blocks + 070707 odc CPIO) archive streaming & extraction
         val out = ByteArrayOutputStream()
-        AirDropCodec.writeDvzipCpio(
+        GlideDropCodec.writeDvzipCpio(
             listOf(
-                AirDropCodec.OutgoingEntry(
+                GlideDropCodec.OutgoingEntry(
                     name = "./test.txt",
                     size = sampleBytes.size.toLong(),
                     openStream = { ByteArrayInputStream(sampleBytes) }
@@ -60,9 +60,9 @@ class AirDropCodecTest {
             out
         )
 
-        val tempDir = Files.createTempDirectory("airdrop-test").toFile()
+        val tempDir = Files.createTempDirectory("glidedrop-test").toFile()
         try {
-            val extracted = AirDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
+            val extracted = GlideDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
             assertEquals(1, extracted.size)
             assertArrayEquals(sampleBytes, File(tempDir, "test.txt").readBytes())
         } finally {
@@ -70,7 +70,7 @@ class AirDropCodecTest {
         }
 
         // Verify BLE Continuity AirDrop wake frame (0x05 + 18 len + 0x40 Arm A + 3 tag bytes + 0x03)
-        val ble = AirDropCodec.bleWakePayload(byteArrayOf(0x11, 0x22, 0x33))
+        val ble = GlideDropCodec.bleWakePayload(byteArrayOf(0x11, 0x22, 0x33))
         assertEquals(20, ble.size)
         assertEquals(0x05.toByte(), ble[0])
         assertEquals(18.toByte(), ble[1])
@@ -83,9 +83,9 @@ class AirDropCodecTest {
         val payload = ByteArray(2 * 1024 * 1024) { (it % 251).toByte() }
         val out = ByteArrayOutputStream()
         var progressReported = 0L
-        AirDropCodec.writeDvzipCpio(
+        GlideDropCodec.writeDvzipCpio(
             listOf(
-                AirDropCodec.OutgoingEntry(
+                GlideDropCodec.OutgoingEntry(
                     name = "./large_test.bin",
                     size = payload.size.toLong(),
                     openStream = { ByteArrayInputStream(payload) }
@@ -98,9 +98,9 @@ class AirDropCodecTest {
 
         assertEquals(payload.size.toLong(), progressReported)
 
-        val tempDir = Files.createTempDirectory("airdrop-large-test").toFile()
+        val tempDir = Files.createTempDirectory("glidedrop-large-test").toFile()
         try {
-            val extracted = AirDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
+            val extracted = GlideDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
             assertEquals(1, extracted.size)
             val extractedFile = File(tempDir, "large_test.bin")
             assertEquals(payload.size.toLong(), extractedFile.length())
@@ -117,8 +117,8 @@ class AirDropCodecTest {
             "FloatVal" to 3.5f,
             "NegativeInt" to -500L
         )
-        val encoded = AirDropCodec.encodeBplist(payload)
-        val decoded = AirDropCodec.decodeBplistDict(encoded)
+        val encoded = GlideDropCodec.encodeBplist(payload)
+        val decoded = GlideDropCodec.decodeBplistDict(encoded)
         assertEquals(42.125, (decoded["DoubleVal"] as Double), 0.0001)
         assertEquals(3.5, (decoded["FloatVal"] as Double), 0.0001)
     }
@@ -126,9 +126,9 @@ class AirDropCodecTest {
     @Test(expected = IllegalArgumentException::class)
     fun negativeSizeRejected() {
         val out = ByteArrayOutputStream()
-        AirDropCodec.writeDvzipCpio(
+        GlideDropCodec.writeDvzipCpio(
             listOf(
-                AirDropCodec.OutgoingEntry(
+                GlideDropCodec.OutgoingEntry(
                     name = "invalid.bin",
                     size = -1L,
                     openStream = { ByteArrayInputStream(ByteArray(0)) }
@@ -143,9 +143,9 @@ class AirDropCodecTest {
         // Test 64-bit Extended CPIO format (070764) for files > 8 GiB (e.g. 17,718,303,741 B / 16.50 GB)
         val payload = "payload-for-16.5gb-virtual-stream".toByteArray(Charsets.UTF_8)
         val out = ByteArrayOutputStream()
-        AirDropCodec.writeDvzipCpio(
+        GlideDropCodec.writeDvzipCpio(
             listOf(
-                AirDropCodec.OutgoingEntry(
+                GlideDropCodec.OutgoingEntry(
                     name = "./large_archive.zip",
                     size = payload.size.toLong(),
                     openStream = { ByteArrayInputStream(payload) }
@@ -154,9 +154,9 @@ class AirDropCodecTest {
             out
         )
 
-        val tempDir = Files.createTempDirectory("airdrop-64bit-test").toFile()
+        val tempDir = Files.createTempDirectory("glidedrop-64bit-test").toFile()
         try {
-            val extracted = AirDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
+            val extracted = GlideDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
             assertEquals(1, extracted.size)
             assertArrayEquals(payload, File(tempDir, "large_archive.zip").readBytes())
         } finally {
@@ -167,9 +167,9 @@ class AirDropCodecTest {
         val largeSize = 17_718_303_741L
         val fakePayload = ByteArray(1024) { (it % 127).toByte() }
         val largeOut = ByteArrayOutputStream()
-        AirDropCodec.writeDvzipCpio(
+        GlideDropCodec.writeDvzipCpio(
             listOf(
-                AirDropCodec.OutgoingEntry(
+                GlideDropCodec.OutgoingEntry(
                     name = "./Fear.The.Walking.Dead.S05.1080p.Hindi.English.Esubs.Moviesmod.cc.zip",
                     size = fakePayload.size.toLong(),
                     openStream = { ByteArrayInputStream(fakePayload) }
@@ -205,9 +205,9 @@ class AirDropCodecTest {
     fun atomicPartFileCleanupOnTruncation() {
         val payload = ByteArray(100_000) { (it % 256).toByte() }
         val out = ByteArrayOutputStream()
-        AirDropCodec.writeDvzipCpio(
+        GlideDropCodec.writeDvzipCpio(
             listOf(
-                AirDropCodec.OutgoingEntry(
+                GlideDropCodec.OutgoingEntry(
                     name = "interrupted.bin",
                     size = payload.size.toLong(),
                     openStream = { ByteArrayInputStream(payload) }
@@ -219,11 +219,11 @@ class AirDropCodecTest {
         // Truncate archive in the middle of payload data
         val truncatedArchive = fullArchive.copyOf(fullArchive.size / 2)
 
-        val tempDir = Files.createTempDirectory("airdrop-atomic-test").toFile()
+        val tempDir = Files.createTempDirectory("glidedrop-atomic-test").toFile()
         try {
             var failed = false
             try {
-                AirDropCodec.extractDvzipCpio(ByteArrayInputStream(truncatedArchive), tempDir)
+                GlideDropCodec.extractDvzipCpio(ByteArrayInputStream(truncatedArchive), tempDir)
             } catch (_: java.io.IOException) {
                 failed = true
             }
@@ -240,9 +240,9 @@ class AirDropCodecTest {
     fun precompressedExtensionUsesStoredBlocksDirectly() {
         val payload = ByteArray(128 * 1024) { (it * 31).toByte() }
         val out = ByteArrayOutputStream()
-        AirDropCodec.writeDvzipCpio(
+        GlideDropCodec.writeDvzipCpio(
             listOf(
-                AirDropCodec.OutgoingEntry(
+                GlideDropCodec.OutgoingEntry(
                     name = "clip.mkv",
                     size = payload.size.toLong(),
                     openStream = { ByteArrayInputStream(payload) }
@@ -252,11 +252,11 @@ class AirDropCodecTest {
         )
         val encoded = out.toByteArray()
         val firstHdr = java.nio.ByteBuffer.wrap(encoded, 0, 4).int
-        assertTrue("Expected stored DVZip header flag (0x80000000)", (firstHdr and AirDropCodec.DVZIP_STORED) != 0)
+        assertTrue("Expected stored DVZip header flag (0x80000000)", (firstHdr and GlideDropCodec.DVZIP_STORED) != 0)
 
-        val tempDir = Files.createTempDirectory("airdrop-precomp-test").toFile()
+        val tempDir = Files.createTempDirectory("glidedrop-precomp-test").toFile()
         try {
-            val extracted = AirDropCodec.extractDvzipCpio(ByteArrayInputStream(encoded), tempDir)
+            val extracted = GlideDropCodec.extractDvzipCpio(ByteArrayInputStream(encoded), tempDir)
             assertEquals(1, extracted.size)
             assertArrayEquals(payload, File(tempDir, "clip.mkv").readBytes())
         } finally {
@@ -268,9 +268,9 @@ class AirDropCodecTest {
     fun multiMegabyteOneMibStoredBlocksRoundTrip() {
         val payload = ByteArray(3 * 1024 * 1024 + 137_913) { ((it * 17) xor (it ushr 9)).toByte() }
         val out = ByteArrayOutputStream()
-        AirDropCodec.writeDvzipCpio(
+        GlideDropCodec.writeDvzipCpio(
             listOf(
-                AirDropCodec.OutgoingEntry(
+                GlideDropCodec.OutgoingEntry(
                     name = "movie_4k.mp4",
                     size = payload.size.toLong(),
                     openStream = { ByteArrayInputStream(payload) }
@@ -278,9 +278,9 @@ class AirDropCodecTest {
             ),
             out
         )
-        val tempDir = Files.createTempDirectory("airdrop-1mib-test").toFile()
+        val tempDir = Files.createTempDirectory("glidedrop-1mib-test").toFile()
         try {
-            val extracted = AirDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
+            val extracted = GlideDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
             assertEquals(1, extracted.size)
             assertArrayEquals(payload, File(tempDir, "movie_4k.mp4").readBytes())
         } finally {

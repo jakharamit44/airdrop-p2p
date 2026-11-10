@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit and Regression Tests for AirDrop P2P AI Processing Subsystem
+Unit and Regression Tests for GlideDrop AI Processing Subsystem
 """
 
 import hashlib
@@ -106,11 +106,11 @@ class TestClaudeProcessor(unittest.TestCase):
     def test_local_offline_analysis(self):
         """Test local structural analysis fallback when offline."""
         p = self.dir_path / "sample.py"
-        p.write_text("class AirDropEngine:\n    def start(self):\n        pass\n", encoding="utf-8")
+        p.write_text("class GlideDropEngine:\n    def start(self):\n        pass\n", encoding="utf-8")
 
         summary = claude_processor.run_local_offline_analysis(p)
         self.assertIn("Local Analysis", summary)
-        self.assertIn("AirDropEngine", summary)
+        self.assertIn("GlideDropEngine", summary)
         self.assertIn("Zero Cloud Exfiltration", summary)
 
     def test_ollama_local_fallback(self):
@@ -342,17 +342,17 @@ class TestClaudeProcessor(unittest.TestCase):
         self.assertNotIn(entered_val[:8], combined_output)
         self.assertNotIn("sk-ant-", combined_output)
 
-    def test_mac_airdrop_send_tls_pinning_enforced(self):
-        """mac-airdrop-p2p.sh send client must enforce SHA-256 pinning and fail closed when unpinned."""
+    def test_glidedrop_send_tls_pinning_enforced(self):
+        """glidedrop.sh send client must enforce SHA-256 pinning and fail closed when unpinned."""
         openssl_bin = shutil.which("openssl")
         if not openssl_bin:
             self.skipTest("openssl binary not available")
 
-        sh_path = Path(__file__).resolve().parent / "mac-airdrop-p2p.sh"
+        sh_path = Path(__file__).resolve().parent / "glidedrop.sh"
         sh_text = sh_path.read_text(encoding="utf-8")
         marker = 'STATE_DIR="$STATE_DIR" python3 - "$@" << \'PYEOF\' &\n'
         start_idx = sh_text.find(marker)
-        self.assertNotEqual(start_idx, -1, "Could not locate send python block in mac-airdrop-p2p.sh")
+        self.assertNotEqual(start_idx, -1, "Could not locate send python block in glidedrop.sh")
         body_start = start_idx + len(marker)
         end_idx = sh_text.find("\nPYEOF\n", body_start)
         self.assertNotEqual(end_idx, -1, "Could not locate end of send python block")
@@ -365,7 +365,7 @@ class TestClaudeProcessor(unittest.TestCase):
                 openssl_bin, "req", "-x509", "-newkey", "ec",
                 "-pkeyopt", "ec_paramgen_curve:prime256v1",
                 "-keyout", str(key_path), "-out", str(cert_path),
-                "-days", "7", "-nodes", "-subj", "/CN=airdrop-test"
+                "-days", "7", "-nodes", "-subj", "/CN=glidedrop-test"
             ],
             check=True,
             stdout=subprocess.DEVNULL,
@@ -439,7 +439,7 @@ class TestClaudeProcessor(unittest.TestCase):
 
         state_dir = self.dir_path / "state"
         state_dir.mkdir(exist_ok=True)
-        env = {**os.environ, "AIRDROP_P2P_STATE_DIR": str(state_dir)}
+        env = {**os.environ, "GLIDEDROP_STATE_DIR": str(state_dir)}
 
         try:
             # 1. Valid pinned fingerprint (colon-delimited uppercase) must succeed

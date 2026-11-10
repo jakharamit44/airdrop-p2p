@@ -1,4 +1,4 @@
-package com.airdrop.p2p
+package io.github.jakharamit44.glidedrop
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -38,7 +38,7 @@ class EmbeddedProxyServerTest {
         assertTrue(EmbeddedProxyServer.isTargetSafe("127.0.0.1", 8080))
         assertTrue(EmbeddedProxyServer.isTargetSafe("127.0.0.2", 8080))
 
-        // Blocked SSRF loopback to local AirDrop or proxy daemon across all loopback variants
+        // Blocked SSRF loopback to local GlideDrop or proxy daemon across all loopback variants
         assertFalse(EmbeddedProxyServer.isTargetSafe("127.0.0.1", 8771))
         assertFalse(EmbeddedProxyServer.isTargetSafe("127.0.0.2", 8771))
         assertFalse(EmbeddedProxyServer.isTargetSafe("127.1", 8771))

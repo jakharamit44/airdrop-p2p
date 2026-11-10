@@ -1,4 +1,4 @@
-# Contributing to AirDrop P2P
+# Contributing to GlideDrop
 
 Contributions, bug reports, protocol fixes, and documentation improvements are welcome. Please review this guide before opening an issue or pull request.
 
@@ -18,20 +18,20 @@ Contributions, bug reports, protocol fixes, and documentation improvements are w
 ```text
 ├── android/
 │   └── app/src/
-│       ├── main/java/com/airdrop/p2p/
+│       ├── main/java/io/github/jakharamit44/glidedrop/
 │       │   ├── MainActivity.kt        # Jetpack Compose UI (Send, Receive, History, Settings)
-│       │   ├── AirDropNode.kt         # BLE L2CAP, ECDH P-256, 5 GHz Wi-Fi Direct & TLS engine
-│       │   ├── AirDropCodec.kt        # bplist00 & DVZip/CPIO (070707 / 070764) codec
+│       │   ├── GlideDropNode.kt         # BLE L2CAP, ECDH P-256, 5 GHz Wi-Fi Direct & TLS engine
+│       │   ├── GlideDropCodec.kt        # bplist00 & DVZip/CPIO (070707 / 070764) codec
 │       │   ├── EmbeddedProxyServer.kt # Dual-protocol SOCKS5 + HTTP CONNECT proxy (:1080)
-│       │   └── AirDropService.kt      # Connected-device foreground service & notifications
-│       └── test/java/com/airdrop/p2p/ # Codec, security, and proxy unit tests
+│       │   └── GlideDropService.kt      # Connected-device foreground service & notifications
+│       └── test/java/io/github/jakharamit44/glidedrop/ # Codec, security, and proxy unit tests
 ├── macos/
-│   ├── mac-ble-airdrop.swift          # SwiftUI app, menu bar daemon, BLE & proxy lifecycle
-│   ├── mac-airdrop-p2p.sh             # HTTPS AirDrop receiver/sender & awdl0 Finder proxy
+│   ├── glidedrop-daemon.swift          # SwiftUI app, menu bar daemon, BLE & proxy lifecycle
+│   ├── glidedrop.sh             # HTTPS AirDrop receiver/sender & awdl0 Finder proxy
 │   ├── claude_processor.py            # Optional offline (Vision OCR/Ollama) & Claude AI hook
 │   ├── test_claude_processor.py       # Python unit tests for AI & Privacy Guard
 │   ├── generate-icon.swift            # macOS squircle AppIcon.icns generator
-│   └── build.sh                       # Builds AirDrop P2P.app bundle
+│   └── build.sh                       # Builds GlideDrop.app bundle
 ├── docs/
 │   ├── index.html                     # Project landing page (GitHub Pages)
 │   └── ARCHITECTURE.md                # Protocol & subsystem specification
@@ -59,20 +59,20 @@ adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 
 ### macOS
 
-Build `AirDrop P2P.app`:
+Build `GlideDrop.app`:
 
 ```bash
 cd macos
-chmod +x build.sh mac-airdrop-p2p.sh
+chmod +x build.sh glidedrop.sh
 ./build.sh
 ```
 
 Run the CLI receiver or check status:
 
 ```bash
-./mac-airdrop-p2p.sh on
-./mac-airdrop-p2p.sh status
-tail -f ~/.airdrop-p2p/daemon.log
+./glidedrop.sh on
+./glidedrop.sh status
+tail -f ~/.glidedrop/daemon.log
 ```
 
 ### Python AI & Privacy Tests

@@ -1,4 +1,4 @@
-package com.airdrop.p2p
+package io.github.jakharamit44.glidedrop
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -108,7 +108,7 @@ import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 import javax.security.auth.x500.X500Principal
 
-data class AirDropPeer(
+data class GlideDropPeer(
     val id: String,
     val name: String,
     val host: String,
@@ -151,12 +151,12 @@ data class TransferProgress(
 )
 
 /**
- * Pure P2P zero-router AirDrop engine for Android <-> macOS:
+ * Pure P2P zero-router GlideDrop engine for Android <-> macOS:
  * - Direct BLE L2CAP CoC server & client (works with zero Wi-Fi / different networks)
  * - 5 GHz Wi-Fi Direct Autonomous Group (192.168.49.1:8771) high-speed P2P receiver
  * - Zero Same-IP / LAN router mDNS dependency
  */
-class AirDropNode(private val context: Context) {
+class GlideDropNode(private val context: Context) {
 
     /**
      * Strict X509TrustManager enforcing exact SHA-256 leaf certificate pinning
@@ -195,9 +195,9 @@ class AirDropNode(private val context: Context) {
     }
 
     companion object {
-        const val AIRDROP_PORT = 8771
+        const val GLIDEDROP_PORT = 8771
         const val PEER_TTL_MS = 4_500L
-        private const val KEYSTORE_ALIAS = "airdrop_p2p_ec_v2"
+        private const val KEYSTORE_ALIAS = "glidedrop_ec_v2"
         val MAC_BLE_SERVICE_UUID: UUID = UUID.fromString("52300001-a12d-4000-8000-523a12d00001")
         val MAC_BLE_PSM_CHAR_UUID: UUID = UUID.fromString("52300002-a12d-4000-8000-523a12d00002")
         val P2P_BLE_SERVICE_UUID: UUID = UUID.fromString("52300003-a12d-4000-8000-523a12d00003")
@@ -249,7 +249,7 @@ class AirDropNode(private val context: Context) {
             val rawSecret = ka.generateSecret()
             val md = MessageDigest.getInstance("SHA-256")
             md.update(rawSecret)
-            md.update("AirDropP2P-v2-SessionKey".toByteArray(StandardCharsets.UTF_8))
+            md.update("GlideDrop-v2-SessionKey".toByteArray(StandardCharsets.UTF_8))
             return md.digest()
         }
 
@@ -377,7 +377,7 @@ class AirDropNode(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val random = SecureRandom()
     private val transferMutex = Mutex()
-    private val prefs = context.getSharedPreferences("airdrop_p2p", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences("glidedrop_prefs", Context.MODE_PRIVATE)
     val authTag = ByteArray(3).also { random.nextBytes(it) }
     val serviceId: String = prefs.getString("service_id", null)
         ?: ByteArray(6)
@@ -462,8 +462,8 @@ class AirDropNode(private val context: Context) {
     val localEndpoints: StateFlow<List<String>> = _localEndpoints.asStateFlow()
 
     // Strict live P2P discovery: only actively advertising BLE peers within PEER_TTL_MS
-    private val _peers = MutableStateFlow<List<AirDropPeer>>(emptyList())
-    val peers: StateFlow<List<AirDropPeer>> = _peers.asStateFlow()
+    private val _peers = MutableStateFlow<List<GlideDropPeer>>(emptyList())
+    val peers: StateFlow<List<GlideDropPeer>> = _peers.asStateFlow()
 
     private val _incomingAsk = MutableStateFlow<IncomingAskPrompt?>(null)
     val incomingAsk: StateFlow<IncomingAskPrompt?> = _incomingAsk.asStateFlow()
@@ -503,7 +503,7 @@ class AirDropNode(private val context: Context) {
         runCatching {
             val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
             if (transferWakeLock == null) {
-                transferWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "airdropp2p:transfer_node_lock")?.apply {
+                transferWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "glidedrop:transfer_node_lock")?.apply {
                     setReferenceCounted(false)
                 }
             }
@@ -517,7 +517,7 @@ class AirDropNode(private val context: Context) {
                     @Suppress("DEPRECATION")
                     WifiManager.WIFI_MODE_FULL_HIGH_PERF
                 }
-                transferWifiLock = wm?.createWifiLock(lockMode, "airdropp2p:transfer_wifi_lock")?.apply {
+                transferWifiLock = wm?.createWifiLock(lockMode, "glidedrop:transfer_wifi_lock")?.apply {
                     setReferenceCounted(false)
                 }
             }
@@ -744,7 +744,7 @@ class AirDropNode(private val context: Context) {
     private class PendingMacTx(
         val metaBytes: ByteArray,
         val archiveBytes: ByteArray,
-        val entries: List<AirDropCodec.OutgoingEntry>,
+        val entries: List<GlideDropCodec.OutgoingEntry>,
         val url: String?,
         val label: String,
         val fileCount: Int,
@@ -757,7 +757,7 @@ class AirDropNode(private val context: Context) {
     @Volatile
     private var pendingMacTx: PendingMacTx? = null
 
-    private fun saveDirectSharePeer(peer: AirDropPeer, remoteName: String) {
+    private fun saveDirectSharePeer(peer: GlideDropPeer, remoteName: String) {
         prefs.edit()
             .putString("last_peer_id", peer.id)
             .putString("last_peer_name", remoteName)
@@ -771,11 +771,11 @@ class AirDropNode(private val context: Context) {
                 putExtra("direct_peer_host", peer.host)
                 putExtra("direct_peer_port", peer.port)
             }
-            val shortcut = ShortcutInfo.Builder(context, "mac_airdrop_direct")
+            val shortcut = ShortcutInfo.Builder(context, "mac_glidedrop_direct")
                 .setShortLabel(remoteName)
-                .setLongLabel("AirDrop to $remoteName")
+                .setLongLabel("Send to $remoteName")
                 .setIcon(Icon.createWithResource(context, R.mipmap.ic_launcher_round))
-                .setCategories(setOf("com.airdrop.p2p.DIRECT_SHARE"))
+                .setCategories(setOf("io.github.jakharamit44.glidedrop.DIRECT_SHARE"))
                 .setIntent(shareIntent)
                 .setLongLived(true)
                 .setRank(0)
@@ -785,7 +785,7 @@ class AirDropNode(private val context: Context) {
     }
 
     fun log(msg: String) {
-        android.util.Log.i("AirDropP2P", msg)
+        android.util.Log.i("GlideDrop", msg)
         val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(Date())
         _logs.update { (it + "[$time] $msg").takeLast(80) }
     }
@@ -850,7 +850,7 @@ class AirDropNode(private val context: Context) {
         } catch (_: Throwable) {
         }
         serverSocket = null
-        log("AirDrop P2P node stopped")
+        log("GlideDrop node stopped")
     }
 
     /**
@@ -867,7 +867,7 @@ class AirDropNode(private val context: Context) {
                 if (!nif.isUp || nif.isLoopback) continue
                 for (addr in Collections.list(nif.inetAddresses)) {
                     if (addr is Inet4Address && addr.hostAddress?.startsWith("192.168.49.") == true) {
-                        list.add("${addr.hostAddress}:$AIRDROP_PORT (5GHz Wi-Fi Direct)")
+                        list.add("${addr.hostAddress}:$GLIDEDROP_PORT (5GHz Wi-Fi Direct)")
                     }
                 }
             }
@@ -1141,7 +1141,7 @@ class AirDropNode(private val context: Context) {
 
         if (prevDev?.address != dev.address || (parsedPsm > 0 && prevPsm != parsedPsm) || _peers.value.none { it.id == "ble-mac" }) {
             log("Discovered live peer over BLE: $displayMacName (${dev.address}, psm=$effectivePsm, rssi=${result.rssi} dBm)")
-            val blePeer = AirDropPeer(
+            val blePeer = GlideDropPeer(
                 id = "ble-mac",
                 name = "$displayMacName (PSM $effectivePsm)",
                 host = "ble://${dev.address}",
@@ -1195,13 +1195,13 @@ class AirDropNode(private val context: Context) {
                         kotlinx.coroutines.delay(400)
                         mgr.requestGroupInfo(ch) { group ->
                             if (group != null && group.isGroupOwner && !group.networkName.isNullOrEmpty() && !group.passphrase.isNullOrEmpty()) {
-                                val creds = "${group.networkName}\t${group.passphrase}\t192.168.49.1\t$AIRDROP_PORT"
+                                val creds = "${group.networkName}\t${group.passphrase}\t192.168.49.1\t$GLIDEDROP_PORT"
                                 if (wifiDirectCreds != creds) {
                                     startEmbeddedProxy()
                                     wifiDirectCreds = creds
                                     val psm = localBlePsm
                                     _p2pStatus.value = "5GHz P2P (${group.networkName}) • BLE PSM $psm"
-                                    log("5GHz Wi-Fi Direct P2P Ready: ${group.networkName} (192.168.49.1:$AIRDROP_PORT)")
+                                    log("5GHz Wi-Fi Direct P2P Ready: ${group.networkName} (192.168.49.1:$GLIDEDROP_PORT)")
                                     refreshLocalAddresses()
                                 }
                             }
@@ -1215,10 +1215,10 @@ class AirDropNode(private val context: Context) {
                 try {
                     if (existing != null && existing.isGroupOwner && !existing.networkName.isNullOrEmpty() && !existing.passphrase.isNullOrEmpty()) {
                         startEmbeddedProxy()
-                        wifiDirectCreds = "${existing.networkName}\t${existing.passphrase}\t192.168.49.1\t$AIRDROP_PORT"
+                        wifiDirectCreds = "${existing.networkName}\t${existing.passphrase}\t192.168.49.1\t$GLIDEDROP_PORT"
                         val psm = localBlePsm
                         _p2pStatus.value = "5GHz P2P (${existing.networkName}) • BLE PSM $psm"
-                        log("5GHz Wi-Fi Direct P2P Ready: ${existing.networkName} (192.168.49.1:$AIRDROP_PORT)")
+                        log("5GHz Wi-Fi Direct P2P Ready: ${existing.networkName} (192.168.49.1:$GLIDEDROP_PORT)")
                         refreshLocalAddresses()
                     } else {
                         val listener = object : WifiP2pManager.ActionListener {
@@ -1235,7 +1235,7 @@ class AirDropNode(private val context: Context) {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             val randomPass = ByteArray(6).also { random.nextBytes(it) }.joinToString("") { "%02x".format(it) }
                             val cfg = WifiP2pConfig.Builder()
-                                .setNetworkName("DIRECT-AirDrop")
+                                .setNetworkName("DIRECT-GlideDrop")
                                 .setPassphrase(randomPass)
                                 .enablePersistentMode(false)
                                 .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_5GHZ)
@@ -1317,7 +1317,7 @@ class AirDropNode(private val context: Context) {
     // End-to-End AES-256-GCM authenticated encryption for BLE L2CAP frames
     private val bleAesKey: SecretKeySpec by lazy {
         val digest = MessageDigest.getInstance("SHA-256")
-            .digest("AirDropP2P-E2EE-AES256GCM-v2".toByteArray(StandardCharsets.UTF_8))
+            .digest("GlideDrop-E2EE-AES256GCM-v2".toByteArray(StandardCharsets.UTF_8))
         SecretKeySpec(digest, "AES")
     }
 
@@ -1384,7 +1384,7 @@ class AirDropNode(private val context: Context) {
                         val effectivePsm = if (bleMacPsm > 0) bleMacPsm else 192
                         val now = System.currentTimeMillis()
                         val wasEmpty = _peers.value.none { it.id == "ble-mac" }
-                        val blePeer = AirDropPeer(
+                        val blePeer = GlideDropPeer(
                             id = "ble-mac",
                             name = "$macName (PSM $effectivePsm)",
                             host = "ble://${sock.remoteDevice?.address ?: "mac"}",
@@ -1512,7 +1512,7 @@ class AirDropNode(private val context: Context) {
                                     val rawArchBytes = if (tx.archiveBytes.isNotEmpty() && tx.archiveBytes.size <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) {
                                         tx.archiveBytes
                                     } else if (tx.entries.isNotEmpty() && tx.totalRawBytes <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) {
-                                        ByteArrayOutputStream().also { AirDropCodec.writeDvzipCpio(tx.entries, it) }.toByteArray()
+                                        ByteArrayOutputStream().also { GlideDropCodec.writeDvzipCpio(tx.entries, it) }.toByteArray()
                                     } else {
                                         ByteArray(0)
                                     }
@@ -1711,7 +1711,7 @@ class AirDropNode(private val context: Context) {
                 val rawMetaBytes = ByteArray(metaLen)
                 dis.readFully(rawMetaBytes)
                 val metaBytes = if (isEncryptedBle) decryptBlePayload(rawMetaBytes) else rawMetaBytes
-                val askDict = AirDropCodec.decodeBplistDict(metaBytes)
+                val askDict = GlideDropCodec.decodeBplistDict(metaBytes)
                 val sender = askDict["SenderComputerName"]?.toString() ?: "MacBook Pro"
                 if (sender.isNotBlank() && sender != "Mac") {
                     learnedMacName = sender
@@ -1729,7 +1729,7 @@ class AirDropNode(private val context: Context) {
                 } else if (items.isNotEmpty()) {
                     items.joinToString(", ") { it.toString() }
                 } else {
-                    "AirDrop transfer (${formatBytes(archiveLen.toLong())})"
+                    "GlideDrop transfer (${formatBytes(archiveLen.toLong())})"
                 }
 
                 val accepted = if (autoAccept) {
@@ -1774,13 +1774,13 @@ class AirDropNode(private val context: Context) {
                     }
                 }
 
-                val fileLabel = fileNames.firstOrNull() ?: "AirDrop file"
+                val fileLabel = fileNames.firstOrNull() ?: "GlideDrop file"
                 val fileCount = maxOf(1, fileNames.size)
 
                 if (archiveLen > 0) {
                     val downloads = File(
                         Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                        "AirDrop"
+                        "GlideDrop"
                     )
                     val startedAt = System.currentTimeMillis()
                     reportProgress(fileLabel, 0, 0L, archiveLen.toLong(), startedAt, fileCount, isSending = false)
@@ -1824,9 +1824,9 @@ class AirDropNode(private val context: Context) {
                             val encBuf = ByteArrayOutputStream(archiveLen)
                             bounded.copyTo(encBuf)
                             val decArch = decryptBlePayload(encBuf.toByteArray())
-                            AirDropCodec.extractDvzipCpio(decArch.inputStream(), downloads)
+                            GlideDropCodec.extractDvzipCpio(decArch.inputStream(), downloads)
                         } else {
-                            AirDropCodec.extractDvzipCpio(bounded, downloads)
+                            GlideDropCodec.extractDvzipCpio(bounded, downloads)
                         }
                     } finally {
                         reportProgress(fileLabel, 100, archiveLen.toLong(), archiveLen.toLong(), startedAt, fileCount, isSending = false)
@@ -1843,7 +1843,7 @@ class AirDropNode(private val context: Context) {
                         )
                         recordHistoryItem(rec)
                         onItemReceived?.invoke(rec)
-                        log("Saved via BLE to Downloads/AirDrop/${f.name} (${formatBytes(f.length())})")
+                        log("Saved via BLE to Downloads/GlideDrop/${f.name} (${formatBytes(f.length())})")
                     }
                 }
 
@@ -1870,7 +1870,7 @@ class AirDropNode(private val context: Context) {
      */
     @SuppressLint("MissingPermission")
     private suspend fun sendOverBleL2cap(
-        entries: List<AirDropCodec.OutgoingEntry>,
+        entries: List<GlideDropCodec.OutgoingEntry>,
         url: String?
     ): Boolean = withContext(Dispatchers.IO) {
         transferMutex.withLock {
@@ -1880,13 +1880,13 @@ class AirDropNode(private val context: Context) {
                 val fileDicts = entries.map { e ->
                     mapOf(
                         "FileName" to e.name,
-                        "FileType" to AirDropCodec.utiForName(e.name),
+                        "FileType" to GlideDropCodec.utiForName(e.name),
                         "FileSize" to e.size,
                         "FileBomPath" to "./${e.name}",
                         "FileIsDirectory" to false
                     )
                 }
-                val metaBytes = AirDropCodec.encodeBplist(
+                val metaBytes = GlideDropCodec.encodeBplist(
                     mapOf(
                         "SenderComputerName" to deviceName,
                         "SenderModelName" to deviceModel,
@@ -1898,7 +1898,7 @@ class AirDropNode(private val context: Context) {
                 val totalRawBytes = entries.sumOf { it.size }
                 val archiveBytes = if (entries.isNotEmpty() && totalRawBytes < 65_536L) {
                     val bos = ByteArrayOutputStream()
-                    AirDropCodec.writeDvzipCpio(entries, bos)
+                    GlideDropCodec.writeDvzipCpio(entries, bos)
                     bos.toByteArray()
                 } else {
                     ByteArray(0)
@@ -2085,7 +2085,7 @@ class AirDropNode(private val context: Context) {
                                 val rawArchBytes = if (archiveBytes.isNotEmpty() && archiveBytes.size <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) {
                                     archiveBytes
                                 } else if (entries.isNotEmpty() && totalRawBytes <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES) {
-                                    ByteArrayOutputStream().also { AirDropCodec.writeDvzipCpio(entries, it) }.toByteArray()
+                                    ByteArrayOutputStream().also { GlideDropCodec.writeDvzipCpio(entries, it) }.toByteArray()
                                 } else {
                                     ByteArray(0)
                                 }
@@ -2213,7 +2213,7 @@ class AirDropNode(private val context: Context) {
         port: Int,
         metaBytes: ByteArray,
         archiveBytes: ByteArray,
-        entries: List<AirDropCodec.OutgoingEntry>,
+        entries: List<GlideDropCodec.OutgoingEntry>,
         url: String?,
         label: String,
         fileCount: Int,
@@ -2469,7 +2469,7 @@ class AirDropNode(private val context: Context) {
                                 lastWriteActivityMs.set(System.currentTimeMillis())
                             }
                         }
-                        AirDropCodec.writeDvzipCpio(entries, chunkedOut) { doneBytes ->
+                        GlideDropCodec.writeDvzipCpio(entries, chunkedOut) { doneBytes ->
                             if (transferCancelled) throw IOException("Transfer cancelled")
                             val now = System.currentTimeMillis()
                             if (now - lastUpdate >= 350L || doneBytes >= total) {
@@ -2573,11 +2573,11 @@ class AirDropNode(private val context: Context) {
                     .createServerSocket() as SSLServerSocket
                 srv.reuseAddress = true
                 runCatching { srv.receiveBufferSize = 4_194_304 }
-                srv.bind(InetSocketAddress(AIRDROP_PORT), 32)
+                srv.bind(InetSocketAddress(GLIDEDROP_PORT), 32)
                 srv.wantClientAuth = false
                 srv.needClientAuth = false
                 serverSocket = srv
-                log("5GHz P2P HTTPS receiver listening on port $AIRDROP_PORT")
+                log("5GHz P2P HTTPS receiver listening on port $GLIDEDROP_PORT")
                 while (_running.value) {
                     val client = try {
                         srv.accept() as SSLSocket
@@ -2620,7 +2620,7 @@ class AirDropNode(private val context: Context) {
             val inp = BufferedInputStream(sock.inputStream, 1_048_576)
             val out = BufferedOutputStream(sock.outputStream, 65536)
             var lastSenderName = "MacBook Pro"
-            var lastAskLabel = "Incoming AirDrop"
+            var lastAskLabel = "Incoming Transfer"
             var lastAskFileCount = 1
             var lastAskTotalBytes = 0L
             var connectionAskApproved = false
@@ -2664,12 +2664,12 @@ class AirDropNode(private val context: Context) {
                             phase = "Handshaking over 5GHz Wi-Fi Direct…",
                             peerName = learnedMacName ?: "MacBook Pro"
                         )
-                        val resp = AirDropCodec.encodeBplist(
+                        val resp = GlideDropCodec.encodeBplist(
                             mapOf(
                                 "ReceiverComputerName" to deviceName,
                                 "ReceiverModelName" to deviceModel,
-                                "ReceiverMediaCapabilities" to AirDropCodec.MEDIA_CAPABILITIES_BYTES,
-                                "IsAirDropable" to true
+                                "ReceiverMediaCapabilities" to GlideDropCodec.MEDIA_CAPABILITIES_BYTES,
+                                "IsAirDropable" to true // Apple AWDL Discover wire-protocol bplist key
                             )
                         )
                         writeHttpResponse(out, 200, "OK", resp)
@@ -2678,7 +2678,7 @@ class AirDropNode(private val context: Context) {
                         transferCancelled = false
                         activeTransferSocket = sock
                         val bodyBytes = readHttpBodyBytes(inp, headers)
-                        val askDict = AirDropCodec.decodeBplistDict(bodyBytes)
+                        val askDict = GlideDropCodec.decodeBplistDict(bodyBytes)
                         val sender = askDict["SenderComputerName"]?.toString() ?: "MacBook Pro"
                         lastSenderName = sender
                         if (sender.isNotBlank()) learnedMacName = sender
@@ -2689,7 +2689,7 @@ class AirDropNode(private val context: Context) {
 
                         val fileNames = files.mapNotNull { it["FileName"]?.toString() }
                         val totalAskBytes = files.sumOf { (it["FileSize"] as? Number)?.toLong() ?: 0L }
-                        lastAskLabel = fileNames.firstOrNull() ?: "Incoming AirDrop"
+                        lastAskLabel = fileNames.firstOrNull() ?: "Incoming Transfer"
                         lastAskFileCount = maxOf(1, fileNames.size)
                         lastAskTotalBytes = totalAskBytes
 
@@ -2701,7 +2701,7 @@ class AirDropNode(private val context: Context) {
                         } else if (items.isNotEmpty()) {
                             items.joinToString(", ") { it.toString() }
                         } else {
-                            "AirDrop item"
+                            "GlideDrop item"
                         }
 
                         log("ASK from $sender: $summary")
@@ -2756,12 +2756,12 @@ class AirDropNode(private val context: Context) {
                             }
                         }
 
-                        val resp = AirDropCodec.encodeBplist(
+                        val resp = GlideDropCodec.encodeBplist(
                             mapOf(
                                 "ReceiverComputerName" to deviceName,
                                 "ReceiverModelName" to deviceModel,
-                                "ReceiverMediaCapabilities" to AirDropCodec.MEDIA_CAPABILITIES_BYTES,
-                                "IsAirDropable" to true
+                                "ReceiverMediaCapabilities" to GlideDropCodec.MEDIA_CAPABILITIES_BYTES,
+                                "IsAirDropable" to true // Apple AWDL Discover wire-protocol bplist key
                             )
                         )
                         writeHttpResponse(out, 200, "OK", resp)
@@ -2780,7 +2780,7 @@ class AirDropNode(private val context: Context) {
                         sock.soTimeout = 30_000
                         val downloads = File(
                             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                            "AirDrop"
+                            "GlideDrop"
                         )
                         val expectedBytes = (headers["totalbytes"]?.toLongOrNull() ?: 0L).let {
                             if (it > 0L) it else lastAskTotalBytes
@@ -2822,7 +2822,7 @@ class AirDropNode(private val context: Context) {
                             rawBody
                         }
                         val extracted = try {
-                            AirDropCodec.extractDvzipCpio(bodyStream, downloads)
+                            GlideDropCodec.extractDvzipCpio(bodyStream, downloads)
                         } finally {
                             reportProgress(label, 100, expectedBytes, expectedBytes, startedAt, fileCount, isSending = false)
                         }
@@ -2843,7 +2843,7 @@ class AirDropNode(private val context: Context) {
                             )
                             recordHistoryItem(rec)
                             onItemReceived?.invoke(rec)
-                            log("Saved to Downloads/AirDrop/${f.name} (${formatBytes(f.length())})")
+                            log("Saved to Downloads/GlideDrop/${f.name} (${formatBytes(f.length())})")
                         }
                         writeHttpResponse(out, 200, "OK", ByteArray(0))
                         break
@@ -2887,7 +2887,7 @@ class AirDropNode(private val context: Context) {
         get() = _transferProgress.value != null || pendingMacTx != null || activeTransferSocket != null
 
     fun sendUrisAsync(
-        peer: AirDropPeer,
+        peer: GlideDropPeer,
         uris: List<Uri>,
         onComplete: ((Boolean) -> Unit)? = null
     ): Job = scope.launch {
@@ -2898,7 +2898,7 @@ class AirDropNode(private val context: Context) {
     }
 
     fun sendTextSnippetAsync(
-        peer: AirDropPeer,
+        peer: GlideDropPeer,
         text: String,
         onComplete: ((Boolean) -> Unit)? = null
     ): Job = scope.launch {
@@ -2909,7 +2909,7 @@ class AirDropNode(private val context: Context) {
     }
 
     fun sendUrlAsync(
-        peer: AirDropPeer,
+        peer: GlideDropPeer,
         url: String,
         onComplete: ((Boolean) -> Unit)? = null
     ): Job = scope.launch {
@@ -2919,7 +2919,7 @@ class AirDropNode(private val context: Context) {
         }
     }
 
-    suspend fun sendUrisToPeer(peer: AirDropPeer, uris: List<Uri>): Boolean =
+    suspend fun sendUrisToPeer(peer: GlideDropPeer, uris: List<Uri>): Boolean =
         withContext(Dispatchers.IO) {
             if (uris.isEmpty()) return@withContext false
             val peerClean = peer.name.substringBefore(" (PSM").trim().ifEmpty { learnedMacName ?: "MacBook Pro" }
@@ -2973,7 +2973,7 @@ class AirDropNode(private val context: Context) {
         return name to size.coerceAtLeast(0L)
     }
 
-    suspend fun sendTextSnippetToPeer(peer: AirDropPeer, text: String): Boolean =
+    suspend fun sendTextSnippetToPeer(peer: GlideDropPeer, text: String): Boolean =
         withContext(Dispatchers.IO) {
             val trimmed = text.trim()
             if (trimmed.isEmpty()) return@withContext false
@@ -2982,7 +2982,7 @@ class AirDropNode(private val context: Context) {
             }
             val bytes = trimmed.toByteArray(StandardCharsets.UTF_8)
             val stamp = java.text.SimpleDateFormat("HHmmss", java.util.Locale.US).format(Date())
-            val entry = AirDropCodec.OutgoingEntry(
+            val entry = GlideDropCodec.OutgoingEntry(
                 name = "Note-$stamp.txt",
                 size = bytes.size.toLong(),
                 openStream = { bytes.inputStream() }
@@ -2990,16 +2990,16 @@ class AirDropNode(private val context: Context) {
             return@withContext sendOverBleL2cap(listOf(entry), null)
         }
 
-    suspend fun sendUrlToPeer(peer: AirDropPeer, url: String): Boolean =
+    suspend fun sendUrlToPeer(peer: GlideDropPeer, url: String): Boolean =
         withContext(Dispatchers.IO) {
             return@withContext sendOverBleL2cap(emptyList(), url)
         }
 
-    private fun resolveUriEntry(uri: Uri): AirDropCodec.OutgoingEntry? {
+    private fun resolveUriEntry(uri: Uri): GlideDropCodec.OutgoingEntry? {
         if (uri.scheme == "file") {
             val f = File(uri.path ?: return null)
             if (!f.isFile) return null
-            return AirDropCodec.OutgoingEntry(
+            return GlideDropCodec.OutgoingEntry(
                 name = f.name,
                 size = f.length(),
                 openStream = { f.inputStream() }
@@ -3047,7 +3047,7 @@ class AirDropNode(private val context: Context) {
                 return null
             }
         }
-        return AirDropCodec.OutgoingEntry(
+        return GlideDropCodec.OutgoingEntry(
             name = name,
             size = size,
             openStream = {
@@ -3079,7 +3079,7 @@ class AirDropNode(private val context: Context) {
                     KeyProperties.DIGEST_SHA384,
                     KeyProperties.DIGEST_SHA512
                 )
-                .setCertificateSubject(X500Principal("CN=airdrop"))
+                .setCertificateSubject(X500Principal("CN=glidedrop"))
                 .setCertificateSerialNumber(BigInteger.ONE)
                 .setCertificateNotBefore(Date(System.currentTimeMillis() - 86_400_000L))
                 .setCertificateNotAfter(Date(System.currentTimeMillis() + 315_360_000_000L))

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
-    <share-target android:targetClass="com.airdrop.p2p.MainActivity">
+    <share-target android:targetClass="io.github.jakharamit44.glidedrop.MainActivity">
         <data android:mimeType="*/*" />
-        <category android:name="com.airdrop.p2p.DIRECT_SHARE" />
+        <category android:name="io.github.jakharamit44.glidedrop.DIRECT_SHARE" />
     </share-target>
 </shortcuts>

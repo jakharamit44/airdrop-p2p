@@ -5,29 +5,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || echo "2.0.0")"
 
-echo "[+] Building AirDrop P2P macOS daemon (v${VERSION})..."
-mkdir -p "$HOME/.airdrop-p2p"
-xcrun swiftc -O "$SCRIPT_DIR/mac-ble-airdrop.swift" -o "$HOME/.airdrop-p2p/airdrop-p2p-daemon"
+echo "[+] Building GlideDrop macOS daemon (v${VERSION})..."
+mkdir -p "$HOME/.glidedrop"
+xcrun swiftc -O "$SCRIPT_DIR/glidedrop-daemon.swift" -o "$HOME/.glidedrop/glidedrop-daemon"
 
-APP_DIR="$ROOT_DIR/AirDrop P2P.app"
+APP_DIR="$ROOT_DIR/GlideDrop.app"
 APP_MACOS="$APP_DIR/Contents/MacOS"
 APP_RES="$APP_DIR/Contents/Resources"
 mkdir -p "$APP_MACOS" "$APP_RES"
 
-cp -f "$HOME/.airdrop-p2p/airdrop-p2p-daemon" "$APP_MACOS/AirDropP2P"
-cp -f "$SCRIPT_DIR/mac-airdrop-p2p.sh" "$APP_RES/mac-airdrop-p2p.sh"
+cp -f "$HOME/.glidedrop/glidedrop-daemon" "$APP_MACOS/GlideDrop"
+cp -f "$SCRIPT_DIR/glidedrop.sh" "$APP_RES/glidedrop.sh"
 cp -f "$SCRIPT_DIR/claude_processor.py" "$APP_RES/claude_processor.py"
-cp -f "$SCRIPT_DIR/mac-airdrop-p2p.sh" "$HOME/.airdrop-p2p/mac-airdrop-p2p.sh"
-cp -f "$SCRIPT_DIR/claude_processor.py" "$HOME/.airdrop-p2p/claude_processor.py"
+cp -f "$SCRIPT_DIR/glidedrop.sh" "$HOME/.glidedrop/glidedrop.sh"
+cp -f "$SCRIPT_DIR/claude_processor.py" "$HOME/.glidedrop/claude_processor.py"
 if [ ! -f "$SCRIPT_DIR/AppIcon.icns" ]; then
   echo "[+] Generating AppIcon.icns..."
   swift "$SCRIPT_DIR/generate-icon.swift" "$SCRIPT_DIR/AppIcon.icns"
 fi
 if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
   cp -f "$SCRIPT_DIR/AppIcon.icns" "$APP_RES/AppIcon.icns"
-  cp -f "$SCRIPT_DIR/AppIcon.icns" "$HOME/.airdrop-p2p/AppIcon.icns"
+  cp -f "$SCRIPT_DIR/AppIcon.icns" "$HOME/.glidedrop/AppIcon.icns"
 fi
-chmod +x "$APP_RES/mac-airdrop-p2p.sh" "$APP_RES/claude_processor.py" "$HOME/.airdrop-p2p/mac-airdrop-p2p.sh" "$HOME/.airdrop-p2p/claude_processor.py"
+chmod +x "$APP_RES/glidedrop.sh" "$APP_RES/claude_processor.py" "$HOME/.glidedrop/glidedrop.sh" "$HOME/.glidedrop/claude_processor.py"
 
 cat > "$APP_DIR/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -35,15 +35,15 @@ cat > "$APP_DIR/Contents/Info.plist" << PLIST
 <plist version="1.0">
 <dict>
   <key>CFBundleExecutable</key>
-  <string>AirDropP2P</string>
+  <string>GlideDrop</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
-  <string>com.airdrop.p2p.mac</string>
+  <string>io.github.jakharamit44.glidedrop.mac</string>
   <key>CFBundleName</key>
-  <string>AirDrop P2P</string>
+  <string>GlideDrop</string>
   <key>CFBundleDisplayName</key>
-  <string>AirDrop P2P</string>
+  <string>GlideDrop</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -55,26 +55,26 @@ cat > "$APP_DIR/Contents/Info.plist" << PLIST
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
-  <string>AirDrop P2P uses Bluetooth LE L2CAP to discover and transfer files with Android devices.</string>
+  <string>GlideDrop uses Bluetooth LE L2CAP to discover and transfer files with Android devices.</string>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>AirDrop P2P requires local network access to discover nearby devices and transfer files over high-speed Wi-Fi Direct and local sockets.</string>
+  <string>GlideDrop requires local network access to discover nearby devices and transfer files over high-speed Wi-Fi Direct and local sockets.</string>
 </dict>
 </plist>
 PLIST
 
 # Strip extended attributes and seal bundle with deep code signature
-echo "[+] Sealing and signing AirDrop P2P.app bundle..."
+echo "[+] Sealing and signing GlideDrop.app bundle..."
 xattr -cr "$APP_DIR"
 codesign --force --deep --sign - "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
 
-if [ -w "/Applications" ] || [ -w "/Applications/AirDrop P2P.app" ]; then
-  echo "[+] Updating /Applications/AirDrop P2P.app..."
-  rm -rf "/Applications/AirDrop P2P.app"
-  cp -R "$APP_DIR" "/Applications/AirDrop P2P.app"
-  xattr -cr "/Applications/AirDrop P2P.app"
-  codesign --force --deep --sign - "/Applications/AirDrop P2P.app"
+if [ -w "/Applications" ] || [ -w "/Applications/GlideDrop.app" ]; then
+  echo "[+] Updating /Applications/GlideDrop.app..."
+  rm -rf "/Applications/GlideDrop.app"
+  cp -R "$APP_DIR" "/Applications/GlideDrop.app"
+  xattr -cr "/Applications/GlideDrop.app"
+  codesign --force --deep --sign - "/Applications/GlideDrop.app"
 fi
 
-echo "[+] AirDrop P2P.app bundle created at: $APP_DIR"
+echo "[+] GlideDrop.app bundle created at: $APP_DIR"
 

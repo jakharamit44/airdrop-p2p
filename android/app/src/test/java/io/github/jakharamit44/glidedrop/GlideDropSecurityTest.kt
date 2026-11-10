@@ -1,4 +1,4 @@
-package com.airdrop.p2p
+package io.github.jakharamit44.glidedrop
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -38,16 +38,16 @@ import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManagerFactory
 
-class AirDropSecurityTest {
+class GlideDropSecurityTest {
 
     @Test
     fun ecdhP256SharedSecretDerivationMatchesBetweenPeers() {
-        // Peer A (Android) and Peer B (Mac) using AirDropNode production companion methods
-        val pairA = AirDropNode.generateEphemeralEcdhKeyPair()
-        val pairB = AirDropNode.generateEphemeralEcdhKeyPair()
+        // Peer A (Android) and Peer B (Mac) using GlideDropNode production companion methods
+        val pairA = GlideDropNode.generateEphemeralEcdhKeyPair()
+        val pairB = GlideDropNode.generateEphemeralEcdhKeyPair()
 
-        val sessionKeyA = AirDropNode.deriveSessionKey(pairA.privateKey, pairB.publicKey.encoded)
-        val sessionKeyB = AirDropNode.deriveSessionKey(pairB.privateKey, pairA.publicKey.encoded)
+        val sessionKeyA = GlideDropNode.deriveSessionKey(pairA.privateKey, pairB.publicKey.encoded)
+        val sessionKeyB = GlideDropNode.deriveSessionKey(pairB.privateKey, pairA.publicKey.encoded)
 
         assertEquals(32, sessionKeyA.size)
         assertEquals(32, sessionKeyB.size)
@@ -56,30 +56,30 @@ class AirDropSecurityTest {
 
     @Test
     fun distinctKeyPairsDeriveUniqueSessionKeys() {
-        val pairA1 = AirDropNode.generateEphemeralEcdhKeyPair()
-        val pairB1 = AirDropNode.generateEphemeralEcdhKeyPair()
-        val pairA2 = AirDropNode.generateEphemeralEcdhKeyPair()
+        val pairA1 = GlideDropNode.generateEphemeralEcdhKeyPair()
+        val pairB1 = GlideDropNode.generateEphemeralEcdhKeyPair()
+        val pairA2 = GlideDropNode.generateEphemeralEcdhKeyPair()
 
-        val key1 = AirDropNode.deriveSessionKey(pairA1.privateKey, pairB1.publicKey.encoded)
-        val key2 = AirDropNode.deriveSessionKey(pairA2.privateKey, pairB1.publicKey.encoded)
+        val key1 = GlideDropNode.deriveSessionKey(pairA1.privateKey, pairB1.publicKey.encoded)
+        val key2 = GlideDropNode.deriveSessionKey(pairA2.privateKey, pairB1.publicKey.encoded)
 
         assertFalse("Different ephemeral private keys must derive completely different session keys", key1.contentEquals(key2))
     }
 
     @Test
     fun wifiDirectCredentialsAes256GcmRoundTrip() {
-        val pairA = AirDropNode.generateEphemeralEcdhKeyPair()
-        val pairB = AirDropNode.generateEphemeralEcdhKeyPair()
-        val sessionKey = AirDropNode.deriveSessionKey(pairA.privateKey, pairB.publicKey.encoded)
+        val pairA = GlideDropNode.generateEphemeralEcdhKeyPair()
+        val pairB = GlideDropNode.generateEphemeralEcdhKeyPair()
+        val sessionKey = GlideDropNode.deriveSessionKey(pairA.privateKey, pairB.publicKey.encoded)
 
-        val ssid = "DIRECT-aB-AirDrop-Test-5G"
+        val ssid = "DIRECT-aB-GlideDrop-Test-5G"
         val pass = "SuperSecretP2pPassphrase99!"
         val plainText = "$ssid\t$pass".toByteArray(StandardCharsets.UTF_8)
 
-        val encryptedPacket = AirDropNode.encryptAesGcm(plainText, sessionKey)
+        val encryptedPacket = GlideDropNode.encryptAesGcm(plainText, sessionKey)
         assertTrue("Ciphertext must include 12-byte IV + payload + 16-byte tag", encryptedPacket.size >= 28 + plainText.size)
 
-        val decryptedBytes = AirDropNode.decryptAesGcm(encryptedPacket, sessionKey)
+        val decryptedBytes = GlideDropNode.decryptAesGcm(encryptedPacket, sessionKey)
         assertArrayEquals(plainText, decryptedBytes)
 
         val decryptedStr = String(decryptedBytes, StandardCharsets.UTF_8)
@@ -90,18 +90,18 @@ class AirDropSecurityTest {
 
     @Test
     fun aes256GcmRejectsTamperedCiphertext() {
-        val pairA = AirDropNode.generateEphemeralEcdhKeyPair()
-        val pairB = AirDropNode.generateEphemeralEcdhKeyPair()
-        val sessionKey = AirDropNode.deriveSessionKey(pairA.privateKey, pairB.publicKey.encoded)
+        val pairA = GlideDropNode.generateEphemeralEcdhKeyPair()
+        val pairB = GlideDropNode.generateEphemeralEcdhKeyPair()
+        val sessionKey = GlideDropNode.deriveSessionKey(pairA.privateKey, pairB.publicKey.encoded)
 
         val plainText = "DIRECT-xy\tsecret123".toByteArray(StandardCharsets.UTF_8)
-        val encryptedPacket = AirDropNode.encryptAesGcm(plainText, sessionKey)
+        val encryptedPacket = GlideDropNode.encryptAesGcm(plainText, sessionKey)
 
         // Tamper with one bit in the ciphertext / auth tag
         encryptedPacket[15] = (encryptedPacket[15].toInt() xor 0x01).toByte()
 
         try {
-            AirDropNode.decryptAesGcm(encryptedPacket, sessionKey)
+            GlideDropNode.decryptAesGcm(encryptedPacket, sessionKey)
             fail("Decryption of tampered ciphertext must throw an AEAD authentication exception")
         } catch (_: javax.crypto.AEADBadTagException) {
             // Expected
@@ -114,7 +114,7 @@ class AirDropSecurityTest {
     fun aes256GcmRejectsShortPackets() {
         val key = ByteArray(32) { 0x42 }
         try {
-            AirDropNode.decryptAesGcm(ByteArray(27), key)
+            GlideDropNode.decryptAesGcm(ByteArray(27), key)
             fail("Packets shorter than 28 bytes (12 IV + 16 Tag) must be rejected")
         } catch (_: java.io.IOException) {
             // Expected
@@ -123,11 +123,11 @@ class AirDropSecurityTest {
 
     @Test
     fun malformedOrCorruptedPeerEcPublicKeyRejection() {
-        val pairA = AirDropNode.generateEphemeralEcdhKeyPair()
+        val pairA = GlideDropNode.generateEphemeralEcdhKeyPair()
         val garbageBytes = byteArrayOf(0x30, 0x10, 0x01, 0x02, 0x03, 0x04)
 
         try {
-            AirDropNode.deriveSessionKey(pairA.privateKey, garbageBytes)
+            GlideDropNode.deriveSessionKey(pairA.privateKey, garbageBytes)
             fail("Deriving session key with invalid DER public key must throw InvalidKeySpecException")
         } catch (_: InvalidKeySpecException) {
             // Expected
@@ -184,33 +184,33 @@ class AirDropSecurityTest {
 
         val md = MessageDigest.getInstance("SHA-256")
         md.update(secret)
-        md.update("AirDropP2P-v2-SessionKey".toByteArray(StandardCharsets.UTF_8))
+        md.update("GlideDrop-v2-SessionKey".toByteArray(StandardCharsets.UTF_8))
         val sessionKey = md.digest()
 
         val sessionKeyB64 = Base64.getEncoder().encodeToString(sessionKey)
-        // Must match exact Swift output: V0EbP7kiAUG3sFkBivaYBnjQvunQpA8jTTPbNreDgJ0=
-        assertEquals("V0EbP7kiAUG3sFkBivaYBnjQvunQpA8jTTPbNreDgJ0=", sessionKeyB64)
+        // Must match exact Swift output: yC4CQspFyUEHQ8fiY9BhEhGOrB0F1UGUUtwaSF3WA/4=
+        assertEquals("yC4CQspFyUEHQ8fiY9BhEhGOrB0F1UGUUtwaSF3WA/4=", sessionKeyB64)
     }
 
     @Test
     fun w2p2PayloadParsingHandlesVersionedAndUnversioned() {
         // 1. Version 2 format: "\t2\t<macPubB64>\t<fingerprint>"
-        val v2Res = AirDropNode.parseW2P2Line("\t2\tPUB_KEY_B64\tFINGERPRINT_HEX")
+        val v2Res = GlideDropNode.parseW2P2Line("\t2\tPUB_KEY_B64\tFINGERPRINT_HEX")
         assertEquals("PUB_KEY_B64", v2Res.first)
         assertEquals("FINGERPRINT_HEX", v2Res.second)
 
         // 2. Unversioned format: "\t<macPubB64>\t<fingerprint>"
-        val unvRes = AirDropNode.parseW2P2Line("\tPUB_KEY_B64\tFINGERPRINT_HEX")
+        val unvRes = GlideDropNode.parseW2P2Line("\tPUB_KEY_B64\tFINGERPRINT_HEX")
         assertEquals("PUB_KEY_B64", unvRes.first)
         assertEquals("FINGERPRINT_HEX", unvRes.second)
 
         // 3. Version without fingerprint: "\t2\t<macPubB64>"
-        val noFpRes = AirDropNode.parseW2P2Line("\t2\tPUB_KEY_B64")
+        val noFpRes = GlideDropNode.parseW2P2Line("\t2\tPUB_KEY_B64")
         assertEquals("PUB_KEY_B64", noFpRes.first)
         assertNull(noFpRes.second)
 
         // 4. Empty/whitespace string
-        val emptyRes = AirDropNode.parseW2P2Line("")
+        val emptyRes = GlideDropNode.parseW2P2Line("")
         assertEquals("", emptyRes.first)
         assertNull(emptyRes.second)
     }
@@ -241,46 +241,46 @@ class AirDropSecurityTest {
     @Test
     fun encryptedBleArchiveLengthCapRejectsOversizedBuffers() {
         // Valid bounds: Encrypted BLE (ADRE) with 30 MB is allowed
-        assertTrue(AirDropNode.isValidBleFrameBounds(512, 30_000_000, isEncryptedBle = true))
+        assertTrue(GlideDropNode.isValidBleFrameBounds(512, 30_000_000, isEncryptedBle = true))
 
         // Rejection: Encrypted BLE (ADRE) with 30 MB + 1 byte must be rejected to prevent JVM OOM
-        assertFalse(AirDropNode.isValidBleFrameBounds(512, 30_000_001, isEncryptedBle = true))
+        assertFalse(GlideDropNode.isValidBleFrameBounds(512, 30_000_001, isEncryptedBle = true))
 
         // Rejection: Encrypted BLE (ADRE) with 1.8 GB must be rejected
-        assertFalse(AirDropNode.isValidBleFrameBounds(512, 1_800_000_000, isEncryptedBle = true))
+        assertFalse(GlideDropNode.isValidBleFrameBounds(512, 1_800_000_000, isEncryptedBle = true))
 
         // Boundary tests for metaLen
-        assertFalse(AirDropNode.isValidBleFrameBounds(0, 1024, isEncryptedBle = true))
-        assertFalse(AirDropNode.isValidBleFrameBounds(-1, 1024, isEncryptedBle = true))
-        assertTrue(AirDropNode.isValidBleFrameBounds(AirDropNode.MAX_BLE_META_BYTES, 1024, isEncryptedBle = true))
-        assertFalse(AirDropNode.isValidBleFrameBounds(AirDropNode.MAX_BLE_META_BYTES + 1, 1024, isEncryptedBle = true))
+        assertFalse(GlideDropNode.isValidBleFrameBounds(0, 1024, isEncryptedBle = true))
+        assertFalse(GlideDropNode.isValidBleFrameBounds(-1, 1024, isEncryptedBle = true))
+        assertTrue(GlideDropNode.isValidBleFrameBounds(GlideDropNode.MAX_BLE_META_BYTES, 1024, isEncryptedBle = true))
+        assertFalse(GlideDropNode.isValidBleFrameBounds(GlideDropNode.MAX_BLE_META_BYTES + 1, 1024, isEncryptedBle = true))
 
         // Negative archive length rejection
-        assertFalse(AirDropNode.isValidBleFrameBounds(512, -1, isEncryptedBle = true))
+        assertFalse(GlideDropNode.isValidBleFrameBounds(512, -1, isEncryptedBle = true))
 
         // Unencrypted BLE (ADRP) streaming bounds
-        assertTrue(AirDropNode.isValidBleFrameBounds(512, 50_000_000, isEncryptedBle = false))
-        assertTrue(AirDropNode.isValidBleFrameBounds(512, 1_800_000_000, isEncryptedBle = false))
-        assertFalse(AirDropNode.isValidBleFrameBounds(512, 1_800_000_001, isEncryptedBle = false))
+        assertTrue(GlideDropNode.isValidBleFrameBounds(512, 50_000_000, isEncryptedBle = false))
+        assertTrue(GlideDropNode.isValidBleFrameBounds(512, 1_800_000_000, isEncryptedBle = false))
+        assertFalse(GlideDropNode.isValidBleFrameBounds(512, 1_800_000_001, isEncryptedBle = false))
     }
 
     @Test
     fun multiFileStagingCalculatesAggregateSize() {
         val testSizes = listOf(4_500_000L, 3_200_000L, 45_000_000L)
-        val aggregateBytes = AirDropNode.calculateAggregateStagedBytes(testSizes)
+        val aggregateBytes = GlideDropNode.calculateAggregateStagedBytes(testSizes)
         assertEquals(52_700_000L, aggregateBytes)
 
         // Robustness: Negative sizes from non-seekable streams (-1L) are coerced to 0L without skewing total
         val mixedSizes = listOf(10_000_000L, -1L, 5_000_000L)
-        assertEquals(15_000_000L, AirDropNode.calculateAggregateStagedBytes(mixedSizes))
+        assertEquals(15_000_000L, GlideDropNode.calculateAggregateStagedBytes(mixedSizes))
 
         // Multi-file label formatting
-        assertEquals("photo.jpg", AirDropNode.formatMultiFileDisplayLabel("photo.jpg", 1))
-        assertEquals("photo.jpg (+2 more)", AirDropNode.formatMultiFileDisplayLabel("photo.jpg", 3))
+        assertEquals("photo.jpg", GlideDropNode.formatMultiFileDisplayLabel("photo.jpg", 1))
+        assertEquals("photo.jpg (+2 more)", GlideDropNode.formatMultiFileDisplayLabel("photo.jpg", 3))
     }
 
     private fun generateTestKeyStore(alias: String, commonName: String): KeyStore {
-        val tmpDir = Files.createTempDirectory("airdrop-tls-test")
+        val tmpDir = Files.createTempDirectory("glidedrop-tls-test")
         try {
             val ksFile = tmpDir.resolve("$alias.p12").toFile()
             val keytoolPath = File(System.getProperty("java.home"), "bin/keytool").absolutePath
@@ -323,21 +323,21 @@ class AirDropSecurityTest {
 
     @Test
     fun pinnedTlsTrustManagerValidatesExactCertificateAndRejectsMismatch() {
-        val ksA = generateTestKeyStore("peerA", "airdrop-peer-a")
-        val ksB = generateTestKeyStore("peerB", "airdrop-peer-b")
+        val ksA = generateTestKeyStore("peerA", "glidedrop-peer-a")
+        val ksB = generateTestKeyStore("peerB", "glidedrop-peer-b")
         val certA = ksA.getCertificate("peerA") as X509Certificate
         val certB = ksB.getCertificate("peerB") as X509Certificate
 
-        val fpA = AirDropNode.sha256FingerprintHex(certA)
+        val fpA = GlideDropNode.sha256FingerprintHex(certA)
         val colonFpA = fpA.chunked(2).joinToString(":").uppercase()
         val dashFpA = fpA.chunked(2).joinToString("-")
 
         // Matching fingerprint (raw, colon-delimited uppercase, dash-delimited) must succeed
-        AirDropNode.PinnedTlsTrustManager(fpA).checkServerTrusted(arrayOf(certA), "ECDHE_ECDSA")
-        AirDropNode.PinnedTlsTrustManager(colonFpA).checkServerTrusted(arrayOf(certA), "ECDHE_ECDSA")
-        AirDropNode.PinnedTlsTrustManager("  $dashFpA  ").checkServerTrusted(arrayOf(certA), "ECDHE_ECDSA")
+        GlideDropNode.PinnedTlsTrustManager(fpA).checkServerTrusted(arrayOf(certA), "ECDHE_ECDSA")
+        GlideDropNode.PinnedTlsTrustManager(colonFpA).checkServerTrusted(arrayOf(certA), "ECDHE_ECDSA")
+        GlideDropNode.PinnedTlsTrustManager("  $dashFpA  ").checkServerTrusted(arrayOf(certA), "ECDHE_ECDSA")
 
-        val tm = AirDropNode.PinnedTlsTrustManager(fpA)
+        val tm = GlideDropNode.PinnedTlsTrustManager(fpA)
 
         // Mismatched certificate must throw CertificateException
         try {
@@ -379,28 +379,28 @@ class AirDropSecurityTest {
 
         // Invalid or empty pin strings must fail closed at construction
         for (badPin in listOf("", "   ", "deadbeef", "zz".repeat(32), "a".repeat(63), "a".repeat(65))) {
-            assertFalse("Expected isValidSha256Fingerprint to reject '$badPin'", AirDropNode.isValidSha256Fingerprint(badPin))
+            assertFalse("Expected isValidSha256Fingerprint to reject '$badPin'", GlideDropNode.isValidSha256Fingerprint(badPin))
             try {
-                AirDropNode.PinnedTlsTrustManager(badPin)
+                GlideDropNode.PinnedTlsTrustManager(badPin)
                 fail("Invalid fingerprint '$badPin' must be rejected")
             } catch (_: IllegalArgumentException) {
                 // Expected
             }
         }
-        assertFalse(AirDropNode.isValidSha256Fingerprint(null))
-        assertTrue(AirDropNode.isValidSha256Fingerprint(fpA))
-        assertTrue(AirDropNode.isValidSha256Fingerprint(colonFpA))
-        assertTrue(AirDropNode.isValidSha256Fingerprint("  $dashFpA  "))
+        assertFalse(GlideDropNode.isValidSha256Fingerprint(null))
+        assertTrue(GlideDropNode.isValidSha256Fingerprint(fpA))
+        assertTrue(GlideDropNode.isValidSha256Fingerprint(colonFpA))
+        assertTrue(GlideDropNode.isValidSha256Fingerprint("  $dashFpA  "))
     }
 
     @Test
     fun pinnedClientSslContextEnforcesHandshakePinningOverLoopbackTls() {
-        val ksA = generateTestKeyStore("srvA", "airdrop-srv-a")
-        val ksB = generateTestKeyStore("srvB", "airdrop-srv-b")
+        val ksA = generateTestKeyStore("srvA", "glidedrop-srv-a")
+        val ksB = generateTestKeyStore("srvB", "glidedrop-srv-b")
         val certA = ksA.getCertificate("srvA") as X509Certificate
         val certB = ksB.getCertificate("srvB") as X509Certificate
-        val fpA = AirDropNode.sha256FingerprintHex(certA)
-        val fpB = AirDropNode.sha256FingerprintHex(certB)
+        val fpA = GlideDropNode.sha256FingerprintHex(certA)
+        val fpB = GlideDropNode.sha256FingerprintHex(certB)
 
         val serverCtx = buildServerContextFromKeyStore(ksA)
         val srv = (serverCtx.serverSocketFactory.createServerSocket(0, 8, InetAddress.getByName("127.0.0.1")) as SSLServerSocket).apply {
@@ -424,10 +424,10 @@ class AirDropSecurityTest {
             }
 
             // 1. Pinned fingerprint matching server cert A must succeed (leaves endpointIdentificationAlgorithm unset for self-signed P2P cert)
-            val matchingCtx = AirDropNode.buildPinnedClientSslContext(fpA)
+            val matchingCtx = GlideDropNode.buildPinnedClientSslContext(fpA)
             (matchingCtx.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
                 tls.soTimeout = 5_000
-                AirDropNode.configureClientTlsSocket(tls, isPinned = true)
+                GlideDropNode.configureClientTlsSocket(tls, isPinned = true)
                 assertNull(tls.sslParameters.endpointIdentificationAlgorithm)
                 tls.startHandshake()
                 val buf = ByteArray(2)
@@ -436,10 +436,10 @@ class AirDropSecurityTest {
             }
 
             // 2. Mismatched fingerprint (simulating MitM cert) must abort TLS handshake
-            val wrongPinCtx = AirDropNode.buildPinnedClientSslContext(fpB)
+            val wrongPinCtx = GlideDropNode.buildPinnedClientSslContext(fpB)
             (wrongPinCtx.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
                 tls.soTimeout = 5_000
-                AirDropNode.configureClientTlsSocket(tls, isPinned = true)
+                GlideDropNode.configureClientTlsSocket(tls, isPinned = true)
                 try {
                     tls.startHandshake()
                     fail("TLS handshake with mismatched pinned fingerprint must fail")
@@ -451,10 +451,10 @@ class AirDropSecurityTest {
             }
 
             // 3. Default platform SSLContext without pin must configure HTTPS endpoint identification and reject untrusted self-signed cert
-            val defaultCtx = AirDropNode.buildDefaultClientSslContext()
+            val defaultCtx = GlideDropNode.buildDefaultClientSslContext()
             (defaultCtx.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
                 tls.soTimeout = 5_000
-                AirDropNode.configureClientTlsSocket(tls, isPinned = false)
+                GlideDropNode.configureClientTlsSocket(tls, isPinned = false)
                 assertEquals("HTTPS", tls.sslParameters.endpointIdentificationAlgorithm)
                 try {
                     tls.startHandshake()
@@ -471,11 +471,11 @@ class AirDropSecurityTest {
             val trustedCtxA = SSLContext.getInstance("TLS").apply { init(null, tmfA.trustManagers, null) }
             (trustedCtxA.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
                 tls.soTimeout = 5_000
-                AirDropNode.configureClientTlsSocket(tls, isPinned = false)
+                GlideDropNode.configureClientTlsSocket(tls, isPinned = false)
                 assertEquals("HTTPS", tls.sslParameters.endpointIdentificationAlgorithm)
                 try {
                     tls.startHandshake()
-                    fail("HTTPS endpoint identification must reject CN=airdrop-srv-a for 127.0.0.1")
+                    fail("HTTPS endpoint identification must reject CN=glidedrop-srv-a for 127.0.0.1")
                 } catch (_: javax.net.ssl.SSLException) {
                     // Expected
                 } catch (_: CertificateException) {

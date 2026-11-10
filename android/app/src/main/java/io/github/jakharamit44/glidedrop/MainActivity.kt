@@ -1,4 +1,4 @@
-package com.airdrop.p2p
+package io.github.jakharamit44.glidedrop
 
 import android.Manifest
 import android.app.Activity
@@ -110,7 +110,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
-import com.airdrop.p2p.theme.AirDropTheme
+import io.github.jakharamit44.glidedrop.theme.GlideDropTheme
 import ds.tokens.DsMotion
 import ds.tokens.LocalDsColors
 import kotlinx.coroutines.Dispatchers
@@ -217,15 +217,15 @@ private fun readInternalStorage(): StorageBreakdown {
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var node: AirDropNode
+    private lateinit var node: GlideDropNode
     private val sharedUris = MutableStateFlow<List<Uri>>(emptyList())
     private val sharedText = MutableStateFlow<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        node = AirDropService.getNode(applicationContext)
+        node = GlideDropService.getNode(applicationContext)
         runCatching {
-            startForegroundService(Intent(this, AirDropService::class.java))
+            startForegroundService(Intent(this, GlideDropService::class.java))
         }
         captureShareIntent(intent)
 
@@ -248,13 +248,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            AirDropTheme(darkTheme = isDark) {
+            GlideDropTheme(darkTheme = isDark) {
                 val colors = LocalDsColors.current
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = colors.surfaceBase
                 ) {
-                    AirDropScreen(
+                    GlideDropScreen(
                         node = node,
                         isDark = isDark,
                         themeMode = themeMode,
@@ -290,7 +290,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         if (isFinishing && ::node.isInitialized && !node.isTransferInProgress) {
             runCatching {
-                stopService(Intent(this, AirDropService::class.java))
+                stopService(Intent(this, GlideDropService::class.java))
             }
         }
         super.onDestroy()
@@ -340,8 +340,8 @@ private enum class QuickIconKind {
 }
 
 @Composable
-fun AirDropScreen(
-    node: AirDropNode,
+fun GlideDropScreen(
+    node: GlideDropNode,
     isDark: Boolean,
     themeMode: String,
     pendingSharedUris: List<Uri>,
@@ -502,7 +502,7 @@ fun AirDropScreen(
         if (stagedItems.isEmpty() || transferProgress != null) return
         val activePeer = peers.firstOrNull { it.id == selectedPeerId }
             ?: peers.firstOrNull()
-            ?: AirDropPeer(
+            ?: GlideDropPeer(
                 id = "ble-mac",
                 name = "Nearby Mac",
                 host = "ble://mac",
@@ -551,7 +551,7 @@ fun AirDropScreen(
             shape = RoundedCornerShape(20.dp),
             title = {
                 Text(
-                    text = "Incoming AirDrop",
+                    text = "Incoming Transfer",
                     fontWeight = FontWeight.Bold,
                     fontSize = 18.sp
                 )
@@ -583,7 +583,7 @@ fun AirDropScreen(
                             )
                             if (ask.totalBytes > 0L) {
                                 Text(
-                                    text = "Total size: ${AirDropNode.formatBytes(ask.totalBytes)}",
+                                    text = "Total size: ${GlideDropNode.formatBytes(ask.totalBytes)}",
                                     color = c.textAccent,
                                     fontSize = 12.sp,
                                     style = TextStyle(fontFeatureSettings = "tnum")
@@ -868,7 +868,7 @@ fun AirDropScreen(
                     onShareItem = { item -> shareFileOrUrl(context, item) },
                     onCopyText = { txt ->
                         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                        cm?.setPrimaryClip(ClipData.newPlainText("AirDrop", txt))
+                        cm?.setPrimaryClip(ClipData.newPlainText("GlideDrop", txt))
                         Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
                     },
                     onClearAll = { node.clearReceivedItems() }
@@ -1211,9 +1211,9 @@ private fun LiveConnectionBridgeCard(
                     MetricColumn(
                         label = "Size",
                         value = when {
-                            progress.isConnecting && progress.totalBytes > 0L -> AirDropNode.formatBytes(progress.totalBytes)
+                            progress.isConnecting && progress.totalBytes > 0L -> GlideDropNode.formatBytes(progress.totalBytes)
                             progress.isConnecting -> "Preparing\u2026"
-                            else -> "${AirDropNode.formatBytes(progress.doneBytes)} / ${AirDropNode.formatBytes(progress.totalBytes)}"
+                            else -> "${GlideDropNode.formatBytes(progress.doneBytes)} / ${GlideDropNode.formatBytes(progress.totalBytes)}"
                         },
                         textColor = c.textOnAction,
                         modifier = Modifier.weight(1.4f)
@@ -1226,7 +1226,7 @@ private fun LiveConnectionBridgeCard(
                     )
                     MetricColumn(
                         label = "Speed",
-                        value = if (progress.isConnecting) "Handshake\u2026" else AirDropNode.formatSpeed(progress.speedBytesPerSec),
+                        value = if (progress.isConnecting) "Handshake\u2026" else GlideDropNode.formatSpeed(progress.speedBytesPerSec),
                         textColor = c.textOnAction,
                         modifier = Modifier.weight(0.95f)
                     )
@@ -1368,7 +1368,7 @@ private fun MetricColumn(
 @Composable
 private fun SendHomeTab(
     stagedItems: List<StagedFileItem>,
-    peers: List<AirDropPeer>,
+    peers: List<GlideDropPeer>,
     selectedPeerId: String?,
     transferActive: Boolean,
     storage: StorageBreakdown,
@@ -1626,7 +1626,7 @@ private fun SendHomeTab(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = "To ${sent.peerName} · ${AirDropNode.formatBytes(sent.sizeBytes)}",
+                                        text = "To ${sent.peerName} · ${GlideDropNode.formatBytes(sent.sizeBytes)}",
                                         color = c.textSecondary,
                                         fontSize = 11.sp,
                                         style = TextStyle(fontFeatureSettings = "tnum"),
@@ -1645,7 +1645,7 @@ private fun SendHomeTab(
 @Composable
 private fun SelectedFilesStagingCard(
     stagedItems: List<StagedFileItem>,
-    peers: List<AirDropPeer>,
+    peers: List<GlideDropPeer>,
     selectedPeerId: String?,
     transferActive: Boolean,
     onSelectPeer: (String) -> Unit,
@@ -1684,7 +1684,7 @@ private fun SelectedFilesStagingCard(
                         fontSize = 16.sp
                     )
                     Text(
-                        text = "Total ${AirDropNode.formatBytes(totalBytes)} · Ready to send",
+                        text = "Total ${GlideDropNode.formatBytes(totalBytes)} · Ready to send",
                         color = c.textSecondary,
                         fontSize = 12.sp,
                         style = TextStyle(fontFeatureSettings = "tnum")
@@ -1782,7 +1782,7 @@ private fun SelectedFilesStagingCard(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = "${item.category} · ${AirDropNode.formatBytes(item.sizeBytes)}",
+                                    text = "${item.category} · ${GlideDropNode.formatBytes(item.sizeBytes)}",
                                     color = c.textSecondary,
                                     fontSize = 11.sp,
                                     style = TextStyle(fontFeatureSettings = "tnum")
@@ -1899,7 +1899,7 @@ private fun SelectedFilesStagingCard(
                     text = if (transferActive) {
                         "Transfer in progress\u2026"
                     } else {
-                        "Send ${stagedItems.size} ${if (stagedItems.size == 1) "File" else "Files"} (${AirDropNode.formatBytes(totalBytes)})"
+                        "Send ${stagedItems.size} ${if (stagedItems.size == 1) "File" else "Files"} (${GlideDropNode.formatBytes(totalBytes)})"
                     },
                     fontWeight = FontWeight.Bold,
                     fontSize = 15.sp,
@@ -2087,12 +2087,12 @@ private fun ReceiveRadarTab(
     running: Boolean,
     deviceName: String,
     autoAccept: Boolean,
-    peers: List<AirDropPeer>,
+    peers: List<GlideDropPeer>,
     p2pStatus: String,
     recentReceived: List<ReceivedItem>,
     onToggleAutoAccept: (Boolean) -> Unit,
     onRescan: () -> Unit,
-    onStartSendToPeer: (AirDropPeer) -> Unit,
+    onStartSendToPeer: (GlideDropPeer) -> Unit,
     onOpenHistoryItem: (ReceivedItem) -> Unit,
     onViewAllReceived: () -> Unit
 ) {
@@ -2240,7 +2240,7 @@ private fun ReceiveRadarTab(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = if (autoAccept) "Auto-accepting incoming files to Downloads/AirDrop" else "Ask before saving incoming files",
+                                    text = if (autoAccept) "Auto-accepting incoming files to Downloads/GlideDrop" else "Ask before saving incoming files",
                                     color = c.textSecondary,
                                     fontSize = 11.sp,
                                     maxLines = 1,
@@ -2439,7 +2439,7 @@ private fun ReceiveRadarTab(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = "From ${rx.peerName} · ${AirDropNode.formatBytes(rx.sizeBytes)}",
+                                text = "From ${rx.peerName} · ${GlideDropNode.formatBytes(rx.sizeBytes)}",
                                 color = c.textSecondary,
                                 fontSize = 11.sp,
                                 style = TextStyle(fontFeatureSettings = "tnum")
@@ -2602,7 +2602,7 @@ private fun TransfersHistoryScreen(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = "${if (item.isOutgoing) "Sent to" else "From"} ${item.peerName} · ${AirDropNode.formatBytes(item.sizeBytes)} · ${fmt.format(Date(item.timestampMs))}",
+                                        text = "${if (item.isOutgoing) "Sent to" else "From"} ${item.peerName} · ${GlideDropNode.formatBytes(item.sizeBytes)} · ${fmt.format(Date(item.timestampMs))}",
                                         color = c.textSecondary,
                                         fontSize = 11.sp,
                                         style = TextStyle(fontFeatureSettings = "tnum"),
@@ -2753,7 +2753,7 @@ private fun SettingsScreenTab(
                     }
                     Text(
                         text = if (autoAccept) {
-                            "Incoming files save directly to Downloads/AirDrop without prompting."
+                            "Incoming files save directly to Downloads/GlideDrop without prompting."
                         } else {
                             "Each incoming transfer shows sender name, file list, and size before saving."
                         },
@@ -2858,7 +2858,7 @@ private fun SettingsScreenTab(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Save Location", color = c.textSecondary, fontSize = 12.sp)
-                            Text("Downloads/AirDrop", color = c.textPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            Text("Downloads/GlideDrop", color = c.textPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                         }
                         OutlinedButton(
                             onClick = onOpenDownloads,

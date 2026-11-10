@@ -9,13 +9,13 @@ android {
         if (vf.exists()) vf.readText().trim() else "2.0.0"
     }
 
-    namespace = "com.airdrop.p2p"
+    namespace = "io.github.jakharamit44.glidedrop"
     compileSdk = 36
     defaultConfig {
-        applicationId = "com.airdrop.p2p"
+        applicationId = "io.github.jakharamit44.glidedrop"
         minSdk = 31
         targetSdk = 36
-        versionCode = 241
+        versionCode = 250
         versionName = appVersionName
     }
 

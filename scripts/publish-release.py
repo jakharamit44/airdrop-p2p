@@ -17,7 +17,7 @@ if not VERSION_FILE.exists():
 VERSION = VERSION_FILE.read_text(encoding="utf-8").strip()
 TAG = f"v{VERSION}"
 OWNER = "jakharamit44"
-REPO = "airdrop-p2p"
+REPO = "glidedrop"
 
 def load_version_changelog(version: str) -> str:
     changelog_path = REPO_ROOT / "CHANGELOG.md"
@@ -40,16 +40,16 @@ def generate_release_body(version: str) -> str:
         except Exception:
             notes = f"Release v{version}"
 
-    body = f"""# AirDrop P2P v{version}
+    body = f"""# GlideDrop v{version}
 
-Pure peer-to-peer AirDrop between macOS and Android devices over BLE and 5 GHz Wi-Fi Direct.
+Pure peer-to-peer file sharing between macOS and Android devices over BLE and 5 GHz Wi-Fi Direct.
 
 {notes}
 
 ### Release Assets
-- `AirDrop-P2P-v{version}.apk`: Universal Android application (Android 12+ / API 31+).
-- `AirDrop-P2P-v{version}.pkg`: macOS Native Installer package (installs directly to /Applications and auto-unquarantines; eliminates Gatekeeper "damaged" alert).
-- `AirDrop-P2P-v{version}.dmg`: macOS drag-and-drop application with built-in Gatekeeper launcher.
+- `GlideDrop-v{version}.apk`: Universal Android application (Android 12+ / API 31+).
+- `GlideDrop-v{version}.pkg`: macOS Native Installer package (installs directly to /Applications and auto-unquarantines; eliminates Gatekeeper "damaged" alert).
+- `GlideDrop-v{version}.dmg`: macOS drag-and-drop application with built-in Gatekeeper launcher.
 - `SHA256SUMS.txt`: Cryptographic checksums.
 """
     return body
@@ -74,7 +74,7 @@ if not token:
 headers = {
     "Authorization": f"token {token}",
     "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "AirDrop-Release-Script",
+    "User-Agent": "GlideDrop-Release-Script",
 }
 
 # 2. Check if release already exists or create new release
@@ -92,7 +92,7 @@ try:
         print(f"[+] Found existing release {TAG} (ID: {release_id}): {html_url}")
         # Update release body with authentic CHANGELOG.md notes
         patch_payload = json.dumps({
-            "name": f"AirDrop P2P v{VERSION}",
+            "name": f"GlideDrop v{VERSION}",
             "body": release_notes,
         }).encode("utf-8")
         patch_req = urllib.request.Request(
@@ -112,7 +112,7 @@ except urllib.error.HTTPError as e:
         create_payload = json.dumps({
             "tag_name": TAG,
             "target_commitish": "main",
-            "name": f"AirDrop P2P v{VERSION}",
+            "name": f"GlideDrop v{VERSION}",
             "body": release_notes,
             "draft": False,
             "prerelease": False
@@ -142,9 +142,9 @@ with urllib.request.urlopen(list_assets_req) as resp:
 
 # 4. Upload assets
 assets_to_upload = [
-    (RELEASE_DIR / f"AirDrop-P2P-v{VERSION}.apk", "application/vnd.android.package-archive"),
-    (RELEASE_DIR / f"AirDrop-P2P-v{VERSION}.dmg", "application/x-apple-diskimage"),
-    (RELEASE_DIR / f"AirDrop-P2P-v{VERSION}.pkg", "application/octet-stream"),
+    (RELEASE_DIR / f"GlideDrop-v{VERSION}.apk", "application/vnd.android.package-archive"),
+    (RELEASE_DIR / f"GlideDrop-v{VERSION}.dmg", "application/x-apple-diskimage"),
+    (RELEASE_DIR / f"GlideDrop-v{VERSION}.pkg", "application/octet-stream"),
     (RELEASE_DIR / "SHA256SUMS.txt", "text/plain"),
 ]
 

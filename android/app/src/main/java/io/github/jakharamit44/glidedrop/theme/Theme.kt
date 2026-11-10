@@ -1,4 +1,4 @@
-package com.airdrop.p2p.theme
+package io.github.jakharamit44.glidedrop.theme
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
@@ -32,7 +32,7 @@ private val LightColorScheme = lightColorScheme(
 )
 
 @Composable
-fun AirDropTheme(
+fun GlideDropTheme(
     darkTheme: Boolean = false,
     content: @Composable () -> Unit
 ) {
