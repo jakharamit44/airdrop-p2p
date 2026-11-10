@@ -2,6 +2,14 @@
 
 All notable changes to AirDrop P2P are documented in this file.
 
+## [v2.4.1] - 2026-11-10
+
+### Fixed
+- **macOS Local Proxy Safety & Cross-Process Locking (`mac-ble-airdrop.swift`)**: Restricted snapshot-free fallback proxy cleanup on `127.0.0.1` strictly to port `1080` so pre-existing local loopback proxies on other ports are never altered on startup, serialized proxy snapshot/restore with an advisory file lock (`proxy_state.lock`) to eliminate UI vs sender teardown races, and increased proxy reachability pre-check timeout to `500 ms`.
+- **Clean Child Process Cancellation (`mac-ble-airdrop.swift`, `mac-airdrop-p2p.sh`)**: Forwarded `SIGINT`/`SIGTERM` from `BleAirDropSender` and `mac-airdrop-p2p.sh` directly to active Python HTTPS transfer subprocesses with immediate `SO_LINGER` TCP RST and exit code `44` so cancelled transfers never orphan subprocesses.
+- **Exact HTTP Proxy Header Limit (`EmbeddedProxyServer.kt`)**: Fixed an off-by-one boundary check so valid HTTP proxy request headers of exact `8,192` bytes are processed rather than rejected with `431`.
+- **Standalone macOS Bundle Metadata (`mac-airdrop-p2p.sh`)**: Synced standalone `ensure_ble_bin` `Info.plist` generation with `VERSION`, `CFBundleVersion`, and `NSLocalNetworkUsageDescription`.
+
 ## [v2.4.0] - 2026-11-10
 
 ### Added

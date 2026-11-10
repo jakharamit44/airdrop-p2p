@@ -44,7 +44,8 @@ ensure_ble_bin() {
     cp -f "$BLE_BIN" "$APP_MACOS/AirDropP2P" 2>/dev/null || true
     cp -f "$SCRIPT_DIR/mac-airdrop-p2p.sh" "$APP_RES/mac-airdrop-p2p.sh" 2>/dev/null || true
     chmod +x "$APP_RES/mac-airdrop-p2p.sh" 2>/dev/null || true
-    cat > "$SCRIPT_DIR/AirDrop P2P.app/Contents/Info.plist" << 'PLIST'
+    APP_VER="$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "2.4.1")"
+    cat > "$SCRIPT_DIR/AirDrop P2P.app/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -62,13 +63,17 @@ ensure_ble_bin() {
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>2.0</string>
+  <string>${APP_VER}</string>
+  <key>CFBundleVersion</key>
+  <string>${APP_VER}</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
   <string>AirDrop P2P uses Bluetooth LE L2CAP to discover and transfer files with Android devices.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>AirDrop P2P requires local network access to discover nearby devices and transfer files over high-speed Wi-Fi Direct and local sockets.</string>
 </dict>
 </plist>
 PLIST
@@ -1383,12 +1388,22 @@ case "$MODE" in
       set -- "$SELECTED"
     fi
     ensure_ble_bin
+    PY_PID=""
+    SIGNAL_CANCELLED=0
+    cleanup_send_py() {
+      SIGNAL_CANCELLED=1
+      if [[ -n "$PY_PID" ]]; then
+        kill -TERM "$PY_PID" 2>/dev/null || true
+      fi
+    }
+    trap cleanup_send_py TERM INT
     rc=0
-    STATE_DIR="$STATE_DIR" python3 - "$@" << 'PYEOF' || rc=$?
-import json, os, plistlib, re, socket, ssl, struct, subprocess, sys, time, zlib
+    STATE_DIR="$STATE_DIR" python3 - "$@" << 'PYEOF' &
+import json, os, plistlib, re, signal, socket, ssl, struct, subprocess, sys, time, zlib
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("AIRDROP_P2P_STATE_DIR") or os.environ.get("STATE_DIR") or (Path.home() / ".airdrop-p2p"))
+_active_raw_sock = [None]
 
 def write_progress(active: bool, direction: str = "", file_name: str = "", done_bytes: int = 0, total_bytes: int = 0, speed_bps: int = 0, eta_sec: int = 0, pct: int = 0, file_count: int = 1, phase: str = "", peer_name: str = "", is_connecting: bool = False):
     pf = STATE_DIR / "transfer_progress.json"
@@ -1453,6 +1468,20 @@ def is_transfer_cancelled() -> bool:
             return False
         except Exception:
             return True
+
+def _on_cancel_signal(_signum, _frame):
+    rs = _active_raw_sock[0]
+    if rs is not None:
+        try:
+            rs.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            rs.close()
+        except Exception:
+            pass
+    write_progress(False)
+    sys.exit(44)
+
+signal.signal(signal.SIGTERM, _on_cancel_signal)
+signal.signal(signal.SIGINT, _on_cancel_signal)
 
 args = sys.argv[1:]
 peer_override = None
@@ -1561,6 +1590,7 @@ try:
         raise last_conn_err or RuntimeError(f"Could not connect to {host}:{port}")
 
     with raw:
+        _active_raw_sock[0] = raw
         raw.settimeout(300.0)
         with ctx.wrap_socket(raw, server_hostname=host) as s:
             s.settimeout(300.0)
@@ -1691,8 +1721,16 @@ try:
                     append_history("URL", u, len(u), "sent", peer_name)
             safe_notify(f"Sent {names} to {peer_name} in {elapsed:.1f}s", "AirDrop Complete")
 finally:
+    _active_raw_sock[0] = None
     write_progress(False)
 PYEOF
+    PY_PID=$!
+    wait "$PY_PID" || rc=$?
+    if [[ "$SIGNAL_CANCELLED" -eq 1 ]]; then
+      wait "$PY_PID" 2>/dev/null || true
+      rc=44
+    fi
+    trap - TERM INT
     if [[ "$rc" -ne 0 ]]; then
       if [[ "$rc" -eq 43 || "$rc" -eq 44 || "${1:-}" == "--peer" ]]; then
         if [[ "${1:-}" != "--peer" ]]; then

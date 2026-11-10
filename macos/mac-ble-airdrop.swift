@@ -754,6 +754,22 @@ func parseBypassDomainsOutput(_ output: String) -> [String] {
 }
 
 private var proxyEnabledInCurrentProcess = false
+private let activeChildTxLock = NSLock()
+private var activeChildTxProcess: Process?
+
+func withProxyStateFileLock<T>(_ body: () -> T) -> T {
+    let lockPath = STATE_DIR.appendingPathComponent("proxy_state.lock").path
+    let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+    if fd >= 0 {
+        flock(fd, LOCK_EX)
+        defer {
+            flock(fd, LOCK_UN)
+            close(fd)
+        }
+        return body()
+    }
+    return body()
+}
 
 func isTcpPortReachable(host: String, port: Int, timeoutMs: Int = 200) -> Bool {
     guard !host.isEmpty, port > 0, port <= 65535 else { return false }
@@ -819,136 +835,140 @@ func enableMacInternetProxy(host: String = "192.168.49.1", port: Int = 1080) {
         return
     }
 
-    guard isTcpPortReachable(host: host, port: port, timeoutMs: 200) else {
+    guard isTcpPortReachable(host: host, port: port, timeoutMs: 500) else {
         print("[BLE-Daemon] Peer proxy \(host):\(port) unreachable or disabled — skipping macOS system proxy")
         fflush(stdout)
         return
     }
 
-    proxyEnabledInCurrentProcess = true
-    let service = getWifiServiceName()
+    withProxyStateFileLock {
+        proxyEnabledInCurrentProcess = true
+        let service = getWifiServiceName()
 
-    // 1. Snapshot previous proxy settings if not already snapshotted
-    if !FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
-        let (_, socksOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsocksfirewallproxy", service])
-        let (_, httpOut) = runProcessCapture("/usr/sbin/networksetup", ["-getwebproxy", service])
-        let (_, httpsOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsecurewebproxy", service])
-        let (_, bypassOut) = runProcessCapture("/usr/sbin/networksetup", ["-getproxybypassdomains", service])
+        // 1. Snapshot previous proxy settings if not already snapshotted
+        if !FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
+            let (_, socksOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsocksfirewallproxy", service])
+            let (_, httpOut) = runProcessCapture("/usr/sbin/networksetup", ["-getwebproxy", service])
+            let (_, httpsOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsecurewebproxy", service])
+            let (_, bypassOut) = runProcessCapture("/usr/sbin/networksetup", ["-getproxybypassdomains", service])
 
-        let saved = SavedProxySettings(
-            service: service,
-            socks: parseProxyOutput(socksOut),
-            http: parseProxyOutput(httpOut),
-            https: parseProxyOutput(httpsOut),
-            bypassDomains: parseBypassDomainsOutput(bypassOut)
-        )
-        if let data = try? JSONEncoder().encode(saved) {
-            try? data.write(to: PREV_PROXY_FILE, options: .atomic)
-            print("[BLE-Daemon] Snapshotted existing proxy settings for \(service) to \(PREV_PROXY_FILE.lastPathComponent)")
-            fflush(stdout)
-        }
-    }
-
-    // 2. Configure proxy bypass domains: preserve user's existing bypass domains alongside P2P / local bypasses
-    var bypassList = ["192.168.49.0/24", "127.0.0.1", "*.local", "169.254/16"]
-    if let savedData = try? Data(contentsOf: PREV_PROXY_FILE),
-       let savedObj = try? JSONDecoder().decode(SavedProxySettings.self, from: savedData) {
-        for d in savedObj.bypassDomains {
-            if !bypassList.contains(d) && !d.isEmpty {
-                bypassList.append(d)
+            let saved = SavedProxySettings(
+                service: service,
+                socks: parseProxyOutput(socksOut),
+                http: parseProxyOutput(httpOut),
+                https: parseProxyOutput(httpsOut),
+                bypassDomains: parseBypassDomainsOutput(bypassOut)
+            )
+            if let data = try? JSONEncoder().encode(saved) {
+                try? data.write(to: PREV_PROXY_FILE, options: .atomic)
+                print("[BLE-Daemon] Snapshotted existing proxy settings for \(service) to \(PREV_PROXY_FILE.lastPathComponent)")
+                fflush(stdout)
             }
         }
+
+        // 2. Configure proxy bypass domains: preserve user's existing bypass domains alongside P2P / local bypasses
+        var bypassList = ["192.168.49.0/24", "127.0.0.1", "*.local", "169.254/16"]
+        if let savedData = try? Data(contentsOf: PREV_PROXY_FILE),
+           let savedObj = try? JSONDecoder().decode(SavedProxySettings.self, from: savedData) {
+            for d in savedObj.bypassDomains {
+                if !bypassList.contains(d) && !d.isEmpty {
+                    bypassList.append(d)
+                }
+            }
+        }
+        var bypassArgs = ["-setproxybypassdomains", service]
+        bypassArgs.append(contentsOf: bypassList)
+        _ = runProcessCapture("/usr/sbin/networksetup", bypassArgs)
+
+        // 3. Configure SOCKS5 proxy
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", service, host, String(port)])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", service, "on"])
+
+        // 4. Configure Web (HTTP) proxy
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", service, host, String(port)])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", service, "on"])
+
+        // 5. Configure Secure Web (HTTPS) proxy
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", service, host, String(port)])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", service, "on"])
+
+        print("[BLE-Daemon] Dual-Protocol embedded proxy active for \(service) -> \(host):\(port) (SOCKS5 + HTTP CONNECT/Forward)")
+        fflush(stdout)
     }
-    var bypassArgs = ["-setproxybypassdomains", service]
-    bypassArgs.append(contentsOf: bypassList)
-    _ = runProcessCapture("/usr/sbin/networksetup", bypassArgs)
-
-    // 3. Configure SOCKS5 proxy
-    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", service, host, String(port)])
-    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", service, "on"])
-
-    // 4. Configure Web (HTTP) proxy
-    _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", service, host, String(port)])
-    _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", service, "on"])
-
-    // 5. Configure Secure Web (HTTPS) proxy
-    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", service, host, String(port)])
-    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", service, "on"])
-
-    print("[BLE-Daemon] Dual-Protocol embedded proxy active for \(service) -> \(host):\(port) (SOCKS5 + HTTP CONNECT/Forward)")
-    fflush(stdout)
 }
 
 func disableMacInternetProxy() {
-    defer { proxyEnabledInCurrentProcess = false }
-    let defaultService = getWifiServiceName()
-    var targetService = defaultService
+    withProxyStateFileLock {
+        defer { proxyEnabledInCurrentProcess = false }
+        let defaultService = getWifiServiceName()
+        var targetService = defaultService
 
-    if FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
-        if let data = try? Data(contentsOf: PREV_PROXY_FILE),
-           let saved = try? JSONDecoder().decode(SavedProxySettings.self, from: data) {
-            targetService = saved.service.isEmpty ? defaultService : saved.service
+        if FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
+            if let data = try? Data(contentsOf: PREV_PROXY_FILE),
+               let saved = try? JSONDecoder().decode(SavedProxySettings.self, from: data) {
+                targetService = saved.service.isEmpty ? defaultService : saved.service
 
-            // Restore SOCKS5
-            if saved.socks.enabled && !saved.socks.server.isEmpty && saved.socks.port > 0 {
-                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", targetService, saved.socks.server, String(saved.socks.port)])
-                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", targetService, "on"])
-            } else {
+                // Restore SOCKS5
+                if saved.socks.enabled && !saved.socks.server.isEmpty && saved.socks.port > 0 {
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", targetService, saved.socks.server, String(saved.socks.port)])
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", targetService, "on"])
+                } else {
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", targetService, "", "0"])
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", targetService, "off"])
+                }
+
+                // Restore Web Proxy
+                if saved.http.enabled && !saved.http.server.isEmpty && saved.http.port > 0 {
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", targetService, saved.http.server, String(saved.http.port)])
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", targetService, "on"])
+                } else {
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", targetService, "", "0"])
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", targetService, "off"])
+                }
+
+                // Restore Secure Web Proxy
+                if saved.https.enabled && !saved.https.server.isEmpty && saved.https.port > 0 {
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", targetService, saved.https.server, String(saved.https.port)])
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", targetService, "on"])
+                } else {
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", targetService, "", "0"])
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", targetService, "off"])
+                }
+
+                // Restore bypass domains
+                if !saved.bypassDomains.isEmpty {
+                    var args = ["-setproxybypassdomains", targetService]
+                    args.append(contentsOf: saved.bypassDomains)
+                    _ = runProcessCapture("/usr/sbin/networksetup", args)
+                } else {
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setproxybypassdomains", targetService, "Empty"])
+                }
+                print("[BLE-Daemon] Restored original proxy settings on \(targetService)")
+                fflush(stdout)
+            }
+            try? FileManager.default.removeItem(at: PREV_PROXY_FILE)
+        } else {
+            // Fallback: If no snapshot file exists, only clear stale P2P / AirDrop proxy state (never unrelated local proxies)
+            let (_, socksOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsocksfirewallproxy", targetService])
+            let socksCfg = parseProxyOutput(socksOut)
+            if socksCfg.server.starts(with: "192.168.49.") || (socksCfg.enabled && socksCfg.server == "127.0.0.1" && socksCfg.port == 1080) {
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", targetService, "", "0"])
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", targetService, "off"])
             }
 
-            // Restore Web Proxy
-            if saved.http.enabled && !saved.http.server.isEmpty && saved.http.port > 0 {
-                _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", targetService, saved.http.server, String(saved.http.port)])
-                _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", targetService, "on"])
-            } else {
+            let (_, httpOut) = runProcessCapture("/usr/sbin/networksetup", ["-getwebproxy", targetService])
+            let httpCfg = parseProxyOutput(httpOut)
+            if httpCfg.server.starts(with: "192.168.49.") || (httpCfg.enabled && httpCfg.server == "127.0.0.1" && httpCfg.port == 1080) {
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", targetService, "", "0"])
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", targetService, "off"])
             }
 
-            // Restore Secure Web Proxy
-            if saved.https.enabled && !saved.https.server.isEmpty && saved.https.port > 0 {
-                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", targetService, saved.https.server, String(saved.https.port)])
-                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", targetService, "on"])
-            } else {
+            let (_, httpsOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsecurewebproxy", targetService])
+            let httpsCfg = parseProxyOutput(httpsOut)
+            if httpsCfg.server.starts(with: "192.168.49.") || (httpsCfg.enabled && httpsCfg.server == "127.0.0.1" && httpsCfg.port == 1080) {
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", targetService, "", "0"])
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", targetService, "off"])
             }
-
-            // Restore bypass domains
-            if !saved.bypassDomains.isEmpty {
-                var args = ["-setproxybypassdomains", targetService]
-                args.append(contentsOf: saved.bypassDomains)
-                _ = runProcessCapture("/usr/sbin/networksetup", args)
-            } else {
-                _ = runProcessCapture("/usr/sbin/networksetup", ["-setproxybypassdomains", targetService, "Empty"])
-            }
-            print("[BLE-Daemon] Restored original proxy settings on \(targetService)")
-            fflush(stdout)
-        }
-        try? FileManager.default.removeItem(at: PREV_PROXY_FILE)
-    } else {
-        // Fallback: If no snapshot file exists, make sure any 192.168.49.x proxy state is turned off and cleared
-        let (_, socksOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsocksfirewallproxy", targetService])
-        let socksCfg = parseProxyOutput(socksOut)
-        if socksCfg.server.starts(with: "192.168.49.") || (socksCfg.enabled && socksCfg.server == "127.0.0.1") {
-            _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", targetService, "", "0"])
-            _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", targetService, "off"])
-        }
-
-        let (_, httpOut) = runProcessCapture("/usr/sbin/networksetup", ["-getwebproxy", targetService])
-        let httpCfg = parseProxyOutput(httpOut)
-        if httpCfg.server.starts(with: "192.168.49.") || (httpCfg.enabled && httpCfg.server == "127.0.0.1") {
-            _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", targetService, "", "0"])
-            _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", targetService, "off"])
-        }
-
-        let (_, httpsOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsecurewebproxy", targetService])
-        let httpsCfg = parseProxyOutput(httpsOut)
-        if httpsCfg.server.starts(with: "192.168.49.") || (httpsCfg.enabled && httpsCfg.server == "127.0.0.1") {
-            _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", targetService, "", "0"])
-            _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", targetService, "off"])
         }
     }
 }
@@ -2675,8 +2695,14 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                             sendArgs += ["--pin", peerPin]
                         }
                         txProc.arguments = sendArgs + self.files.map { $0.path } + self.urls
+                        activeChildTxLock.lock()
+                        activeChildTxProcess = txProc
+                        activeChildTxLock.unlock()
                         try? txProc.run()
                         txProc.waitUntilExit()
+                        activeChildTxLock.lock()
+                        activeChildTxProcess = nil
+                        activeChildTxLock.unlock()
                         restoreMacInternetWifi(ssid: ssid)
 
                         if isTransferCancelled() || txProc.terminationStatus == 44 {
@@ -5647,7 +5673,8 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
             "cancel_transfer.flag",
             "lan_fallback_active.flag",
             "pending_ask.json",
-            "prev_proxy_settings.json"
+            "prev_proxy_settings.json",
+            "proxy_state.lock"
         ] {
             try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent(cleanupFile))
         }
@@ -5784,12 +5811,22 @@ signal(SIGPIPE, SIG_IGN)
 private var sigIntSource: DispatchSourceSignal?
 private var sigTermSource: DispatchSourceSignal?
 
+func terminateActiveChildTxProcess() {
+    activeChildTxLock.lock()
+    let child = activeChildTxProcess
+    activeChildTxLock.unlock()
+    if let p = child, p.isRunning {
+        p.terminate()
+    }
+}
+
 func installSafeSignalHandlers() {
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
     let q = DispatchQueue.global(qos: .userInitiated)
     let sInt = DispatchSource.makeSignalSource(signal: SIGINT, queue: q)
     sInt.setEventHandler {
+        terminateActiveChildTxProcess()
         restoreMacInternetWifi()
         exit(130)
     }
@@ -5798,6 +5835,7 @@ func installSafeSignalHandlers() {
 
     let sTerm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: q)
     sTerm.setEventHandler {
+        terminateActiveChildTxProcess()
         restoreMacInternetWifi()
         exit(143)
     }
@@ -5861,10 +5899,8 @@ if args.count >= 2 && args[1] == "restore-wifi" {
     if FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
         print("[BLE-Daemon] Lingering prev_proxy_settings.json detected on startup. Performing proxy crash recovery...")
         fflush(stdout)
-        disableMacInternetProxy()
-    } else {
-        disableMacInternetProxy()
     }
+    disableMacInternetProxy()
 
     if !isBackgroundDaemon {
         let daemonPidFile = STATE_DIR.appendingPathComponent("daemon.pid")

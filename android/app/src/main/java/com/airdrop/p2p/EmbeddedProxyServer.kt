@@ -453,17 +453,19 @@ class EmbeddedProxyServer(
         // 1. Read request headers with length bound and O(1) delimiter check
         val headerBytes = ByteArrayOutputStream()
         var window = 0
+        var headerComplete = false
         while (headerBytes.size() < MAX_HTTP_HEADER_BYTES) {
             val b = input.read()
             if (b == -1) return
             headerBytes.write(b)
             window = (window shl 8) or (b and 0xFF)
             if ((window and 0x0000FFFF) == 0x0A0A || window == 0x0D0A0D0A) {
+                headerComplete = true
                 break
             }
         }
 
-        if (headerBytes.size() >= MAX_HTTP_HEADER_BYTES) {
+        if (!headerComplete) {
             sendHttpResponse(output, 431, "Request Header Fields Too Large")
             return
         }

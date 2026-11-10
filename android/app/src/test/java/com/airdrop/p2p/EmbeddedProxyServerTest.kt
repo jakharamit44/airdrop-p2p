@@ -568,6 +568,126 @@ class EmbeddedProxyServerTest {
         }
     }
 
+    @Test
+    fun testExactMaxHeaderBoundaryAcceptedAndOverflowRejected() {
+        val mockServer = ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"))
+        val mockPort = mockServer.localPort
+
+        val serverThread = Thread {
+            try {
+                mockServer.accept().use { sock ->
+                    val inp = sock.getInputStream()
+                    val out = sock.getOutputStream()
+                    while (true) {
+                        val line = readLine(inp) ?: break
+                        if (line.isEmpty()) break
+                    }
+                    out.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+                }
+            } catch (_: Exception) {
+            }
+        }
+        serverThread.isDaemon = true
+        serverThread.start()
+
+        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        assertTrue(proxy.start())
+
+        try {
+            // Exact 8192-byte HTTP request header must succeed (not spuriously rejected with 431)
+            val prefix = "GET http://127.0.0.1:$mockPort/ HTTP/1.1\r\nHost: 127.0.0.1:$mockPort\r\nX-Pad: "
+            val suffix = "\r\n\r\n"
+            val padLen = 8192 - prefix.length - suffix.length
+            val exactReq = prefix + "A".repeat(padLen) + suffix
+            assertEquals(8192, exactReq.length)
+
+            Socket("127.0.0.1", proxy.actualPort).use { client ->
+                client.getOutputStream().apply {
+                    write(exactReq.toByteArray(StandardCharsets.US_ASCII))
+                    flush()
+                }
+                val status = readLine(client.getInputStream()).orEmpty()
+                assertTrue("Expected 200 OK for exact 8192-byte header, got: $status", status.contains("200 OK"))
+            }
+
+            // 8193-byte header without completing inside 8192 bytes must return 431
+            val overReq = prefix + "A".repeat(padLen + 1) + suffix
+            assertEquals(8193, overReq.length)
+            Socket("127.0.0.1", proxy.actualPort).use { client ->
+                client.getOutputStream().apply {
+                    write(overReq.toByteArray(StandardCharsets.US_ASCII))
+                    flush()
+                }
+                val status = readLine(client.getInputStream()).orEmpty()
+                assertTrue("Expected 431 for 8193-byte header, got: $status", status.contains("431"))
+            }
+        } finally {
+            proxy.stop()
+            mockServer.close()
+        }
+    }
+
+    @Test
+    fun testSocks5DomainAndIpv4SsrfBlocked() {
+        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        assertTrue(proxy.start())
+        val proxyPort = proxy.actualPort
+
+        try {
+            // 1. SOCKS5 IPv4 target 127.0.0.1:8771 must return REP=0x02 (Not Allowed)
+            Socket("127.0.0.1", proxyPort).use { client ->
+                val inp = client.getInputStream()
+                val out = client.getOutputStream()
+                out.write(byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                assertEquals(0x05, inp.read())
+                assertEquals(0x00, inp.read())
+
+                val pHi = (8771 shr 8) and 0xFF
+                val pLo = 8771 and 0xFF
+                out.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, pHi.toByte(), pLo.toByte()))
+                out.flush()
+                val reply = ByteArray(10)
+                readFully(inp, reply)
+                assertEquals(0x05, reply[0].toInt() and 0xFF)
+                assertEquals(0x02, reply[1].toInt() and 0xFF)
+            }
+
+            // 2. SOCKS5 DOMAIN target "localhost" to proxyPort must return REP=0x02 (Not Allowed)
+            Socket("127.0.0.1", proxyPort).use { client ->
+                val inp = client.getInputStream()
+                val out = client.getOutputStream()
+                out.write(byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                assertEquals(0x05, inp.read())
+                assertEquals(0x00, inp.read())
+
+                val hostBytes = "localhost".toByteArray(StandardCharsets.US_ASCII)
+                val pHi = (proxyPort shr 8) and 0xFF
+                val pLo = proxyPort and 0xFF
+                val req = ByteArray(4 + 1 + hostBytes.size + 2)
+                req[0] = 0x05
+                req[1] = 0x01
+                req[2] = 0x00
+                req[3] = 0x03
+                req[4] = hostBytes.size.toByte()
+                System.arraycopy(hostBytes, 0, req, 5, hostBytes.size)
+                req[5 + hostBytes.size] = pHi.toByte()
+                req[6 + hostBytes.size] = pLo.toByte()
+                out.write(req)
+                out.flush()
+
+                val reply = ByteArray(10)
+                readFully(inp, reply)
+                assertEquals(0x05, reply[0].toInt() and 0xFF)
+                assertEquals(0x02, reply[1].toInt() and 0xFF)
+            }
+        } finally {
+            proxy.stop()
+        }
+    }
+
     private fun readFully(inp: InputStream, buf: ByteArray) {
         var offset = 0
         while (offset < buf.size) {

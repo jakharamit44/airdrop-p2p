@@ -2328,7 +2328,7 @@ class AirDropNode(private val context: Context) {
                             }
                         }
                         chunkedOut.close()
-                        writeWatchdogJob?.cancel()
+                        writeWatchdogJob.cancel()
                         val upStatus = readHttpLine(inp).orEmpty()
                         reportProgress(label, 100, total, total, startedAt, fileCount, isSending = true)
                         if (!upStatus.contains("200") || transferCancelled) return false
