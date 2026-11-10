@@ -311,6 +311,25 @@ class AirDropNode(private val context: Context) {
             prefs.edit().putString("theme_mode", normalized).apply()
         }
 
+    private var embeddedProxyServer: EmbeddedProxyServer? = null
+
+    private val _shareCellularInternetFlow = MutableStateFlow(prefs.getBoolean("share_cellular_internet", true))
+    val shareCellularInternetFlow: StateFlow<Boolean> = _shareCellularInternetFlow.asStateFlow()
+
+    var shareCellularInternet: Boolean
+        get() = _shareCellularInternetFlow.value
+        set(value) {
+            _shareCellularInternetFlow.value = value
+            prefs.edit().putBoolean("share_cellular_internet", value).apply()
+            if (value) {
+                if (wifiDirectCreds.isNotEmpty()) {
+                    startEmbeddedProxy()
+                }
+            } else {
+                stopEmbeddedProxy()
+            }
+        }
+
     var onItemReceived: ((ReceivedItem) -> Unit)? = null
     var onTransferProgress: ((String, Int, Long, Long, Long, Boolean, Boolean, String) -> Unit)? = null
 
@@ -700,6 +719,7 @@ class AirDropNode(private val context: Context) {
         bleMacPsm = 0
         stopBleWake()
         stopWifiDirectGroup()
+        stopEmbeddedProxy()
         try {
             serverSocket?.close()
         } catch (_: Throwable) {
@@ -725,6 +745,10 @@ class AirDropNode(private val context: Context) {
                         list.add("${addr.hostAddress}:$AIRDROP_PORT (5GHz Wi-Fi Direct)")
                     }
                 }
+            }
+            if (embeddedProxyServer?.running == true) {
+                val proxyPort = embeddedProxyServer?.actualPort ?: EmbeddedProxyServer.DEFAULT_PROXY_PORT
+                list.add("0.0.0.0:$proxyPort (Dual SOCKS5/HTTP Proxy)")
             }
         } catch (_: Throwable) {
         }
@@ -1048,6 +1072,7 @@ class AirDropNode(private val context: Context) {
                             if (group != null && group.isGroupOwner && !group.networkName.isNullOrEmpty() && !group.passphrase.isNullOrEmpty()) {
                                 val creds = "${group.networkName}\t${group.passphrase}\t192.168.49.1\t$AIRDROP_PORT"
                                 if (wifiDirectCreds != creds) {
+                                    startEmbeddedProxy()
                                     wifiDirectCreds = creds
                                     val psm = localBlePsm
                                     _p2pStatus.value = "5GHz P2P (${group.networkName}) • BLE PSM $psm"
@@ -1064,6 +1089,7 @@ class AirDropNode(private val context: Context) {
             mgr.requestGroupInfo(ch) { existing ->
                 try {
                     if (existing != null && existing.isGroupOwner && !existing.networkName.isNullOrEmpty() && !existing.passphrase.isNullOrEmpty()) {
+                        startEmbeddedProxy()
                         wifiDirectCreds = "${existing.networkName}\t${existing.passphrase}\t192.168.49.1\t$AIRDROP_PORT"
                         val psm = localBlePsm
                         _p2pStatus.value = "5GHz P2P (${existing.networkName}) • BLE PSM $psm"
@@ -1105,6 +1131,7 @@ class AirDropNode(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     private fun stopWifiDirectGroup() {
+        stopEmbeddedProxy()
         try {
             val mgr = wifiP2pManager ?: (context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager)
             val ch = wifiP2pChannel ?: mgr?.initialize(context, Looper.getMainLooper(), null)
@@ -1120,6 +1147,32 @@ class AirDropNode(private val context: Context) {
         if (localBlePsm > 0) {
             _p2pStatus.value = "BLE PSM $localBlePsm • 5GHz On-Demand Ready"
         }
+        refreshLocalAddresses()
+    }
+
+    private fun startEmbeddedProxy() {
+        if (!shareCellularInternet) return
+        if (embeddedProxyServer?.running == true) return
+        try {
+            val proxy = EmbeddedProxyServer(context, EmbeddedProxyServer.DEFAULT_PROXY_PORT) { msg ->
+                log(msg)
+            }
+            if (proxy.start()) {
+                embeddedProxyServer = proxy
+                log("5GHz Wi-Fi Direct Dual-Protocol Proxy active (0.0.0.0:${EmbeddedProxyServer.DEFAULT_PROXY_PORT})")
+                refreshLocalAddresses()
+            }
+        } catch (t: Throwable) {
+            log("EmbeddedProxyServer error: ${t.message}")
+        }
+    }
+
+    private fun stopEmbeddedProxy() {
+        try {
+            embeddedProxyServer?.stop()
+        } catch (_: Throwable) {
+        }
+        embeddedProxyServer = null
         refreshLocalAddresses()
     }
 

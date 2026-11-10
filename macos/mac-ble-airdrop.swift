@@ -670,7 +670,291 @@ func topPreferredWifiNetwork() -> String {
     return ""
 }
 
+private var _cachedWifiServiceName: String?
+
+func getWifiServiceName() -> String {
+    if let cached = _cachedWifiServiceName { return cached }
+    let iface = getWifiInterfaceName()
+    let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-listnetworkserviceorder"])
+    let lines = out.components(separatedBy: "\n")
+    var lastService = ""
+    for line in lines {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let clean = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "* \t"))
+        if clean.hasPrefix("(") && clean.contains(")") {
+            if let closeParen = clean.firstIndex(of: ")") {
+                let name = String(clean[clean.index(after: closeParen)...]).trimmingCharacters(in: .whitespaces)
+                if !name.isEmpty {
+                    lastService = name
+                }
+            }
+        } else if trimmed.contains("Device: \(iface)") {
+            if !lastService.isEmpty {
+                _cachedWifiServiceName = lastService
+                return lastService
+            }
+        }
+    }
+    _cachedWifiServiceName = "Wi-Fi"
+    return "Wi-Fi"
+}
+
+let PREV_PROXY_FILE = STATE_DIR.appendingPathComponent("prev_proxy_settings.json")
+
+struct ProxyEndpointConfig: Codable {
+    let enabled: Bool
+    let server: String
+    let port: Int
+    let authenticated: Bool
+}
+
+struct SavedProxySettings: Codable {
+    let service: String
+    let socks: ProxyEndpointConfig
+    let http: ProxyEndpointConfig
+    let https: ProxyEndpointConfig
+    let bypassDomains: [String]
+}
+
+func parseProxyOutput(_ output: String) -> ProxyEndpointConfig {
+    var enabled = false
+    var server = ""
+    var port = 0
+    var authenticated = false
+    for line in output.components(separatedBy: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("enabled:") {
+            let val = trimmed.components(separatedBy: ":").last?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+            enabled = (val == "yes")
+        } else if lower.hasPrefix("server:") {
+            server = trimmed.components(separatedBy: ":").dropFirst().joined(separator: ":").trimmingCharacters(in: .whitespaces)
+        } else if lower.hasPrefix("port:") {
+            if let p = Int(trimmed.components(separatedBy: ":").last?.trimmingCharacters(in: .whitespaces) ?? "") {
+                port = p
+            }
+        } else if lower.hasPrefix("authenticated proxy enabled:") {
+            let val = trimmed.components(separatedBy: ":").last?.trimmingCharacters(in: .whitespaces) ?? ""
+            authenticated = (val == "1" || val.lowercased() == "yes")
+        }
+    }
+    return ProxyEndpointConfig(enabled: enabled, server: server, port: port, authenticated: authenticated)
+}
+
+func parseBypassDomainsOutput(_ output: String) -> [String] {
+    var domains: [String] = []
+    for line in output.components(separatedBy: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.contains("aren't any bypass domains") {
+            continue
+        }
+        domains.append(trimmed)
+    }
+    return domains
+}
+
+private var proxyEnabledInCurrentProcess = false
+
+func isTcpPortReachable(host: String, port: Int, timeoutMs: Int = 200) -> Bool {
+    guard !host.isEmpty, port > 0, port <= 65535 else { return false }
+    var hints = addrinfo()
+    hints.ai_family = AF_UNSPEC
+    hints.ai_socktype = SOCK_STREAM
+    hints.ai_flags = AI_NUMERICHOST
+    var res: UnsafeMutablePointer<addrinfo>?
+    let portStr = String(port)
+    if getaddrinfo(host, portStr, &hints, &res) != 0 {
+        hints.ai_flags = 0
+        guard getaddrinfo(host, portStr, &hints, &res) == 0 else {
+            return false
+        }
+    }
+    guard let firstInfo = res else { return false }
+    defer { freeaddrinfo(firstInfo) }
+
+    var ptr: UnsafeMutablePointer<addrinfo>? = firstInfo
+    while let info = ptr {
+        let sock = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
+        if sock >= 0 {
+            let flags = fcntl(sock, F_GETFL, 0)
+            if flags >= 0 && fcntl(sock, F_SETFL, flags | O_NONBLOCK) >= 0 {
+                let connRes = connect(sock, info.pointee.ai_addr, info.pointee.ai_addrlen)
+                if connRes == 0 {
+                    close(sock)
+                    return true
+                }
+                if errno == EINPROGRESS {
+                    var pollFd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
+                    var pollRes: Int32 = -1
+                    repeat {
+                        pollRes = poll(&pollFd, 1, Int32(timeoutMs))
+                    } while pollRes < 0 && errno == EINTR
+                    if pollRes > 0 && (pollFd.revents & Int16(POLLOUT)) != 0 && (pollFd.revents & Int16(POLLERR | POLLNVAL)) == 0 {
+                        var err: Int32 = 0
+                        var errLen = socklen_t(MemoryLayout<Int32>.size)
+                        if getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0 && err == 0 {
+                            close(sock)
+                            return true
+                        }
+                    }
+                }
+            }
+            close(sock)
+        }
+        ptr = info.pointee.ai_next
+    }
+    return false
+}
+
+func enableMacInternetProxy(host: String = "192.168.49.1", port: Int = 1080) {
+    if host.starts(with: "192.168.49.") {
+        if currentWifiP2pIp().isEmpty {
+            print("[BLE-Daemon] No active 192.168.49.x Wi-Fi Direct IP — skipping proxy setup for \(host):\(port)")
+            fflush(stdout)
+            return
+        }
+    } else if host != "127.0.0.1" && host != "::1" {
+        print("[BLE-Daemon] Non-P2P host \(host) — skipping macOS system proxy")
+        fflush(stdout)
+        return
+    }
+
+    guard isTcpPortReachable(host: host, port: port, timeoutMs: 200) else {
+        print("[BLE-Daemon] Peer proxy \(host):\(port) unreachable or disabled — skipping macOS system proxy")
+        fflush(stdout)
+        return
+    }
+
+    proxyEnabledInCurrentProcess = true
+    let service = getWifiServiceName()
+
+    // 1. Snapshot previous proxy settings if not already snapshotted
+    if !FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
+        let (_, socksOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsocksfirewallproxy", service])
+        let (_, httpOut) = runProcessCapture("/usr/sbin/networksetup", ["-getwebproxy", service])
+        let (_, httpsOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsecurewebproxy", service])
+        let (_, bypassOut) = runProcessCapture("/usr/sbin/networksetup", ["-getproxybypassdomains", service])
+
+        let saved = SavedProxySettings(
+            service: service,
+            socks: parseProxyOutput(socksOut),
+            http: parseProxyOutput(httpOut),
+            https: parseProxyOutput(httpsOut),
+            bypassDomains: parseBypassDomainsOutput(bypassOut)
+        )
+        if let data = try? JSONEncoder().encode(saved) {
+            try? data.write(to: PREV_PROXY_FILE, options: .atomic)
+            print("[BLE-Daemon] Snapshotted existing proxy settings for \(service) to \(PREV_PROXY_FILE.lastPathComponent)")
+            fflush(stdout)
+        }
+    }
+
+    // 2. Configure proxy bypass domains: preserve user's existing bypass domains alongside P2P / local bypasses
+    var bypassList = ["192.168.49.0/24", "127.0.0.1", "*.local", "169.254/16"]
+    if let savedData = try? Data(contentsOf: PREV_PROXY_FILE),
+       let savedObj = try? JSONDecoder().decode(SavedProxySettings.self, from: savedData) {
+        for d in savedObj.bypassDomains {
+            if !bypassList.contains(d) && !d.isEmpty {
+                bypassList.append(d)
+            }
+        }
+    }
+    var bypassArgs = ["-setproxybypassdomains", service]
+    bypassArgs.append(contentsOf: bypassList)
+    _ = runProcessCapture("/usr/sbin/networksetup", bypassArgs)
+
+    // 3. Configure SOCKS5 proxy
+    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", service, host, String(port)])
+    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", service, "on"])
+
+    // 4. Configure Web (HTTP) proxy
+    _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", service, host, String(port)])
+    _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", service, "on"])
+
+    // 5. Configure Secure Web (HTTPS) proxy
+    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", service, host, String(port)])
+    _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", service, "on"])
+
+    print("[BLE-Daemon] Dual-Protocol embedded proxy active for \(service) -> \(host):\(port) (SOCKS5 + HTTP CONNECT/Forward)")
+    fflush(stdout)
+}
+
+func disableMacInternetProxy() {
+    defer { proxyEnabledInCurrentProcess = false }
+    let defaultService = getWifiServiceName()
+    var targetService = defaultService
+
+    if FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
+        if let data = try? Data(contentsOf: PREV_PROXY_FILE),
+           let saved = try? JSONDecoder().decode(SavedProxySettings.self, from: data) {
+            targetService = saved.service.isEmpty ? defaultService : saved.service
+
+            // Restore SOCKS5
+            if saved.socks.enabled && !saved.socks.server.isEmpty && saved.socks.port > 0 {
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", targetService, saved.socks.server, String(saved.socks.port)])
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", targetService, "on"])
+            } else {
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", targetService, "", "0"])
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", targetService, "off"])
+            }
+
+            // Restore Web Proxy
+            if saved.http.enabled && !saved.http.server.isEmpty && saved.http.port > 0 {
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", targetService, saved.http.server, String(saved.http.port)])
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", targetService, "on"])
+            } else {
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", targetService, "", "0"])
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", targetService, "off"])
+            }
+
+            // Restore Secure Web Proxy
+            if saved.https.enabled && !saved.https.server.isEmpty && saved.https.port > 0 {
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", targetService, saved.https.server, String(saved.https.port)])
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", targetService, "on"])
+            } else {
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", targetService, "", "0"])
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", targetService, "off"])
+            }
+
+            // Restore bypass domains
+            if !saved.bypassDomains.isEmpty {
+                var args = ["-setproxybypassdomains", targetService]
+                args.append(contentsOf: saved.bypassDomains)
+                _ = runProcessCapture("/usr/sbin/networksetup", args)
+            } else {
+                _ = runProcessCapture("/usr/sbin/networksetup", ["-setproxybypassdomains", targetService, "Empty"])
+            }
+            print("[BLE-Daemon] Restored original proxy settings on \(targetService)")
+            fflush(stdout)
+        }
+        try? FileManager.default.removeItem(at: PREV_PROXY_FILE)
+    } else {
+        // Fallback: If no snapshot file exists, make sure any 192.168.49.x proxy state is turned off and cleared
+        let (_, socksOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsocksfirewallproxy", targetService])
+        let socksCfg = parseProxyOutput(socksOut)
+        if socksCfg.server.starts(with: "192.168.49.") || (socksCfg.enabled && socksCfg.server == "127.0.0.1") {
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", targetService, "", "0"])
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", targetService, "off"])
+        }
+
+        let (_, httpOut) = runProcessCapture("/usr/sbin/networksetup", ["-getwebproxy", targetService])
+        let httpCfg = parseProxyOutput(httpOut)
+        if httpCfg.server.starts(with: "192.168.49.") || (httpCfg.enabled && httpCfg.server == "127.0.0.1") {
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", targetService, "", "0"])
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", targetService, "off"])
+        }
+
+        let (_, httpsOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsecurewebproxy", targetService])
+        let httpsCfg = parseProxyOutput(httpsOut)
+        if httpsCfg.server.starts(with: "192.168.49.") || (httpsCfg.enabled && httpsCfg.server == "127.0.0.1") {
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", targetService, "", "0"])
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", targetService, "off"])
+        }
+    }
+}
+
 func restoreMacInternetWifi(ssid: String = "DIRECT-") {
+    disableMacInternetProxy()
     try? FileManager.default.removeItem(at: LAN_FALLBACK_FILE)
     try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
 
@@ -712,8 +996,9 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
 
     // 2. Check if iface is already back on normal Wi-Fi or was never on P2P
     let curSsid = currentWifiSsid()
+    let onP2p = curSsid.hasPrefix("DIRECT-") || !currentWifiP2pIp().isEmpty
     let savedSsid = (try? String(contentsOf: PREV_WIFI_FILE, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    if !curSsid.hasPrefix("DIRECT-") && (wifiHasNormalIpv4() || savedSsid.isEmpty) {
+    if !onP2p && (wifiHasNormalIpv4() || savedSsid.isEmpty) {
         print("[BLE-Daemon] \(iface) already on normal Wi-Fi ('\(curSsid)'). P2P cleanup completed.")
         fflush(stdout)
         try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
@@ -721,7 +1006,7 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
         return
     }
 
-    if wifiHasNormalIpv4() && !curSsid.hasPrefix("DIRECT-") {
+    if wifiHasNormalIpv4() && !onP2p {
         print("[BLE-Daemon] \(iface) connected to normal Wi-Fi. P2P removed from preferred list.")
         fflush(stdout)
         try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
@@ -735,8 +1020,8 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     // 3. Resolve target home network to restore
     let targetSsid = (!savedSsid.isEmpty && !savedSsid.hasPrefix("DIRECT-")) ? savedSsid : topPreferredWifiNetwork()
 
-    // 4. Disassociate iface using CoreWLAN to cleanly detach from P2P only if currently associated to P2P
-    if curSsid.hasPrefix("DIRECT-") {
+    // 4. Disassociate iface using CoreWLAN to cleanly detach from P2P when still on P2P
+    if onP2p {
         if let cwIface = CWWiFiClient.shared().interface(withName: iface) ?? CWWiFiClient.shared().interface() {
             cwIface.disassociate()
         }
@@ -1058,6 +1343,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     )
     print("[BLE-Daemon] Joined \(ssid) at \(macP2pIp), signaling peer...")
     fflush(stdout)
+    enableMacInternetProxy(host: "192.168.49.1", port: 1080)
     if !writeAll(out, data: Data("OK \(macP2pIp)\n".utf8)) {
         print("[BLE-Daemon] Warning: BLE L2CAP reply stream closed while sending OK \(macP2pIp); waiting briefly for TCP fallback")
         fflush(stdout)
@@ -2377,48 +2663,55 @@ final class BleAirDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                         }
                     }
 
-                    self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
-                    let txProc = Process()
-                    txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
-                    txProc.environment = ProcessInfo.processInfo.environment
-                    txProc.environment?["SKIP_BLE_RESTART"] = "1"
-                    var sendArgs = ["send", "--peer", "\(host):\(port)"]
-                    if !peerPin.isEmpty {
-                        sendArgs += ["--pin", peerPin]
-                    }
-                    txProc.arguments = sendArgs + self.files.map { $0.path } + self.urls
-                            try? txProc.run()
-                            txProc.waitUntilExit()
-                            restoreMacInternetWifi(ssid: ssid)
-
-                            if isTransferCancelled() {
-                                clearCancelFlag()
-                                writeProgressJson(active: false)
-                                inp.close()
-                                out.close()
-                                try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-                                print("[BLE-Send] Transfer cancelled by user")
-                                exit(1)
-                            }
-
-                            if txProc.terminationStatus == 0 {
-                                writeProgressJson(active: false)
-                                inp.close()
-                                out.close()
-                                try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-                                print("[BLE-Send] Delivered via 5GHz Wi-Fi Direct P2P!")
-                                exit(0)
-                            }
-                            if txProc.terminationStatus == 43 {
-                                writeProgressJson(active: false)
-                                inp.close()
-                                out.close()
-                                try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-                                print("[BLE-Send] Transfer declined by receiver")
-                                exit(1)
-                            }
+                    if !host.starts(with: "192.168.49.") || hasWifiP2pIp() {
+                        self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
+                        enableMacInternetProxy(host: host, port: 1080)
+                        let txProc = Process()
+                        txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                        txProc.environment = ProcessInfo.processInfo.environment
+                        txProc.environment?["SKIP_BLE_RESTART"] = "1"
+                        var sendArgs = ["send", "--peer", "\(host):\(port)"]
+                        if !peerPin.isEmpty {
+                            sendArgs += ["--pin", peerPin]
                         }
+                        txProc.arguments = sendArgs + self.files.map { $0.path } + self.urls
+                        try? txProc.run()
+                        txProc.waitUntilExit()
+                        restoreMacInternetWifi(ssid: ssid)
+
+                        if isTransferCancelled() || txProc.terminationStatus == 44 {
+                            clearCancelFlag()
+                            writeProgressJson(active: false)
+                            inp.close()
+                            out.close()
+                            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                            print("[BLE-Send] Transfer cancelled by user")
+                            exit(1)
+                        }
+
+                        if txProc.terminationStatus == 0 {
+                            writeProgressJson(active: false)
+                            inp.close()
+                            out.close()
+                            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                            print("[BLE-Send] Delivered via 5GHz Wi-Fi Direct P2P!")
+                            exit(0)
+                        }
+                        if txProc.terminationStatus == 43 {
+                            writeProgressJson(active: false)
+                            inp.close()
+                            out.close()
+                            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                            print("[BLE-Send] Transfer declined by receiver")
+                            exit(1)
+                        }
+                    } else {
+                        print("[BLE-Send] Failed to obtain 5GHz P2P IP on \(wifiIface); falling back to Direct BLE L2CAP")
+                        fflush(stdout)
+                        restoreMacInternetWifi(ssid: ssid)
                     }
+                }
+            }
 
             var payloadFrame = self.frameData
             if payloadFrame.isEmpty && !self.files.isEmpty {
@@ -3257,11 +3550,13 @@ final class MacAirDropViewModel: ObservableObject {
         liveProgress = nil
         transferStatus = "Transfer cancelled"
         DispatchQueue.global(qos: .userInitiated).async {
-            let killProc = Process()
-            killProc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-            killProc.arguments = ["-f", "mac-ble-airdrop send"]
-            try? killProc.run()
-            killProc.waitUntilExit()
+            for pattern in ["AirDropP2P send", "airdrop-p2p-daemon send", "mac-ble-airdrop send", "mac-airdrop-p2p.sh send"] {
+                let killProc = Process()
+                killProc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+                killProc.arguments = ["-f", pattern]
+                try? killProc.run()
+                killProc.waitUntilExit()
+            }
             restoreMacInternetWifi()
         }
     }
@@ -5335,7 +5630,6 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
 
     private func performCleanShutdown() {
         restoreMacInternetWifi()
-        resumeCloudflareWarpIfNeeded()
         BleAirDropDaemon.shared?.stopAdvertisingAndScanning()
         for pf in ["daemon.pid", "mdns.pid", "awdl-mdns.pid"] {
             let f = STATE_DIR.appendingPathComponent(pf)
@@ -5352,7 +5646,8 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
             "rx_in_progress.lock",
             "cancel_transfer.flag",
             "lan_fallback_active.flag",
-            "pending_ask.json"
+            "pending_ask.json",
+            "prev_proxy_settings.json"
         ] {
             try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent(cleanupFile))
         }
@@ -5485,11 +5780,43 @@ final class AwdlLoopbackBridge {
 }
 
 signal(SIGPIPE, SIG_IGN)
+
+private var sigIntSource: DispatchSourceSignal?
+private var sigTermSource: DispatchSourceSignal?
+
+func installSafeSignalHandlers() {
+    signal(SIGINT, SIG_IGN)
+    signal(SIGTERM, SIG_IGN)
+    let q = DispatchQueue.global(qos: .userInitiated)
+    let sInt = DispatchSource.makeSignalSource(signal: SIGINT, queue: q)
+    sInt.setEventHandler {
+        restoreMacInternetWifi()
+        exit(130)
+    }
+    sInt.resume()
+    sigIntSource = sInt
+
+    let sTerm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: q)
+    sTerm.setEventHandler {
+        restoreMacInternetWifi()
+        exit(143)
+    }
+    sTerm.resume()
+    sigTermSource = sTerm
+}
+
+atexit {
+    if proxyEnabledInCurrentProcess {
+        disableMacInternetProxy()
+    }
+}
+
 let args = CommandLine.arguments
 if args.count >= 2 && args[1] == "restore-wifi" {
     restoreMacInternetWifi()
     exit(0)
 } else if args.count >= 2 && args[1] == "send" {
+    installSafeSignalHandlers()
     let rawArgs = Array(args.dropFirst(2))
     let urls = rawArgs.filter { $0.hasPrefix("http://") || $0.hasPrefix("https://") }
     let fileUrls = rawArgs
@@ -5528,6 +5855,16 @@ if args.count >= 2 && args[1] == "restore-wifi" {
     }
 
     try? String(getpid()).write(to: blePidFile, atomically: true, encoding: .utf8)
+    installSafeSignalHandlers()
+
+    // Crash recovery: only in primary daemon after confirming no existing instance is active
+    if FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
+        print("[BLE-Daemon] Lingering prev_proxy_settings.json detected on startup. Performing proxy crash recovery...")
+        fflush(stdout)
+        disableMacInternetProxy()
+    } else {
+        disableMacInternetProxy()
+    }
 
     if !isBackgroundDaemon {
         let daemonPidFile = STATE_DIR.appendingPathComponent("daemon.pid")

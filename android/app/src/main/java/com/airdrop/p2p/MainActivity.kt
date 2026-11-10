@@ -362,6 +362,7 @@ fun AirDropScreen(
     val logs by node.logs.collectAsState()
     val deviceName by node.deviceNameFlow.collectAsState()
     val autoAccept by node.autoAcceptFlow.collectAsState()
+    val shareCellularInternet by node.shareCellularInternetFlow.collectAsState()
     val btEnabled by node.bluetoothEnabled.collectAsState()
     val wifiEnabled by node.wifiEnabled.collectAsState()
     val permsGranted by node.permissionsGranted.collectAsState()
@@ -877,6 +878,7 @@ fun AirDropScreen(
                     deviceName = deviceName,
                     themeMode = themeMode,
                     autoAccept = autoAccept,
+                    shareCellularInternet = shareCellularInternet,
                     p2pStatus = p2pStatus,
                     endpoints = endpoints,
                     logs = logs,
@@ -884,6 +886,7 @@ fun AirDropScreen(
                     onSelectThemeMode = { node.themeMode = it },
                     onToggleRunning = { enabled -> if (enabled) node.start() else node.stop() },
                     onSelectAutoAccept = { node.autoAccept = it },
+                    onToggleShareCellularInternet = { node.shareCellularInternet = it },
                     onRenameDevice = {
                         renameText = deviceName
                         showRenameDialog = true
@@ -2644,6 +2647,7 @@ private fun SettingsScreenTab(
     deviceName: String,
     themeMode: String,
     autoAccept: Boolean,
+    shareCellularInternet: Boolean,
     p2pStatus: String,
     endpoints: List<String>,
     logs: List<String>,
@@ -2651,6 +2655,7 @@ private fun SettingsScreenTab(
     onSelectThemeMode: (String) -> Unit,
     onToggleRunning: (Boolean) -> Unit,
     onSelectAutoAccept: (Boolean) -> Unit,
+    onToggleShareCellularInternet: (Boolean) -> Unit,
     onRenameDevice: () -> Unit,
     onOpenDownloads: () -> Unit,
     onRescanP2p: () -> Unit,
@@ -2759,7 +2764,55 @@ private fun SettingsScreenTab(
             }
         }
 
-        // 3. Device Identity & Downloads
+        // 3. Internet Sharing Proxy (Port 1080 SOCKS5 + HTTP CONNECT)
+        item {
+            Surface(
+                color = c.surfaceRaised,
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, c.borderSubtle),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "Mac Internet Sharing Proxy",
+                        color = c.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        FilterChipPill(
+                            label = "Share Internet",
+                            selected = shareCellularInternet,
+                            onClick = { onToggleShareCellularInternet(true) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        FilterChipPill(
+                            label = "Disabled",
+                            selected = !shareCellularInternet,
+                            onClick = { onToggleShareCellularInternet(false) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Text(
+                        text = if (shareCellularInternet) {
+                            "Runs an embedded Dual-Protocol Proxy (SOCKS5 + HTTP CONNECT on port 1080). When Mac connects to 5GHz Wi-Fi Direct, it can route internet traffic through your phone's cellular connection."
+                        } else {
+                            "Proxy disabled. Mac will not route internet traffic through this phone during P2P transfers."
+                        },
+                        color = c.textSecondary,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        }
+
+        // 4. Device Identity & Downloads
         item {
             Surface(
                 color = c.surfaceRaised,

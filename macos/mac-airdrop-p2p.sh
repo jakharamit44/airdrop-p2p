@@ -465,9 +465,13 @@ def is_transfer_cancelled() -> bool:
     try:
         ts = float(cf.read_text(encoding="utf-8").strip())
         return (time.time() - ts) < 10.0
+    except FileNotFoundError:
+        return False
     except Exception:
         try:
             return (time.time() - cf.stat().st_mtime) < 10.0
+        except FileNotFoundError:
+            return False
         except Exception:
             return True
 
@@ -554,10 +558,9 @@ def read_body_bytes(f, headers, track_progress: bool = False, file_label: str = 
     return bytes(out)
 
 class ChunkedReader:
-    def __init__(self, f, on_bytes=None, cancel_file=None):
+    def __init__(self, f, on_bytes=None):
         self.f = f
         self.on_bytes = on_bytes
-        self.cancel_file = cancel_file
         self.chunk_rem = 0
         self.eof = False
         self.last_cancel_check = 0.0
@@ -620,11 +623,10 @@ class ChunkedReader:
 
 
 class FixedLengthReader:
-    def __init__(self, f, total, on_bytes=None, cancel_file=None):
+    def __init__(self, f, total, on_bytes=None):
         self.f = f
         self.rem = total
         self.on_bytes = on_bytes
-        self.cancel_file = cancel_file
         self.last_cancel_check = 0.0
 
     def read(self, n):
@@ -914,7 +916,6 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
     last_term_log = [0.0]
     last_touch = [0.0]
     done = [0]
-    cancel_file = STATE_DIR / "cancel_transfer.flag"
     rx_lock = STATE_DIR / "rx_in_progress.lock"
 
     if track_progress:
@@ -958,10 +959,10 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
     try:
         is_chunked = "chunked" in headers.get("transfer-encoding", "").lower()
         if is_chunked:
-            raw_reader = ChunkedReader(f, on_bytes=on_bytes_read, cancel_file=cancel_file)
+            raw_reader = ChunkedReader(f, on_bytes=on_bytes_read)
         else:
             clen = int(headers.get("content-length", "0"))
-            raw_reader = FixedLengthReader(f, clen, on_bytes=on_bytes_read, cancel_file=cancel_file)
+            raw_reader = FixedLengthReader(f, clen, on_bytes=on_bytes_read)
 
         decompressor = StreamDecompressor(raw_reader)
         saved = extract_cpio_stream(decompressor, dest_dir)
@@ -1382,11 +1383,12 @@ case "$MODE" in
       set -- "$SELECTED"
     fi
     ensure_ble_bin
-    if ! STATE_DIR="$STATE_DIR" python3 - "$@" << 'PYEOF'
+    rc=0
+    STATE_DIR="$STATE_DIR" python3 - "$@" << 'PYEOF' || rc=$?
 import json, os, plistlib, re, socket, ssl, struct, subprocess, sys, time, zlib
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("AIRDROP_P2P_STATE_DIR", Path.home() / ".airdrop-p2p"))
+STATE_DIR = Path(os.environ.get("AIRDROP_P2P_STATE_DIR") or os.environ.get("STATE_DIR") or (Path.home() / ".airdrop-p2p"))
 
 def write_progress(active: bool, direction: str = "", file_name: str = "", done_bytes: int = 0, total_bytes: int = 0, speed_bps: int = 0, eta_sec: int = 0, pct: int = 0, file_count: int = 1, phase: str = "", peer_name: str = "", is_connecting: bool = False):
     pf = STATE_DIR / "transfer_progress.json"
@@ -1435,6 +1437,23 @@ def safe_notify(message: str, title: str):
         str(title)[:120],
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+def is_transfer_cancelled() -> bool:
+    cf = STATE_DIR / "cancel_transfer.flag"
+    if not cf.exists():
+        return False
+    try:
+        ts = float(cf.read_text(encoding="utf-8").strip())
+        return (time.time() - ts) < 10.0
+    except FileNotFoundError:
+        return False
+    except Exception:
+        try:
+            return (time.time() - cf.stat().st_mtime) < 10.0
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return True
+
 args = sys.argv[1:]
 peer_override = None
 peer_pin = None
@@ -1467,10 +1486,8 @@ for f in files:
         sys.exit(f"File not found: {f}")
 
 total_bytes = sum(f.stat().st_size for f in files)
-joined_p2p = False
 
 def discover_android():
-    global joined_p2p
     try:
         with socket.create_connection(("192.168.49.1", 8771), timeout=0.25):
             return "192.168.49.1", 8771
@@ -1613,7 +1630,6 @@ try:
                 tx_start = time.time()
                 last_emit = 0.0
                 off = 0
-                cancel_file = STATE_DIR / "cancel_transfer.flag"
                 write_progress(True, "Sending", label, 0, tot, 0, 0, 0, fcount, phase="Sending files", peer_name=peer_name, is_connecting=False)
 
                 def send_dvzip_block(raw_block: bytes):
@@ -1621,7 +1637,12 @@ try:
                         return
                     if is_transfer_cancelled():
                         write_progress(False)
-                        sys.exit("[-] Transfer cancelled by user")
+                        try:
+                            raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                        except Exception:
+                            pass
+                        print("[-] Transfer cancelled by user", file=sys.stderr)
+                        sys.exit(44)
                     hdr4 = struct.pack(">I", 0x80000000 | len(raw_block))
                     pkt_len = 4 + len(raw_block)
                     s.sendall(f"{pkt_len:x}\r\n".encode("ascii") + hdr4 + raw_block + b"\r\n")
@@ -1672,10 +1693,12 @@ try:
 finally:
     write_progress(False)
 PYEOF
-    then
-      if [[ "${1:-}" == "--peer" || -f "$STATE_DIR/cancel_transfer.flag" ]]; then
-        rm -f "$STATE_DIR/cancel_transfer.flag"
-        exit 1
+    if [[ "$rc" -ne 0 ]]; then
+      if [[ "$rc" -eq 43 || "$rc" -eq 44 || "${1:-}" == "--peer" ]]; then
+        if [[ "${1:-}" != "--peer" ]]; then
+          rm -f "$STATE_DIR/cancel_transfer.flag"
+        fi
+        exit "$rc"
       fi
       echo "[*] Wi-Fi unreachable — switching to Direct Bluetooth LE L2CAP..."
       "$BLE_BIN" send "$@"

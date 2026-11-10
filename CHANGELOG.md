@@ -2,6 +2,19 @@
 
 All notable changes to AirDrop P2P are documented in this file.
 
+## [v2.4.0] - 2026-11-10
+
+### Added
+- **Dual-Protocol Embedded Proxy (`EmbeddedProxyServer.kt`)**: Added an embedded SOCKS5 (RFC 1928) and HTTP `CONNECT` / Forward proxy server on port `1080` during Android 5 GHz Wi-Fi Direct sessions, allowing connected macOS peers to maintain internet connectivity via Android's upstream cellular or active validated network (`CHANGE_NETWORK_STATE` + `ConnectivityManager.requestNetwork`).
+- **SSRF & Client Isolation Controls**: Enforced strict client IP allowlisting (`192.168.49.0/24` and loopback), bounded concurrency (128 clients) and header parsing (8 KB), and pre/post-DNS SSRF blocking targeting internal AirDrop (`8771`) and proxy (`1080`) ports.
+- **Android Settings Toggle**: Added a persistent **Mac Internet Sharing Proxy** toggle (`Share Internet` / `Disabled`) in Android Settings with live start/stop lifecycle binding during active Wi-Fi Direct sessions and 13 unit tests in `EmbeddedProxyServerTest.kt`.
+- **macOS Zero-Sudo Proxy Lifecycle & Crash Recovery (`mac-ble-airdrop.swift`)**: Added dynamic Wi-Fi network service discovery (`getWifiServiceName()`), TCP reachability pre-checks (`isTcpPortReachable`), and automatic snapshot/restore (`prev_proxy_settings.json`) for macOS SOCKS/HTTP/HTTPS proxy settings and bypass domains using `networksetup` without sudo, backed by `SIGINT`/`SIGTERM` handlers, `atexit` hooks, and startup crash recovery.
+
+### Fixed
+- **5 GHz Wi-Fi Direct Pre-Flight & BLE Fallback (`mac-ble-airdrop.swift`)**: Verified `192.168.49.x` DHCP lease acquisition (`hasWifiP2pIp()`) prior to launching HTTPS transfers, preventing stalled connection attempts and immediately falling back to Direct BLE L2CAP when Wi-Fi Direct association fails.
+- **Transfer Cancellation & Process Cleanup (`mac-airdrop-p2p.sh`, `mac-ble-airdrop.swift`)**: Fixed `FileNotFoundError` handling in `is_transfer_cancelled()` so missing cancel flags no longer report false cancellations, preserved exit codes (`43` declined, `44` cancelled) for `--peer` transfers, added `SO_LINGER` TCP RST on sender-side cancellation, and expanded `pkill` patterns for UI cancellation.
+- **Complete P2P Wi-Fi Detection (`mac-ble-airdrop.swift`)**: Updated `restoreMacInternetWifi()` to check both `DIRECT-` SSID association and active `192.168.49.x` P2P interface addresses (`onP2p`) before skipping CoreWLAN disassociation.
+
 ## [v2.3.1] - 2026-11-09
 
 ### Fixed
