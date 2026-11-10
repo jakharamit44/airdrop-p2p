@@ -3,10 +3,17 @@
 Unit and Regression Tests for AirDrop P2P AI Processing Subsystem
 """
 
+import hashlib
 import io
 import os
+import plistlib
+import shutil
+import socket
+import ssl
+import subprocess
 import sys
 import json
+import threading
 import time
 import unittest
 import tempfile
@@ -283,6 +290,210 @@ class TestClaudeProcessor(unittest.TestCase):
             self.assertEqual(cm.exception.code, 1)
 
         self.assertIn("No Anthropic API key configured", out_buf.getvalue())
+
+    def test_cli_test_mode_api_error_never_logs_api_key_or_prefix(self):
+        """CLI --test failure path must exit 1 without leaking the configured key or prefix."""
+        env_val = "sk-ant-api03-ErrMockValue9876543210"
+        missing_path = MagicMock(spec=Path)
+        missing_path.exists.return_value = False
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": env_val}, clear=False), \
+             patch.object(claude_processor, "CONFIG_FILE", missing_path), \
+             patch.object(claude_processor, "KEY_FILE", missing_path), \
+             patch.object(sys, "argv", ["claude_processor.py", "--test"]), \
+             patch("claude_processor.call_claude_api", side_effect=RuntimeError("HTTP 503 upstream failure")), \
+             redirect_stdout(out_buf), \
+             redirect_stderr(err_buf):
+            with self.assertRaises(SystemExit) as cm:
+                claude_processor.main()
+            self.assertEqual(cm.exception.code, 1)
+
+        combined_output = out_buf.getvalue() + err_buf.getvalue()
+        self.assertIn("Verification FAILED", combined_output)
+        self.assertNotIn(env_val, combined_output)
+        self.assertNotIn(env_val[:8], combined_output)
+        self.assertNotIn("sk-ant-", combined_output)
+        self.assertNotIn("prefix:", combined_output.lower())
+
+    def test_cli_set_key_saves_without_logging_key(self):
+        """CLI --set-key must not echo the provided key or prefix to stdout/stderr."""
+        entered_val = "sk-ant-api03-SetMockValue5566778899"
+        dir_mock = MagicMock(spec=Path)
+        cfg_mock = MagicMock(spec=Path)
+        cfg_mock.exists.return_value = False
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+
+        with patch.object(claude_processor, "CONFIG_DIR", dir_mock), \
+             patch.object(claude_processor, "CONFIG_FILE", cfg_mock), \
+             patch.object(sys, "argv", ["claude_processor.py", "--set-key", entered_val]), \
+             redirect_stdout(out_buf), \
+             redirect_stderr(err_buf):
+            with self.assertRaises(SystemExit) as cm:
+                claude_processor.main()
+            self.assertEqual(cm.exception.code, 0)
+
+        cfg_mock.write_text.assert_called_once()
+        combined_output = out_buf.getvalue() + err_buf.getvalue()
+        self.assertIn("Saved API key securely", combined_output)
+        self.assertNotIn(entered_val, combined_output)
+        self.assertNotIn(entered_val[:8], combined_output)
+        self.assertNotIn("sk-ant-", combined_output)
+
+    def test_mac_airdrop_send_tls_pinning_enforced(self):
+        """mac-airdrop-p2p.sh send client must enforce SHA-256 pinning and fail closed when unpinned."""
+        openssl_bin = shutil.which("openssl")
+        if not openssl_bin:
+            self.skipTest("openssl binary not available")
+
+        sh_path = Path(__file__).resolve().parent / "mac-airdrop-p2p.sh"
+        sh_text = sh_path.read_text(encoding="utf-8")
+        marker = 'STATE_DIR="$STATE_DIR" python3 - "$@" << \'PYEOF\' &\n'
+        start_idx = sh_text.find(marker)
+        self.assertNotEqual(start_idx, -1, "Could not locate send python block in mac-airdrop-p2p.sh")
+        body_start = start_idx + len(marker)
+        end_idx = sh_text.find("\nPYEOF\n", body_start)
+        self.assertNotEqual(end_idx, -1, "Could not locate end of send python block")
+        send_script = sh_text[body_start:end_idx]
+
+        cert_path = self.dir_path / "srv_cert.pem"
+        key_path = self.dir_path / "srv_key.pem"
+        subprocess.run(
+            [
+                openssl_bin, "req", "-x509", "-newkey", "ec",
+                "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                "-keyout", str(key_path), "-out", str(cert_path),
+                "-days", "7", "-nodes", "-subj", "/CN=airdrop-test"
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Compute DER SHA-256 fingerprint of test server certificate
+        pem_lines = [
+            line.strip() for line in cert_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("-----")
+        ]
+        import base64
+        cert_der = base64.b64decode("".join(pem_lines))
+        actual_fp = hashlib.sha256(cert_der).hexdigest().lower()
+        colon_fp = ":".join(actual_fp[i:i + 2] for i in range(0, 64, 2)).upper()
+        wrong_fp = ("0" if actual_fp[0] != "0" else "1") + actual_fp[1:]
+
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(str(cert_path), str(key_path))
+
+        http_requests = []
+        stop_event = threading.Event()
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(8)
+        srv_sock.settimeout(0.2)
+        port = srv_sock.getsockname()[1]
+
+        def serve_loop():
+            while not stop_event.is_set():
+                try:
+                    raw_conn, _ = srv_sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    with raw_conn:
+                        raw_conn.settimeout(3.0)
+                        with server_ctx.wrap_socket(raw_conn, server_side=True) as tls_conn:
+                            f = tls_conn.makefile("rb")
+                            while True:
+                                req_line = f.readline().decode("iso-8859-1").strip()
+                                if not req_line:
+                                    break
+                                http_requests.append(req_line)
+                                headers = {}
+                                while True:
+                                    hl = f.readline().decode("iso-8859-1").strip()
+                                    if not hl:
+                                        break
+                                    if ":" in hl:
+                                        k, v = hl.split(":", 1)
+                                        headers[k.strip().lower()] = v.strip()
+                                clen = int(headers.get("content-length", "0"))
+                                if clen > 0:
+                                    f.read(clen)
+                                if "/Discover" in req_line:
+                                    body = plistlib.dumps({"ReceiverComputerName": "LoopbackTestPeer"}, fmt=plistlib.FMT_BINARY)
+                                else:
+                                    body = b""
+                                resp = f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+                                tls_conn.sendall(resp)
+                                if "/Ask" in req_line:
+                                    break
+                except Exception:
+                    pass
+
+        srv_thread = threading.Thread(target=serve_loop, daemon=True)
+        srv_thread.start()
+
+        state_dir = self.dir_path / "state"
+        state_dir.mkdir(exist_ok=True)
+        env = {**os.environ, "AIRDROP_P2P_STATE_DIR": str(state_dir)}
+
+        try:
+            # 1. Valid pinned fingerprint (colon-delimited uppercase) must succeed
+            res_ok = subprocess.run(
+                [sys.executable, "-", "--peer", f"127.0.0.1:{port}", "--pin", colon_fp, "https://example.com/ok"],
+                input=send_script,
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=10,
+            )
+            self.assertEqual(res_ok.returncode, 0, f"Expected pinned send to succeed: {res_ok.stderr}")
+            self.assertEqual(len(http_requests), 2)
+
+            # 2. Mismatched pin must abort before sending any HTTP request
+            http_requests.clear()
+            res_bad_pin = subprocess.run(
+                [sys.executable, "-", "--peer", f"127.0.0.1:{port}", "--pin", wrong_fp, "https://example.com/mitm"],
+                input=send_script,
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=10,
+            )
+            self.assertNotEqual(res_bad_pin.returncode, 0)
+            self.assertEqual(http_requests, [], "Mismatched pin must abort before any HTTP request")
+
+            # 3. Malformed pin must fail closed immediately
+            res_malformed = subprocess.run(
+                [sys.executable, "-", "--peer", f"127.0.0.1:{port}", "--pin", "not-a-sha256", "https://example.com/bad"],
+                input=send_script,
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=10,
+            )
+            self.assertNotEqual(res_malformed.returncode, 0)
+            self.assertEqual(http_requests, [])
+
+            # 4. Unpinned self-signed cert must fail closed (no CERT_NONE bypass)
+            res_unpinned = subprocess.run(
+                [sys.executable, "-", "--peer", f"127.0.0.1:{port}", "https://example.com/unpinned"],
+                input=send_script,
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=10,
+            )
+            self.assertNotEqual(res_unpinned.returncode, 0)
+            self.assertEqual(http_requests, [], "Unpinned connection to self-signed cert must fail closed")
+        finally:
+            stop_event.set()
+            srv_sock.close()
+            srv_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

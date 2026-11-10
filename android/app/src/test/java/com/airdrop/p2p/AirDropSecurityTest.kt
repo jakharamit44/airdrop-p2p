@@ -36,6 +36,7 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLHandshakeException
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
+import javax.net.ssl.TrustManagerFactory
 
 class AirDropSecurityTest {
 
@@ -346,6 +347,14 @@ class AirDropSecurityTest {
             // Expected
         }
 
+        // Multi-cert chain where attacker leaf certB is followed by pinned certA must still reject leaf
+        try {
+            tm.checkServerTrusted(arrayOf(certB, certA), "ECDHE_ECDSA")
+            fail("Multi-cert chain with untrusted leaf must throw CertificateException")
+        } catch (_: CertificateException) {
+            // Expected
+        }
+
         // Empty or null chain must throw CertificateException
         try {
             tm.checkServerTrusted(emptyArray<X509Certificate>(), "ECDHE_ECDSA")
@@ -369,7 +378,8 @@ class AirDropSecurityTest {
         }
 
         // Invalid or empty pin strings must fail closed at construction
-        for (badPin in listOf("", "   ", "deadbeef", "zz".repeat(32))) {
+        for (badPin in listOf("", "   ", "deadbeef", "zz".repeat(32), "a".repeat(63), "a".repeat(65))) {
+            assertFalse("Expected isValidSha256Fingerprint to reject '$badPin'", AirDropNode.isValidSha256Fingerprint(badPin))
             try {
                 AirDropNode.PinnedTlsTrustManager(badPin)
                 fail("Invalid fingerprint '$badPin' must be rejected")
@@ -377,6 +387,10 @@ class AirDropSecurityTest {
                 // Expected
             }
         }
+        assertFalse(AirDropNode.isValidSha256Fingerprint(null))
+        assertTrue(AirDropNode.isValidSha256Fingerprint(fpA))
+        assertTrue(AirDropNode.isValidSha256Fingerprint(colonFpA))
+        assertTrue(AirDropNode.isValidSha256Fingerprint("  $dashFpA  "))
     }
 
     @Test
@@ -395,7 +409,7 @@ class AirDropSecurityTest {
         val executor = Executors.newSingleThreadExecutor()
         try {
             val serverFuture = executor.submit {
-                repeat(3) {
+                repeat(4) {
                     try {
                         (srv.accept() as SSLSocket).use { client ->
                             client.soTimeout = 5_000
@@ -409,10 +423,12 @@ class AirDropSecurityTest {
                 }
             }
 
-            // 1. Pinned fingerprint matching server cert A must succeed
+            // 1. Pinned fingerprint matching server cert A must succeed (leaves endpointIdentificationAlgorithm unset for self-signed P2P cert)
             val matchingCtx = AirDropNode.buildPinnedClientSslContext(fpA)
             (matchingCtx.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
                 tls.soTimeout = 5_000
+                AirDropNode.configureClientTlsSocket(tls, isPinned = true)
+                assertNull(tls.sslParameters.endpointIdentificationAlgorithm)
                 tls.startHandshake()
                 val buf = ByteArray(2)
                 assertEquals(2, tls.inputStream.read(buf))
@@ -423,6 +439,7 @@ class AirDropSecurityTest {
             val wrongPinCtx = AirDropNode.buildPinnedClientSslContext(fpB)
             (wrongPinCtx.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
                 tls.soTimeout = 5_000
+                AirDropNode.configureClientTlsSocket(tls, isPinned = true)
                 try {
                     tls.startHandshake()
                     fail("TLS handshake with mismatched pinned fingerprint must fail")
@@ -433,14 +450,33 @@ class AirDropSecurityTest {
                 }
             }
 
-            // 3. Default platform SSLContext without pin must reject untrusted self-signed cert
+            // 3. Default platform SSLContext without pin must configure HTTPS endpoint identification and reject untrusted self-signed cert
             val defaultCtx = AirDropNode.buildDefaultClientSslContext()
             (defaultCtx.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
                 tls.soTimeout = 5_000
+                AirDropNode.configureClientTlsSocket(tls, isPinned = false)
+                assertEquals("HTTPS", tls.sslParameters.endpointIdentificationAlgorithm)
                 try {
                     tls.startHandshake()
                     fail("Default TrustManager must reject untrusted self-signed server certificate")
                 } catch (_: SSLHandshakeException) {
+                    // Expected
+                } catch (_: CertificateException) {
+                    // Expected
+                }
+            }
+
+            // 4. Even if server cert is in trust store, configureClientTlsSocket(isPinned = false) enforces HTTPS hostname/IP verification
+            val tmfA = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply { init(ksA) }
+            val trustedCtxA = SSLContext.getInstance("TLS").apply { init(null, tmfA.trustManagers, null) }
+            (trustedCtxA.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
+                tls.soTimeout = 5_000
+                AirDropNode.configureClientTlsSocket(tls, isPinned = false)
+                assertEquals("HTTPS", tls.sslParameters.endpointIdentificationAlgorithm)
+                try {
+                    tls.startHandshake()
+                    fail("HTTPS endpoint identification must reject CN=airdrop-srv-a for 127.0.0.1")
+                } catch (_: javax.net.ssl.SSLException) {
                     // Expected
                 } catch (_: CertificateException) {
                     // Expected

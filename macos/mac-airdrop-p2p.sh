@@ -322,15 +322,18 @@ def get_active_peers(max_age: float = 10.0) -> list:
         return []
 
 def safe_notify(message: str, title: str):
-    subprocess.Popen([
-        "osascript",
-        "-e", "on run argv",
-        "-e", 'display notification (item 1 of argv) with title (item 2 of argv) sound name "Glass"',
-        "-e", "end run",
-        "--",
-        str(message)[:240],
-        str(title)[:120],
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        subprocess.Popen([
+            "osascript",
+            "-e", "on run argv",
+            "-e", 'display notification (item 1 of argv) with title (item 2 of argv) sound name "Glass"',
+            "-e", "end run",
+            "--",
+            str(message)[:240],
+            str(title)[:120],
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int) -> bool:
     s = load_settings()
@@ -1399,7 +1402,7 @@ case "$MODE" in
     trap cleanup_send_py TERM INT
     rc=0
     STATE_DIR="$STATE_DIR" python3 - "$@" << 'PYEOF' &
-import json, os, plistlib, re, signal, socket, ssl, struct, subprocess, sys, time, zlib
+import hashlib, hmac, json, os, plistlib, re, signal, socket, ssl, struct, subprocess, sys, time, zlib
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("AIRDROP_P2P_STATE_DIR") or os.environ.get("STATE_DIR") or (Path.home() / ".airdrop-p2p"))
@@ -1442,15 +1445,18 @@ def append_history(kind: str, path_or_url: str, size_bytes: int, direction: str,
         pass
 
 def safe_notify(message: str, title: str):
-    subprocess.Popen([
-        "osascript",
-        "-e", "on run argv",
-        "-e", 'display notification (item 1 of argv) with title (item 2 of argv) sound name "Glass"',
-        "-e", "end run",
-        "--",
-        str(message)[:240],
-        str(title)[:120],
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        subprocess.Popen([
+            "osascript",
+            "-e", "on run argv",
+            "-e", 'display notification (item 1 of argv) with title (item 2 of argv) sound name "Glass"',
+            "-e", "end run",
+            "--",
+            str(message)[:240],
+            str(title)[:120],
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 def is_transfer_cancelled() -> bool:
     cf = STATE_DIR / "cancel_transfer.flag"
@@ -1496,16 +1502,25 @@ while args:
     else:
         break
 
-if not peer_pin:
+if peer_pin is None:
     pin_file = STATE_DIR / "pinned_peer_tls_fingerprint.txt"
     if pin_file.exists():
         try:
             mtime = pin_file.stat().st_mtime
             if time.time() - mtime < 60.0:
-                peer_pin = pin_file.read_text(encoding="utf-8").strip()
+                file_pin = pin_file.read_text(encoding="utf-8").strip()
+                if file_pin:
+                    peer_pin = file_pin
             pin_file.unlink(missing_ok=True)
         except Exception:
             pass
+
+expected_fp = None
+if peer_pin is not None:
+    normalized_pin = peer_pin.replace(":", "").replace("-", "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized_pin):
+        raise ssl.SSLError("Invalid SHA-256 peer TLS certificate fingerprint")
+    expected_fp = normalized_pin
 
 urls = [a for a in args if a.startswith("http://") or a.startswith("https://")]
 file_args = [a for a in args if a not in urls]
@@ -1537,8 +1552,10 @@ try:
 
     print(f"[+] Connecting to Android peer over 5GHz Wi-Fi at {host}:{port}...")
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    if expected_fp:
+        # Self-signed P2P certificates are verified immediately post-handshake against the W2P2 SHA-256 pin.
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     try:
         if hasattr(ctx, "set_ciphersuites"):
             ctx.set_ciphersuites("TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
@@ -1594,14 +1611,12 @@ try:
         raw.settimeout(300.0)
         with ctx.wrap_socket(raw, server_hostname=host) as s:
             s.settimeout(300.0)
-            der_cert = s.getpeercert(binary_form=True)
-            if peer_pin:
+            if expected_fp:
+                der_cert = s.getpeercert(binary_form=True)
                 if not der_cert:
                     raise ssl.SSLError("Android peer did not provide a TLS certificate")
-                import hashlib
                 actual_fp = hashlib.sha256(der_cert).hexdigest().lower()
-                expected_fp = peer_pin.replace(":", "").replace("-", "").strip().lower()
-                if actual_fp != expected_fp:
+                if not hmac.compare_digest(actual_fp, expected_fp):
                     print(f"[-] FATAL: Peer TLS certificate fingerprint mismatch! Expected {expected_fp}, got {actual_fp}")
                     raise ssl.SSLError(f"Certificate fingerprint pinning failed! Expected {expected_fp}, got {actual_fp}")
                 print(f"[+] Verified peer TLS certificate fingerprint: {actual_fp}")
