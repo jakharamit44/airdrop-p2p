@@ -1,73 +1,78 @@
-# AirDrop P2P — Architecture & Protocol Specification
+# AirDrop P2P Architecture & Protocol Specification
 
-AirDrop P2P enables high-speed, off-grid file transfers between Android and macOS without requiring an external Wi-Fi router, local area network (LAN), cloud relay, or USB connection.
+AirDrop P2P transfers files, links, and text notes directly between Android (API 31+) and macOS (13+) without a shared Wi-Fi router, local area network (LAN), cloud relay, or USB cable.
 
----
-
-## 1. High-Level Flow
+## 1. Bidirectional Transfer Flow
 
 ```
 [Android Device]                                              [MacBook / macOS]
        |                                                             |
-       |  1. BLE L2CAP Discovery & Pairing                           |
-       |------------------------------------------------------------>|
-       |     • Advertises custom 128-bit BLE service & PSM           |
-       |     • Dynamic device model & PSM handshake                  |
+       |  1. BLE L2CAP Discovery & Ping/Pong                         |
+       |<----------------------------------------------------------->|
+       |     * Advertises custom 128-bit BLE service & L2CAP PSM     |
+       |     * Exchanges localized device name, PSM, and RSSI        |
        |                                                             |
-       |  2. 5GHz Wi-Fi Direct (P2P) Group Negotiation               |
-       |     • Android creates autonomous 5GHz P2P Group             |
-       |     • Signals SSID + Passphrase over BLE L2CAP channel      |
-       |------------------------------------------------------------>|
+       |  2. Ephemeral ECDH P-256 Handshake (W2P2)                   |
+       |<----------------------------------------------------------->|
+       |     * Exchanges secp256r1 DER public keys & SHA-256 TLS     |
+       |       certificate fingerprints                              |
+       |     * Derives AES-256-GCM session key via SHA-256           |
+       |     * Transfers encrypted 5 GHz Wi-Fi Direct SSID + key     |
        |                                                             |
-       |  3. Connection & Dynamic Addressing                         |
-       |     • Mac associates to 5GHz Wi-Fi Direct SSID              |
-       |     • Mac obtains dynamic IP via P2P DHCP (192.168.49.x)    |
-       |     • Sends handshake confirmation: "OK <Mac-P2P-IP>"       |
-       |<------------------------------------------------------------|
+       |  3. Wi-Fi Direct Association & Address Assignment           |
+       |     * Mac prompts user before joining DIRECT-* SSID         |
+       |     * Mac associates via CoreWLAN / networksetup            |
+       |     * Mac receives P2P DHCP IP (192.168.49.x)               |
+       |     * Optional: Mac points SOCKS5/HTTP proxy to :1080       |
        |                                                             |
-       |  4. TLS 1.3 / HTTPS Stream with Bidirectional Keepalive     |
-       |     • POST /Ask (Metadata, file list, sizes)                |
-       |------------------------------------------------------------>|
-       |     • 200 OK (Accepted by user or auto-accept)              |
-       |<------------------------------------------------------------|
-       |     • POST /Upload (Apple DVZip/CPIO chunked stream)        |
-       |============================================================>| (45+ MB/s)
-       |     • Bidirectional ICMP/UDP Heartbeat (every 2.0s)         |
-       |<------------------------------------------------------------>| (Prevents ARP stall)
-       |     • 200 OK (Transfer complete)                            |
-       |<------------------------------------------------------------|
+       |  4. Pinned TLS HTTPS Stream (/Discover, /Ask, /Upload)      |
+       |     * POST /Discover (bplist00 capability negotiation)      |
+       |     * POST /Ask (bplist00 file/URL metadata & approval)     |
+       |     * POST /Upload (DVZip/CPIO chunked archive stream)      |
+       |<===========================================================>| (45+ MB/s)
+       |     * Bidirectional 2.0s UDP keepalive on 192.168.49.x      |
        |                                                             |
-       |  5. Wi-Fi Teardown & Auto-Reconnection                      |
-       |     • Android tears down P2P Group                          |
-       |     • Mac purges P2P SSID from preferred networks           |
-       |     • Mac CoreWLAN disassociates -> airportd rejoins Wi-Fi  |
+       |  5. Clean Teardown & Network Restore                        |
+       |     * Mac restores snapshot proxy settings (no sudo)        |
+       |     * Mac removes DIRECT-* from preferred networks          |
+       |     * CoreWLAN disassociates so airportd rejoins home Wi-Fi |
+       |     * Cloudflare WARP resumes if previously active          |
        |                                                             |
-       |  6. Claude AI Ingestion & Processing                        |
-       |     • Auto-analyzes images/OCR/documents/code via Claude    |
+       |  6. Optional Sidecar Analysis (macOS Receiver)              |
+       |     * Off by default; runs Apple Vision OCR / Ollama /      |
+       |       Anthropic Claude with local Privacy Guard             |
 ```
-
----
 
 ## 2. Core Subsystems
 
-### A. Discovery Layer: Bluetooth Low Energy (BLE L2CAP)
-* **Standard AirDrop Compatibility**: Emulates native Apple AirDrop discovery packets alongside a custom BLE L2CAP direct socket protocol.
-* **Dynamic Device Naming**: Dynamically resolves device hardware (`"${Build.MANUFACTURER} ${Build.MODEL}"` on Android, `Host.current().localizedName` on macOS).
-* **Credit-Based Flow Control**: Direct L2CAP channel established over dynamic PSMs (Protocol/Service Multiplexers), bypassing GATT attribute size constraints.
+### A. Discovery & Fallback Layer (BLE L2CAP)
 
-### B. Transport Layer: 5GHz Wi-Fi Direct (P2P)
-* **Off-Grid Independent Network**: Android acts as the Wi-Fi Direct Group Owner (GO) operating strictly on 5GHz (Band 4 / UNII-3) for minimal interference and maximum throughput.
-* **Apple DVZip / CPIO Streaming**: Files are compressed on-the-fly and streamed directly from file descriptors into an HTTP chunked upload pipe. Mac extracts files sequentially to `~/Downloads` without memory double-buffering.
+* **L2CAP CoC Channels**: Android and macOS open direct Bluetooth Low Energy L2CAP Connection-Oriented Channels (`CBPeripheralManager` / `BluetoothServerSocket.listenUsingL2capChannel`) using dynamically assigned PSMs, avoiding GATT MTU bottlenecks.
+* **Hardware-Agnostic Naming**: Android builds names from `${Build.MANUFACTURER} ${Build.MODEL}` (or user override); macOS uses `Host.current().localizedName` or `scutil --get ComputerName`.
+* **Direct BLE Transfers (`ADRE`)**: Payloads under 64 KiB, URLs, and environments where Wi-Fi Direct association fails fall back to encrypted `ADRE` frames over BLE L2CAP (bounded at 30 MB on Android to avoid JVM out-of-memory failures).
 
-### C. Kernel Resilience: Bidirectional ARP Keepalive
-* **The 35-Second Linux Stall Problem**: Standard HTTP uploads are unidirectional. Linux neighbor discovery on Android marks the Mac's neighbor entry as `STALE` after ~30 seconds, then `FAILED` after dropped unicast probes under 45 MB/s data flooding.
-* **The Fix**: During active transfers, both Mac and Android emit periodic ICMP/UDP keepalive packets every 2.0 seconds. Android's kernel receives valid inbound packets from the Mac's IP, resetting the neighbor state to `NUD_REACHABLE` (`0x2`) continuously throughout multi-gigabyte transfers.
+### B. Transport Layer (5 GHz Wi-Fi Direct + CPIO Streaming)
 
-### D. Clean Wi-Fi Restoration
-* **macOS Sequoia Compatibility**: Ephemeral P2P SSIDs are unconditionally removed from macOS's preferred wireless networks list. Calling `CoreWLAN.disassociate()` signals macOS native `airportd` to immediately re-associate with the user's primary Wi-Fi network without manual interaction.
+* **Autonomous 5 GHz Group**: Android creates a temporary Wi-Fi Direct Group Owner (GO) on 5 GHz (Band 4 / UNII-3) with a per-session random WPA2 passphrase.
+* **DVZip + Extended 64-bit CPIO**: Archives stream directly from source file descriptors over HTTP/1.1 chunked encoding to `/Upload` (`port 8772` on macOS, `port 8771` on Android). Files up to 8 GiB use standard POSIX `070707` headers; files 8 GiB and larger switch to extended `070764` headers with 64-bit hex sizes, writing safely via `.part` staging and canonical destination checks.
+* **macOS Finder AirDrop Proxy (`awdl0`)**: When an Android peer is nearby, macOS advertises `_airdrop._tcp` on `awdl0:8774`, receives drops on `127.0.0.1:8773`, and forwards them to the Android peer.
 
-### E. Claude AI Ingestion Pipeline
-* **Intelligent File Processing**: Configurable Anthropic Claude API hook (`claude_processor.py`).
-* **Multimodal Vision (Claude 3.5 Sonnet)**: Extracts OCR text, inspects receipts, analyzes UI screenshots, and describes photos.
-* **Document Synthesis**: Generates structured summaries, key takeaways, and action items for text, PDF, and code files.
+### C. Kernel Neighbor Cache Keepalive
 
+Unidirectional HTTP uploads at 45+ MB/s can starve reverse ARP traffic, causing the Linux neighbor table on Android to mark the peer `STALE` after roughly 30 seconds and drop packets. During active 5 GHz sessions, bidirectional UDP pulses every 2.0 seconds keep the neighbor entry in `NUD_REACHABLE` so 10 GB+ transfers complete without stalling.
+
+### D. Embedded Dual-Protocol Internet Proxy (`port 1080`)
+
+When macOS switches Wi-Fi to the offline `DIRECT-*` SSID, [`EmbeddedProxyServer.kt`](../android/app/src/main/java/com/airdrop/p2p/EmbeddedProxyServer.kt) can serve SOCKS5 (RFC 1928) and HTTP `CONNECT`/Forward traffic on port `1080`, binding outbound sockets to Android's active validated internet network (`ConnectivityManager`).
+
+* Only `192.168.49.0/24` and loopback clients are accepted.
+* Post-DNS SSRF checks block connections back to loopback/P2P control ports (`8771`, `1080`) and the `192.168.49.0/24` subnet.
+* On macOS, `mac-ble-airdrop.swift` serializes snapshot and restore operations under an advisory file lock (`proxy_state.lock`) via `networksetup`, preserving existing proxy settings and bypass domains without `sudo`.
+
+### E. macOS Wi-Fi & VPN Recovery
+
+Before joining a Wi-Fi Direct SSID, macOS records the active Wi-Fi network, pauses Cloudflare WARP (`warp-cli`) if connected, and ensures `DIRECT-*` entries are purged from preferred networks afterwards. Disassociating via CoreWLAN lets `airportd` rejoin the user's primary Wi-Fi without power-cycling the shared Wi-Fi/Bluetooth radio.
+
+### F. Optional AI Sidecar Processor (`claude_processor.py`)
+
+When explicitly enabled, received files on macOS pass through a local Privacy Guard (blocking private keys, `.pem`, `.key`, `.env*`, and API tokens by filename and regex inspection). Benign files can be summarized offline via macOS Apple Vision OCR and a local Ollama instance (`http://localhost:11434`), or via Anthropic's Messages API (`claude-3-5-sonnet-latest` with fallback to Haiku/Opus).

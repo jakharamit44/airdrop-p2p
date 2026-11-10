@@ -1,0 +1,1279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AirDrop for Android and Mac over 5 GHz Wi-Fi | AirDrop P2P</title>
+  <meta name="description" content="Send files, photos, videos, links, and notes between Android and macOS over BLE and 5 GHz Wi-Fi Direct. No shared router, USB cable, cloud, or size limit.">
+  <meta name="robots" content="index,follow,max-image-preview:large">
+  <meta name="theme-color" content="#0B132B">
+  <link rel="canonical" href="https://jakharamit44.github.io/airdrop-p2p/">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+  <link rel="manifest" href="site.webmanifest">
+
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="AirDrop P2P">
+  <meta property="og:title" content="AirDrop for Android and Mac over 5 GHz Wi-Fi | AirDrop P2P">
+  <meta property="og:description" content="Send files, photos, videos, links, and notes directly between Android and macOS at 45+ MB/s over BLE and 5 GHz Wi-Fi Direct. Free, open source, and encrypted.">
+  <meta property="og:url" content="https://jakharamit44.github.io/airdrop-p2p/">
+  <meta property="og:image" content="https://jakharamit44.github.io/airdrop-p2p/og-image.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="AirDrop P2P concentric wave emblem and key technical specifications">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="AirDrop for Android and Mac over 5 GHz Wi-Fi | AirDrop P2P">
+  <meta name="twitter:description" content="Direct peer-to-peer file sharing between Android 12+ and macOS 13+ over 5 GHz Wi-Fi Direct and BLE L2CAP. No cloud or shared router required.">
+  <meta name="twitter:image" content="https://jakharamit44.github.io/airdrop-p2p/og-image.png">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://jakharamit44.github.io/airdrop-p2p/#software",
+        "name": "AirDrop P2P",
+        "alternateName": "AirDrop P2P for Android and macOS",
+        "description": "Open-source peer-to-peer file transfer app for Android and macOS using Bluetooth LE L2CAP discovery, ECDH P-256 key exchange, pinned TLS, and 5 GHz Wi-Fi Direct without a shared router or file size limit.",
+        "applicationCategory": "UtilitiesApplication",
+        "operatingSystem": "Android 12+, macOS 13+",
+        "softwareVersion": "2.4.1",
+        "datePublished": "2026-11-10",
+        "license": "https://opensource.org/license/mit",
+        "isAccessibleForFree": true,
+        "url": "https://jakharamit44.github.io/airdrop-p2p/",
+        "downloadUrl": "https://github.com/jakharamit44/airdrop-p2p/releases/tag/v2.4.1",
+        "installUrl": "https://github.com/jakharamit44/airdrop-p2p/releases/latest",
+        "softwareRequirements": "Android 12 (API 31) or newer with BLE and 5 GHz Wi-Fi Direct; macOS 13 Ventura, 14 Sonoma, or 15 Sequoia on Apple Silicon or Intel.",
+        "featureList": [
+          "Bidirectional file, photo, video, link, and text note transfer between Android and macOS",
+          "Off-grid 5 GHz Wi-Fi Direct transfers at 45+ MB/s with Direct BLE L2CAP fallback",
+          "64-bit extended CPIO (070764) streaming for files larger than 8 GiB",
+          "ECDH P-256 key exchange, AES-256-GCM credential encryption, and SHA-256 pinned TLS",
+          "Embedded SOCKS5 and HTTP CONNECT proxy on port 1080 to keep macOS online during Wi-Fi Direct transfers",
+          "Optional on-device Apple Vision OCR, local Ollama summaries, and Claude API ingestion"
+        ],
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "author": {
+          "@type": "Person",
+          "name": "Amit Jakhar",
+          "url": "https://github.com/jakharamit44"
+        },
+        "codeRepository": "https://github.com/jakharamit44/airdrop-p2p"
+      },
+      {
+        "@type": "FAQPage",
+        "@id": "https://jakharamit44.github.io/airdrop-p2p/#faq",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "How do I send files from Android to Mac without USB or the same Wi-Fi network?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Install AirDrop P2P on both devices and open it. Android and Mac discover each other over Bluetooth Low Energy L2CAP, exchange Wi-Fi Direct credentials encrypted with ECDH P-256 and AES-256-GCM, and stream files over a temporary 5 GHz Wi-Fi Direct link."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Does AirDrop P2P work from Mac to Android too?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. Transfers work in both directions. From macOS you can drag files onto the menu bar icon or Send window, pick files by category, pull the current Finder selection or clipboard, compose a link or text note, or share from Finder over the local AWDL proxy."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Is there a file size limit or cloud upload?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "There is no artificial file size cap and zero cloud relay. Files up to 8 GiB use standard POSIX CPIO headers, and larger files (such as 10 GB+ videos) automatically switch to 64-bit extended CPIO (070764) streaming over 5 GHz Wi-Fi Direct."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Will my Mac lose internet while connected to Wi-Fi Direct?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "When Mac temporarily leaves its home router to join Android's 5 GHz Wi-Fi Direct group, Android can run an embedded SOCKS5 and HTTP CONNECT proxy on port 1080 (enabled under Settings -> Mac Internet Sharing Proxy). macOS configures and restores system proxy settings automatically without sudo, and returns to your original Wi-Fi network once the transfer finishes."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "How are transfers encrypted and protected against spoofing?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Wi-Fi Direct credentials are negotiated over BLE L2CAP using ephemeral ECDH P-256 keys and AES-256-GCM, alongside SHA-256 TLS certificate fingerprints pinned for the subsequent HTTPS transfer. On macOS, joining a new Wi-Fi Direct SSID always prompts for explicit user approval."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Can I send entire folders directly?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Currently both Android and macOS stage individual or multiple selected files, links, and text notes rather than raw directory trees. To send a folder, select the files inside it or compress the folder into a zip archive first."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "How do I avoid macOS Gatekeeper warnings when installing?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Use the AirDrop-P2P-v2.4.1.pkg installer, which places the app in /Applications and clears the quarantine extended attribute automatically. If you use the DMG, run the bundled bypass script or execute xattr -cr \"/Applications/AirDrop P2P.app\" in Terminal."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Does the AI summary feature send my private keys to the cloud?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "AI processing is turned off by default. When enabled, a local privacy guard blocks cloud upload for .pem, .key, .env, SSH keys, and files containing API tokens. You can also run entirely offline using macOS Apple Vision OCR and a local Ollama model."
+            }
+          }
+        ]
+      }
+    ]
+  }
+  </script>
+
+  <style>
+    :root {
+      --bg: #070b14;
+      --bg-elev: #0e1424;
+      --bg-card: #121a2e;
+      --bg-card-hover: #17213b;
+      --border: #22304f;
+      --border-strong: #324673;
+      --text: #f3f6fc;
+      --text-muted: #a6b4cf;
+      --text-dim: #7f8eab;
+      --accent: #38bdf8;
+      --accent-strong: #5360f5;
+      --accent-strong-hover: #424ee0;
+      --green: #22c55e;
+      --green-bg: rgba(34, 197, 94, 0.14);
+      --amber: #f59e0b;
+      --code-bg: #0a101e;
+      --shadow: 0 18px 42px rgba(2, 6, 20, 0.45);
+      --radius: 16px;
+      --max-w: 1120px;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f4f7fc;
+        --bg-elev: #ffffff;
+        --bg-card: #ffffff;
+        --bg-card-hover: #f8faff;
+        --border: #d7e1f0;
+        --border-strong: #b8c8e2;
+        --text: #0f172a;
+        --text-muted: #475569;
+        --text-dim: #64748b;
+        --accent: #0284c7;
+        --accent-strong: #434fe0;
+        --accent-strong-hover: #3540c9;
+        --green: #15803d;
+        --green-bg: rgba(21, 128, 61, 0.10);
+        --amber: #b45309;
+        --code-bg: #eef2fa;
+        --shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+      }
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      -webkit-text-size-adjust: 100%;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      font-size: 16px;
+      overflow-x: hidden;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+    }
+
+    .skip-link {
+      position: absolute;
+      left: -9999px;
+      top: 0;
+      background: var(--accent-strong);
+      color: #ffffff;
+      padding: 10px 16px;
+      border-radius: 8px;
+      z-index: 100;
+      font-weight: 600;
+    }
+
+    .skip-link:focus {
+      left: 16px;
+      top: 16px;
+    }
+
+    .container {
+      max-width: var(--max-w);
+      margin: 0 auto;
+      padding: 0 20px;
+    }
+
+    header.site-header {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      backdrop-filter: blur(12px);
+      background: color-mix(in srgb, var(--bg) 86%, transparent);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .nav-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 64px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text);
+      font-weight: 700;
+      font-size: 17px;
+      letter-spacing: -0.01em;
+    }
+
+    .brand:hover {
+      text-decoration: none;
+    }
+
+    .brand img {
+      width: 30px;
+      height: 30px;
+      border-radius: 7px;
+      display: block;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+
+    .nav-links a {
+      color: var(--text-muted);
+      font-size: 14px;
+      font-weight: 500;
+      padding: 8px 4px;
+      min-height: 44px;
+      display: inline-flex;
+      align-items: center;
+    }
+
+    .nav-links a:hover {
+      color: var(--text);
+      text-decoration: none;
+    }
+
+    .nav-cta {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 14px !important;
+      color: var(--text) !important;
+      font-weight: 600 !important;
+    }
+
+    .nav-cta:hover {
+      border-color: var(--border-strong);
+      background: var(--bg-card-hover);
+    }
+
+    @media (max-width: 720px) {
+      .nav-hide-mobile {
+        display: none !important;
+      }
+    }
+
+    .hero {
+      padding: 56px 0 42px;
+      border-bottom: 1px solid var(--border);
+      background: radial-gradient(ellipse 80% 55% at 50% -10%, rgba(56, 189, 248, 0.14), transparent 70%);
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.25fr 0.95fr;
+      gap: 32px;
+      align-items: center;
+    }
+
+    @media (max-width: 900px) {
+      .hero-grid {
+        grid-template-columns: 1fr;
+      }
+      .hero {
+        padding: 36px 0 32px;
+      }
+    }
+
+    .release-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 16px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      flex-shrink: 0;
+    }
+
+    h1 {
+      margin: 0 0 16px;
+      font-size: clamp(2rem, 3.8vw, 2.9rem);
+      line-height: 1.14;
+      letter-spacing: -0.025em;
+      font-weight: 800;
+    }
+
+    .hero-lead {
+      font-size: 18px;
+      color: var(--text-muted);
+      margin: 0 0 24px;
+      max-width: 60ch;
+    }
+
+    .cta-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 46px;
+      padding: 11px 18px;
+      border-radius: 12px;
+      font-size: 15px;
+      font-weight: 650;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+    }
+
+    .btn:hover {
+      text-decoration: none;
+    }
+
+    .btn-primary {
+      background: var(--accent-strong);
+      color: #ffffff;
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-strong-hover);
+    }
+
+    .btn-secondary {
+      background: var(--bg-card);
+      border-color: var(--border-strong);
+      color: var(--text);
+    }
+
+    .btn-secondary:hover {
+      background: var(--bg-card-hover);
+    }
+
+    .hero-meta {
+      font-size: 13px;
+      color: var(--text-dim);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+    }
+
+    .hero-meta a {
+      color: var(--text-muted);
+      text-decoration: underline;
+      text-decoration-color: var(--border-strong);
+      text-underline-offset: 3px;
+    }
+
+    .proto-card {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: var(--shadow);
+    }
+
+    .proto-head {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding-bottom: 14px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      font-weight: 650;
+      color: var(--text-muted);
+    }
+
+    .proto-badge {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: var(--green-bg);
+      color: var(--green);
+      white-space: nowrap;
+    }
+
+    .proto-step {
+      display: grid;
+      grid-template-columns: 30px 1fr;
+      gap: 12px;
+      padding: 10px 0;
+      align-items: start;
+    }
+
+    .proto-step + .proto-step {
+      border-top: 1px dashed var(--border);
+    }
+
+    .step-num {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .proto-step strong {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 2px;
+    }
+
+    .proto-step p {
+      margin: 0;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .metrics-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+      margin-top: 32px;
+    }
+
+    @media (max-width: 820px) {
+      .metrics-strip {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 460px) {
+      .metrics-strip {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .metric-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+
+    .metric-val {
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+      margin-bottom: 4px;
+    }
+
+    .metric-lbl {
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    section {
+      padding: 48px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    section:last-of-type {
+      border-bottom: none;
+    }
+
+    h2 {
+      margin: 0 0 10px;
+      font-size: clamp(1.45rem, 2.5vw, 1.9rem);
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+      font-weight: 750;
+    }
+
+    .section-intro {
+      margin: 0 0 26px;
+      color: var(--text-muted);
+      max-width: 68ch;
+    }
+
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    @media (max-width: 900px) {
+      .cards-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 620px) {
+      .cards-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+
+    .card h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .card p {
+      margin: 0;
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 20px;
+    }
+
+    @media (max-width: 780px) {
+      .two-col {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .hero-grid > *,
+    .two-col > *,
+    .cards-grid > *,
+    .metrics-strip > * {
+      min-width: 0;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      max-width: 100%;
+      -webkit-overflow-scrolling: touch;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg-card);
+    }
+
+    .table-compact {
+      margin-top: 12px;
+    }
+
+    .table-compact table {
+      min-width: 100%;
+    }
+
+    .mt-sm {
+      margin-top: 10px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 620px;
+      font-size: 14px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 13px 16px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text);
+      background: var(--bg-elev);
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    td {
+      color: var(--text-muted);
+    }
+
+    td strong {
+      color: var(--text);
+    }
+
+    pre, code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+    }
+
+    code {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+
+    .code-block {
+      position: relative;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      overflow-x: auto;
+      margin: 12px 0 0;
+    }
+
+    .code-block pre {
+      margin: 0;
+      white-space: pre;
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    .copy-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .copy-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 12px;
+      min-height: 36px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .copy-btn:hover {
+      background: var(--bg-card-hover);
+    }
+
+    .dl-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .dl-card h3 {
+      margin: 0 0 6px;
+      font-size: 17px;
+    }
+
+    .dl-card p {
+      margin: 0;
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    .dl-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .note-box {
+      margin-top: 18px;
+      padding: 16px 18px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--bg-elev);
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    .note-box strong {
+      color: var(--text);
+    }
+
+    .faq-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    details.faq-item {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 0 18px;
+    }
+
+    details.faq-item summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 16px 0;
+      font-weight: 650;
+      font-size: 15px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      min-height: 48px;
+    }
+
+    details.faq-item summary::-webkit-details-marker {
+      display: none;
+    }
+
+    details.faq-item summary::after {
+      content: "+";
+      font-size: 19px;
+      font-weight: 500;
+      color: var(--accent);
+      flex-shrink: 0;
+    }
+
+    details.faq-item[open] summary::after {
+      content: "−";
+    }
+
+    details.faq-item p {
+      margin: 0 0 16px;
+      font-size: 14px;
+      color: var(--text-muted);
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+    }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 32px 0 42px;
+      color: var(--text-dim);
+      font-size: 14px;
+    }
+
+    .footer-grid {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+    }
+
+    .footer-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    .footer-links a {
+      color: var(--text-muted);
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+
+  <header class="site-header">
+    <div class="container nav-bar">
+      <a class="brand" href="./">
+        <img src="favicon.svg" alt="AirDrop P2P wave icon" width="30" height="30">
+        <span>AirDrop P2P</span>
+      </a>
+      <nav class="nav-links" aria-label="Primary navigation">
+        <a class="nav-hide-mobile" href="#downloads">Downloads</a>
+        <a class="nav-hide-mobile" href="#comparison">Compare</a>
+        <a class="nav-hide-mobile" href="#how-it-works">Protocol</a>
+        <a class="nav-hide-mobile" href="#faq">FAQ</a>
+        <a class="nav-cta" href="https://github.com/jakharamit44/airdrop-p2p">GitHub Repo</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="container">
+        <div class="hero-grid">
+          <div>
+            <div class="release-pill">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span>Release v2.4.1 (Public Beta)</span>
+            </div>
+            <h1>AirDrop Between Android and Mac Over 5 GHz Wi-Fi Direct</h1>
+            <p class="hero-lead">
+              AirDrop P2P transfers files, photos, videos, links, and text notes directly between Android 12+ and macOS 13+. It works without a shared Wi-Fi router, USB cable, cloud account, or file size cap.
+            </p>
+            <div class="cta-group">
+              <a class="btn btn-primary" href="https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.apk">
+                Download Android APK
+              </a>
+              <a class="btn btn-secondary" href="https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.pkg">
+                Download macOS PKG
+              </a>
+              <a class="btn btn-secondary" href="https://github.com/jakharamit44/airdrop-p2p">
+                View Source
+              </a>
+            </div>
+            <div class="hero-meta">
+              <span>MIT License</span>
+              <span>Android 12+ &amp; macOS 13+ (Apple Silicon &amp; Intel)</span>
+              <a href="https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/SHA256SUMS.txt">SHA256SUMS.txt</a>
+            </div>
+          </div>
+
+          <aside class="proto-card" aria-label="Wireless transfer flow">
+            <div class="proto-head">
+              <span>Transfer Pipeline (Android &harr; Mac)</span>
+              <span class="proto-badge">ECDH P-256 + TLS</span>
+            </div>
+            <div class="proto-step">
+              <div class="step-num">1</div>
+              <div>
+                <strong>BLE L2CAP Discovery</strong>
+                <p>Peers find each other over Bluetooth Low Energy without sharing a Wi-Fi network.</p>
+              </div>
+            </div>
+            <div class="proto-step">
+              <div class="step-num">2</div>
+              <div>
+                <strong>Encrypted Credential Handshake</strong>
+                <p>Ephemeral ECDH P-256 keys and AES-256-GCM protect 5 GHz Wi-Fi Direct credentials and pin TLS fingerprints.</p>
+              </div>
+            </div>
+            <div class="proto-step">
+              <div class="step-num">3</div>
+              <div>
+                <strong>5 GHz Wi-Fi Direct Streaming</strong>
+                <p>Files stream over HTTPS with 64-bit CPIO (070764) support above 8 GiB, plus an optional port 1080 internet proxy.</p>
+              </div>
+            </div>
+            <div class="proto-step">
+              <div class="step-num">4</div>
+              <div>
+                <strong>Clean Network Restore</strong>
+                <p>macOS removes temporary P2P SSIDs, restores prior proxy settings, and rejoins your home Wi-Fi via CoreWLAN.</p>
+              </div>
+            </div>
+          </aside>
+        </div>
+
+        <div class="metrics-strip" aria-label="Measured specifications">
+          <div class="metric-box">
+            <div class="metric-val">45+ MB/s</div>
+            <div class="metric-lbl">Measured 5 GHz Wi-Fi Direct throughput</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-val">No Size Cap</div>
+            <div class="metric-lbl">64-bit CPIO 070764 streams 10 GB+ files</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-val">Port 1080</div>
+            <div class="metric-lbl">Optional SOCKS5 / HTTP proxy keeps Mac online</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-val">Zero Cloud</div>
+            <div class="metric-lbl">Direct device-to-device radio link only</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="downloads">
+      <div class="container">
+        <h2>Download Release v2.4.1</h2>
+        <p class="section-intro">
+          Pre-built binaries are published on GitHub Releases with SHA-256 checksums. Both apps run natively without third-party transfer servers.
+        </p>
+
+        <div class="two-col">
+          <article class="dl-card">
+            <div>
+              <h3>Android App (Universal APK)</h3>
+              <p>
+                Requires Android 12 (API 31) or newer with Bluetooth Low Energy and 5 GHz Wi-Fi Direct. Tested across Samsung, Google Pixel, OnePlus, Xiaomi, and Motorola builds using standard Android APIs. Includes Share Sheet targets and a toggleable SOCKS5/HTTP cellular sharing proxy.
+              </p>
+            </div>
+            <div class="dl-actions">
+              <a class="btn btn-primary" href="https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.apk">
+                AirDrop-P2P-v2.4.1.apk
+              </a>
+            </div>
+          </article>
+
+          <article class="dl-card">
+            <div>
+              <h3>macOS App (PKG or DMG)</h3>
+              <p>
+                Requires macOS 13 Ventura, 14 Sonoma, or 15 Sequoia (Apple Silicon or Intel). Runs as a native SwiftUI menu bar and radar window app. Pick the PKG installer to install into <code>/Applications</code> and clear Gatekeeper quarantine attributes automatically.
+              </p>
+            </div>
+            <div class="dl-actions">
+              <a class="btn btn-primary" href="https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.pkg">
+                AirDrop-P2P-v2.4.1.pkg (Recommended)
+              </a>
+              <a class="btn btn-secondary" href="https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.dmg">
+                AirDrop-P2P-v2.4.1.dmg
+              </a>
+            </div>
+          </article>
+        </div>
+
+        <div class="note-box">
+          <strong>Verify downloads &amp; Gatekeeper note:</strong> Check hashes against
+          <a href="https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/SHA256SUMS.txt">SHA256SUMS.txt</a>.
+          If you install from the unsigned <code>.dmg</code> and macOS says the app cannot be opened, run the bundled Gatekeeper script or clear the quarantine attribute:
+          <div class="code-block">
+            <pre id="gatekeeper-cmd">xattr -cr "/Applications/AirDrop P2P.app"</pre>
+          </div>
+          <div class="copy-row">
+            <span id="copy-status" aria-live="polite"></span>
+            <button class="copy-btn" type="button" data-copy-target="gatekeeper-cmd">Copy Terminal command</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="features">
+      <div class="container">
+        <h2>Built for Real Android to Mac Transfers</h2>
+        <p class="section-intro">
+          Most cross-platform sharing tools fail the moment you leave home Wi-Fi or try moving a 10 GB video. AirDrop P2P handles the radio, kernel, and network edge cases directly.
+        </p>
+
+        <div class="cards-grid">
+          <article class="card">
+            <h3>Bidirectional Android &harr; Mac</h3>
+            <p>Send files from Android's Share Sheet or inside the app, and send back from macOS via drag-and-drop, Finder selection, clipboard, or Finder's AirDrop menu.</p>
+          </article>
+          <article class="card">
+            <h3>No Shared Router Required</h3>
+            <p>Android opens a dedicated 5 GHz Band 4 Wi-Fi Direct group per session, so transfers work on trains, cafes, hotels, and studio sets with zero LAN access.</p>
+          </article>
+          <article class="card">
+            <h3>Stay Online on Mac</h3>
+            <p>Android's embedded dual-protocol proxy (SOCKS5 and HTTP CONNECT on port 1080) routes Mac traffic over cellular data while Wi-Fi Direct is active.</p>
+          </article>
+          <article class="card">
+            <h3>Pinned TLS + ECDH P-256</h3>
+            <p>Ephemeral P-256 keys encrypt Wi-Fi credentials over BLE, TLS certificate SHA-256 fingerprints are pinned, and Mac asks before joining any Wi-Fi Direct SSID.</p>
+          </article>
+          <article class="card">
+            <h3>No 35-Second Kernel Stalls</h3>
+            <p>Bidirectional 2.0s UDP keepalives reset Android's Linux neighbor cache state so 10 GB+ HTTP streams do not freeze mid-transfer.</p>
+          </article>
+          <article class="card">
+            <h3>Files, Links, and Text Notes</h3>
+            <p>Move batches of photos, 4K videos, PDFs, APKs, URLs, or quick notes. For full folder trees, select the contained files or send a zip archive.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="comparison">
+      <div class="container">
+        <h2>How It Compares to Alternatives</h2>
+        <p class="section-intro">
+          Different tools fit different situations. Here is how AirDrop P2P compares against USB MTP, local-Wi-Fi sharing apps, and cloud messengers.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Method</th>
+                <th>Same Wi-Fi Needed?</th>
+                <th>USB Cable?</th>
+                <th>Typical Speed</th>
+                <th>File Size Cap</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>AirDrop P2P</strong></td>
+                <td>No (BLE + Wi-Fi Direct)</td>
+                <td>No</td>
+                <td>45+ MB/s (5 GHz)</td>
+                <td>None (64-bit CPIO)</td>
+                <td>Mac can stay online via Android proxy; requires app on both devices</td>
+              </tr>
+              <tr>
+                <td><strong>LAN Apps (LocalSend / Web)</strong></td>
+                <td>Yes (shared router or hotspot)</td>
+                <td>No</td>
+                <td>Varies by router</td>
+                <td>Usually memory/device bound</td>
+                <td>Blocked on isolated guest/corporate Wi-Fi with AP client isolation</td>
+              </tr>
+              <tr>
+                <td><strong>Android File Transfer / MTP</strong></td>
+                <td>No</td>
+                <td>Yes</td>
+                <td>20–40 MB/s (USB 2/3)</td>
+                <td>None</td>
+                <td>Requires cable; MTP protocol on macOS often hangs on large media folders</td>
+              </tr>
+              <tr>
+                <td><strong>Cloud Drive / Messengers</strong></td>
+                <td>Internet on both</td>
+                <td>No</td>
+                <td>Limited by upload bandwidth</td>
+                <td>2–15 GB typical limits</td>
+                <td>Uploads files to third-party servers and consumes double bandwidth</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="how-it-works">
+      <div class="container">
+        <h2>Under the Hood &amp; Optional AI Tools</h2>
+        <p class="section-intro">
+          The transport layer mirrors Apple AirDrop's <code>/Discover</code>, <code>/Ask</code>, and <code>/Upload</code> HTTPS protocol using binary plists (<code>bplist00</code>) and streaming DVZip/CPIO archives.
+        </p>
+
+        <div class="two-col">
+          <article class="card">
+            <h3>Measured 5 GHz Wi-Fi Direct Speeds</h3>
+            <p>Recorded over 80 MHz Band 4 Wi-Fi Direct with 1 MiB chunk buffers and 4 MiB socket buffers:</p>
+            <div class="table-wrap table-compact">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Payload</th>
+                    <th>Time</th>
+                    <th>Average Speed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td>100 MB (Photos / Docs)</td><td>~2.1 s</td><td>47.6 MB/s</td></tr>
+                  <tr><td>1.50 GB (Video Clip)</td><td>~32.8 s</td><td>45.7 MB/s</td></tr>
+                  <tr><td>3.00 GB (1080p Film)</td><td>~66.2 s</td><td>45.3 MB/s</td></tr>
+                  <tr><td>10.0+ GB (Media Archive)</td><td>~221.0 s</td><td>45.2 MB/s</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3>Optional AI Summary Sidecars (Off by Default)</h3>
+            <p>
+              If you enable <code>macos/claude_processor.py</code>, received files on Mac can generate companion <code>.claude.md</code> notes using either on-device tools or Anthropic's Messages API.
+            </p>
+            <p class="mt-sm">
+              <strong>Offline mode (no API key):</strong> Uses macOS Apple Vision OCR for images and an optional local Ollama server (<code>llama3.2</code>, <code>mistral</code>, <code>qwen2.5</code>, <code>phi3</code>) for summaries.
+            </p>
+            <p class="mt-sm">
+              <strong>Privacy Guard:</strong> Before any file touches the cloud, filename rules and content regexes block <code>.pem</code>, <code>.key</code>, <code>.env*</code>, SSH keys, and exposed API tokens.
+            </p>
+          </article>
+        </div>
+
+        <div class="note-box">
+          <strong>Build from source:</strong> Run <code>cd macos &amp;&amp; ./build.sh</code> on macOS (Xcode CLT + Python 3.9+) and <code>cd android &amp;&amp; ./gradlew assembleDebug</code> (JDK 17 + Android SDK 36). See the <a href="https://github.com/jakharamit44/airdrop-p2p/blob/main/docs/ARCHITECTURE.md">Architecture Specification</a> and <a href="https://github.com/jakharamit44/airdrop-p2p/blob/main/SECURITY.md">Security Policy</a> for protocol details.
+        </div>
+      </div>
+    </section>
+
+    <section id="faq">
+      <div class="container">
+        <h2>Frequently Asked Questions</h2>
+        <p class="section-intro">Common setup, speed, proxy, and privacy questions for first-time users.</p>
+
+        <div class="faq-list">
+          <details class="faq-item">
+            <summary>How do I send files from Android to Mac without USB or the same Wi-Fi network?</summary>
+            <p>Install AirDrop P2P on both devices and open it. Android and Mac discover each other over Bluetooth Low Energy L2CAP, negotiate temporary 5 GHz Wi-Fi Direct credentials encrypted with ECDH P-256 and AES-256-GCM, and transfer directly over HTTPS without any router or cable.</p>
+          </details>
+          <details class="faq-item">
+            <summary>Does AirDrop P2P work from Mac to Android too?</summary>
+            <p>Yes. Transfers work in both directions. From macOS you can drag files onto the menu bar icon or Send tab, pick files by category, grab the current Finder selection or clipboard, compose a link or note, or send from Finder's native AirDrop target via the local AWDL proxy.</p>
+          </details>
+          <details class="faq-item">
+            <summary>Is there a file size limit or cloud upload?</summary>
+            <p>There is no file size limit and zero cloud upload. Transfers under 8 GiB use standard POSIX CPIO headers, while larger files automatically stream with 64-bit extended CPIO (070764) headers directly from file descriptors.</p>
+          </details>
+          <details class="faq-item">
+            <summary>Will my Mac lose internet while connected to Wi-Fi Direct?</summary>
+            <p>During 5 GHz Wi-Fi Direct transfers, Android can run an embedded SOCKS5 and HTTP CONNECT proxy on port 1080 (under Settings &rarr; Mac Internet Sharing Proxy) to share its active cellular connection. macOS snapshots your previous proxy settings, applies the temporary proxy without sudo, and restores both your proxy config and home Wi-Fi once done.</p>
+          </details>
+          <details class="faq-item">
+            <summary>How are transfers encrypted and protected against spoofing?</summary>
+            <p>Wi-Fi Direct credentials travel inside an ephemeral ECDH P-256 + AES-256-GCM handshake over BLE, and both sides exchange SHA-256 TLS certificate fingerprints to pin the HTTPS connection. On macOS, joining a new Wi-Fi Direct group requires explicit confirmation even if auto-accept is enabled for incoming files.</p>
+          </details>
+          <details class="faq-item">
+            <summary>Can I send entire folders directly?</summary>
+            <p>Not directly yet. Both Android and macOS stage single or multiple selected files, links, and text notes rather than directory trees. Select the files inside a folder or create a zip archive first when moving folders.</p>
+          </details>
+          <details class="faq-item">
+            <summary>How do I avoid macOS Gatekeeper warnings when installing?</summary>
+            <p>Install with <code>AirDrop-P2P-v2.4.1.pkg</code>, which installs into <code>/Applications</code> and runs <code>xattr -cr</code> automatically. If you downloaded the <code>.dmg</code>, run the bundled Gatekeeper helper script or run <code>xattr -cr "/Applications/AirDrop P2P.app"</code> in Terminal.</p>
+          </details>
+          <details class="faq-item">
+            <summary>Does the AI summary feature send my private keys to the cloud?</summary>
+            <p>No. AI ingestion is disabled by default. Even when enabled, the Privacy Guard blocks <code>.pem</code>, <code>.key</code>, <code>.env*</code>, SSH keys, and files containing API tokens from cloud upload, and local mode runs completely offline via Apple Vision OCR and Ollama.</p>
+          </details>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-grid">
+      <div>AirDrop P2P v2.4.1 &middot; Open source under the MIT License</div>
+      <div class="footer-links">
+        <a href="https://github.com/jakharamit44/airdrop-p2p">GitHub</a>
+        <a href="https://github.com/jakharamit44/airdrop-p2p/releases">Releases</a>
+        <a href="https://github.com/jakharamit44/airdrop-p2p/blob/main/docs/ARCHITECTURE.md">Architecture</a>
+        <a href="https://github.com/jakharamit44/airdrop-p2p/blob/main/SECURITY.md">Security</a>
+        <a href="https://github.com/jakharamit44/airdrop-p2p/blob/main/CONTRIBUTING.md">Contributing</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var btns = document.querySelectorAll('[data-copy-target]');
+      var statusEl = document.getElementById('copy-status');
+      function showStatus(btn, ok) {
+        if (statusEl) {
+          statusEl.textContent = ok ? 'Copied command to clipboard.' : 'Select and copy the command manually.';
+        }
+        btn.textContent = ok ? 'Copied' : 'Copy failed';
+        setTimeout(function () { btn.textContent = 'Copy Terminal command'; }, 1800);
+      }
+      btns.forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var target = document.getElementById(btn.getAttribute('data-copy-target'));
+          if (!target) return;
+          var txt = target.textContent.trim();
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(txt).then(function () {
+              showStatus(btn, true);
+            }).catch(function () {
+              showStatus(btn, false);
+            });
+          } else {
+            var ta = document.createElement('textarea');
+            ta.value = txt;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            var ok = false;
+            try { ok = document.execCommand('copy'); } catch (e) {}
+            document.body.removeChild(ta);
+            showStatus(btn, ok);
+          }
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

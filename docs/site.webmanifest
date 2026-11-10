@@ -1,0 +1,21 @@
+{
+  "name": "AirDrop P2P",
+  "short_name": "AirDrop P2P",
+  "description": "Direct peer-to-peer file transfer between Android and macOS over BLE and 5 GHz Wi-Fi Direct.",
+  "start_url": "/airdrop-p2p/",
+  "display": "standalone",
+  "background_color": "#0B132B",
+  "theme_color": "#0B132B",
+  "icons": [
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

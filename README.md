@@ -1,117 +1,101 @@
 # AirDrop P2P
 
-[![Views](https://komarev.com/ghpvc/?username=jakharamit44&repo=airdrop-p2p&color=blue)](https://github.com/jakharamit44/airdrop-p2p)
+Send files, photos, videos, links, and text notes directly between Android and macOS over Bluetooth Low Energy and 5 GHz Wi-Fi Direct. AirDrop P2P runs peer-to-peer without a shared Wi-Fi router, USB cable, cloud account, or file size limit.
 
-> High-speed, pure peer-to-peer file transfer between any Android device and macOS, powered by 5GHz Wi-Fi Direct and BLE L2CAP, with automated file intelligence via the Anthropic Claude API.
+**Website & Documentation:** [jakharamit44.github.io/airdrop-p2p](https://jakharamit44.github.io/airdrop-p2p/)
 
-[![Platform: Android](https://img.shields.io/badge/Platform-Android%2012%2B-green.svg)](https://developer.android.com)
-[![Platform: macOS](https://img.shields.io/badge/Platform-macOS%2013%2B%20%28Apple%20Silicon%20%26%20Intel%29-blue.svg)](https://apple.com/macos)
-[![Protocol: AirDrop 1.0](https://img.shields.io/badge/Protocol-Apple%20AirDrop%201.0%20%2B%20WP2P-orange.svg)](docs/ARCHITECTURE.md)
-[![AI Engine: Claude 3.5](https://img.shields.io/badge/AI-Claude%203.5%20Sonnet%20%2F%20Haiku-purple.svg)](https://anthropic.com)
-[![Release: v2.4.1](https://img.shields.io/badge/Release-v2.4.1-blueviolet.svg)](https://github.com/jakharamit44/airdrop-p2p/releases/latest)
-[![Security: Hardened](https://img.shields.io/badge/Security-Audit%20Hardened-success.svg)](SECURITY.md)
-[![Status: Public Beta](https://img.shields.io/badge/Status-Public%20Beta-amber.svg)](SECURITY.md)
+[![Release: v2.4.1](https://img.shields.io/badge/Release-v2.4.1-5360F5.svg)](https://github.com/jakharamit44/airdrop-p2p/releases/latest)
+[![Platform: Android 12+](https://img.shields.io/badge/Android-12%2B%20(API%2031%2B)-16A34A.svg)](https://github.com/jakharamit44/airdrop-p2p/releases/latest)
+[![Platform: macOS 13+](https://img.shields.io/badge/macOS-13%2B%20(Apple%20Silicon%20%26%20Intel)-0284C7.svg)](https://github.com/jakharamit44/airdrop-p2p/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-334155.svg)](LICENSE)
+[![Status: Public Beta](https://img.shields.io/badge/Status-Public%20Beta-D97706.svg)](SECURITY.md)
 
 > [!WARNING]
-> **Active Public Beta Stage (v2.4.1)**
-> AirDrop P2P is currently in active public beta. The protocol and transport layers are functional and audited, but edge cases across different OEM Wi-Fi chipsets and macOS versions are actively being refined.
-> Please review [SECURITY.md](SECURITY.md) and report any issues or contributions via [CONTRIBUTING.md](CONTRIBUTING.md).
+> **Public Beta (v2.4.1)**
+> Core BLE L2CAP, 5 GHz Wi-Fi Direct, and TLS transport layers are functional and covered by unit tests, while OEM Wi-Fi chipset and macOS edge cases continue to be refined. Review [SECURITY.md](SECURITY.md) before transferring sensitive data in untrusted RF spaces, and open issues via [CONTRIBUTING.md](CONTRIBUTING.md).
 
----
+## Downloads (v2.4.1)
 
-## Downloads
+Pre-compiled binaries and SHA-256 verification hashes are available on the [latest GitHub Release](https://github.com/jakharamit44/airdrop-p2p/releases/latest).
 
-Get pre-compiled release artifacts from [Releases](https://github.com/jakharamit44/airdrop-p2p/releases/latest):
-
-| Platform | Asset | Description |
-| :--- | :--- | :--- |
-| **Android** | [`AirDrop-P2P-v2.4.1.apk`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.apk) | Universal APK for Android (Samsung, Pixel, OnePlus, Xiaomi) |
-| **macOS (PKG)** | [`AirDrop-P2P-v2.4.1.pkg`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.pkg) | Native Installer package (recommended for macOS 13+) |
-| **macOS (DMG)** | [`AirDrop-P2P-v2.4.1.dmg`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.dmg) | Drag-and-drop installer for macOS 13+ (Ventura, Sonoma, Sequoia) |
-| **Checksums** | [`SHA256SUMS.txt`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/SHA256SUMS.txt) | Cryptographic SHA-256 verification hashes |
-
----
-
-## Highlights
-
-* **100% Off-Grid Peer-to-Peer**: Operates entirely without an external Wi-Fi router, local network, mobile data, or internet connection.
-* **45+ MB/s Real-World Throughput**: Transfers multi-gigabyte files (movies, RAW photos, APKs) over dedicated 5GHz Wi-Fi Direct channels.
-* **Universal Android Support**: Compatible with any modern Android device (Samsung, Google Pixel, OnePlus, Xiaomi, Motorola, etc.). Device names and models are resolved dynamically from hardware properties.
-* **Kernel ARP Keepalive Engine**: Prevents Linux kernel neighbor cache timeouts during sustained multi-gigabyte unidirectional HTTP streaming.
-* **Native macOS Wi-Fi Auto-Reassociation**: Ephemeral P2P credentials are removed upon completion, automatically restoring primary Wi-Fi connections via CoreWLAN without manual toggling.
-* **Claude AI Ingestion Pipeline**: Automatically extracts OCR text from images, generates summaries for documents and code, and produces structured markdown sidecars for received files using Anthropic's Claude 3.5 Sonnet and Haiku models.
-
----
-
-## Architecture Overview
-
-```
-                      +-----------------------------+
-                      |   Bluetooth Low Energy      |
-                      |   Discovery & PSM Exchange  |
-                      +--------------+--------------+
-                                     |
-                                     v
-                      +-----------------------------+
-                      |   5GHz Wi-Fi Direct (P2P)   |
-                      |   Autonomous Group Owner    |
-                      +--------------+--------------+
-                                     |
-                                     v
-                      +-----------------------------+
-                      |   TLS 1.3 Streaming Engine  |
-                      |   Chunked DVZip / CPIO Pipe |
-                      +--------------+--------------+
-                                     |
-                       Bidirectional Keepalive (2.0s)
-                                     |
-                                     v
-                      +-----------------------------+
-                      |   Automated Wi-Fi Recovery  |
-                      |   Clean Network Reset       |
-                      +--------------+--------------+
-                                     |
-                                     v
-                      +-----------------------------+
-                      |   Claude AI Analysis Hook   |
-                      |   OCR, Summaries, Metadata  |
-                      +-----------------------------+
-```
-
-For full protocol details, see [ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
----
-
-## Performance
-
-Measured transfer metrics over pure 5GHz Wi-Fi Direct (Band 4, 80 MHz channel width):
-
-| Payload Size | Transfer Time | Average Speed | Status |
+| Platform | Package | Target Requirements | Notes |
 | :--- | :--- | :--- | :--- |
-| **100 MB** (Photos / Documents) | ~2.1 seconds | 47.6 MB/s | Verified |
-| **1.50 GB** (Video Clip) | ~32.8 seconds | 45.7 MB/s | Verified |
-| **3.00 GB** (1080p BluRay Film) | ~66.2 seconds | 45.3 MB/s | Verified (No Stall) |
-| **10.0+ GB** (Large Media Archives) | ~221.0 seconds | 45.2 MB/s | Verified (Continuous Stream) |
+| **Android** | [`AirDrop-P2P-v2.4.1.apk`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.apk) | Android 12+ (API 31+) | Universal APK for Samsung, Pixel, OnePlus, Xiaomi, Motorola, and AOSP devices |
+| **macOS (PKG)** | [`AirDrop-P2P-v2.4.1.pkg`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.pkg) | macOS 13+ (Ventura, Sonoma, Sequoia) | Recommended installer; places the app in `/Applications` and removes Gatekeeper quarantine flags |
+| **macOS (DMG)** | [`AirDrop-P2P-v2.4.1.dmg`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/AirDrop-P2P-v2.4.1.dmg) | macOS 13+ (Apple Silicon & Intel) | Drag-and-drop image containing a helper script for Gatekeeper (`xattr -cr`) |
+| **Checksums** | [`SHA256SUMS.txt`](https://github.com/jakharamit44/airdrop-p2p/releases/latest/download/SHA256SUMS.txt) | All | SHA-256 hashes for verifying downloaded packages |
 
----
+If you install from the `.dmg` and macOS reports that the unsigned app cannot be opened, run the included `Open AirDrop P2P (Bypass Gatekeeper).command` script or clear the quarantine attribute in Terminal:
 
-## Getting Started
+```bash
+xattr -cr "/Applications/AirDrop P2P.app"
+```
+
+## What It Transfers and How It Works
+
+Transfers run in both directions between Android and macOS. From Android, pick files inside the app or send directly from the system Share Sheet (`SEND` and `SEND_MULTIPLE`). From macOS, drop files onto the menu bar icon or Send window, pick by file category, pull the active Finder selection or clipboard, compose a link or note, or send through Finder's AirDrop menu via the local AWDL proxy.
+
+Supported items include single or multiple files (photos, videos, PDFs, documents, audio, archives, APKs), HTTP/HTTPS URLs, and text notes (`Note-*.txt`). Raw directory trees are not sent directly yet; select the files inside a directory or compress it into a zip archive first.
+
+```
+Android Device                                         macOS (Menu Bar + Daemon)
+      |                                                           |
+      |  1. BLE L2CAP discovery + ECDH P-256 handshake (W2P2)     |
+      |<--------------------------------------------------------->|
+      |  2. AES-256-GCM encrypted 5 GHz Wi-Fi Direct credentials  |
+      |     + TLS SHA-256 certificate fingerprints                |
+      |---------------------------------------------------------->|
+      |  3. HTTPS stream (/Discover, /Ask, /Upload) on 5 GHz      |
+      |     64-bit CPIO (070764) + 2.0s UDP ARP keepalive         |
+      |<=========================================================>|  45+ MB/s
+      |  4. Optional SOCKS5 / HTTP CONNECT proxy on port 1080     |
+      |<--------------------------------------------------------->|
+      |  5. Clean Wi-Fi Direct teardown + CoreWLAN restore        |
+      |     + Optional Apple Vision OCR / Ollama / Claude summary |
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for wire framing, CPIO headers, and proxy lifecycle details.
+
+## Key Technical Details
+
+| Component | Behavior in v2.4.1 | Source |
+| :--- | :--- | :--- |
+| **Radio Discovery & Fallback** | Discovers peers over Bluetooth Low Energy L2CAP CoC without a router. Transfers of 64 KiB or more negotiate a 5 GHz Band 4 Wi-Fi Direct group; smaller items, URLs, or unreachable Wi-Fi Direct peers fall back to encrypted BLE L2CAP (`ADRE`, capped at 30 MB on Android). | [`AirDropNode.kt`](android/app/src/main/java/com/airdrop/p2p/AirDropNode.kt), [`mac-ble-airdrop.swift`](macos/mac-ble-airdrop.swift) |
+| **64-bit Large File Streaming** | Streams files up to 8 GiB with POSIX `070707` CPIO headers and automatically switches to 64-bit extended `070764` CPIO headers above 8 GiB so 10 GB+ files move directly from file descriptors without memory buffering. | [`AirDropCodec.kt`](android/app/src/main/java/com/airdrop/p2p/AirDropCodec.kt), [`mac-airdrop-p2p.sh`](macos/mac-airdrop-p2p.sh) |
+| **Mac Internet Sharing Proxy** | Because macOS temporarily switches off its router Wi-Fi to join Android's `DIRECT-*` network, Android runs an embedded dual-protocol SOCKS5 and HTTP `CONNECT` proxy on port `1080` (toggleable under Settings). macOS snapshots prior proxy settings under an advisory file lock, applies the proxy without `sudo`, and restores everything afterward. | [`EmbeddedProxyServer.kt`](android/app/src/main/java/com/airdrop/p2p/EmbeddedProxyServer.kt), [`mac-ble-airdrop.swift`](macos/mac-ble-airdrop.swift) |
+| **Kernel Stall & VPN Handling** | Bidirectional 2.0s UDP keepalives reset Android's Linux neighbor cache (`NUD_REACHABLE`) so multi-gigabyte streams do not stall around 35 seconds. On macOS, Cloudflare WARP (`warp-cli`) is paused cleanly before joining the offline P2P SSID and resumed after completion. | [`AirDropNode.kt`](android/app/src/main/java/com/airdrop/p2p/AirDropNode.kt), [`mac-ble-airdrop.swift`](macos/mac-ble-airdrop.swift) |
+| **Cryptography & Pinning** | `W2P2` negotiates ephemeral ECDH P-256 (`secp256r1`) session keys to encrypt Wi-Fi Direct credentials with AES-256-GCM and exchanges SHA-256 TLS certificate fingerprints for pinning on `TLSv1.3`/`TLSv1.2` transfers. Mac always asks before joining a new Wi-Fi Direct group. | [`AirDropNode.kt`](android/app/src/main/java/com/airdrop/p2p/AirDropNode.kt), [`AirDropSecurityTest.kt`](android/app/src/test/java/com/airdrop/p2p/AirDropSecurityTest.kt) |
+
+## Comparison With Other Transfer Methods
+
+| Method | Shared Wi-Fi Required | USB Cable | Typical Speed | File Size Cap | Trade-offs |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **AirDrop P2P** | No | No | 45+ MB/s (5 GHz) | None (64-bit CPIO) | Requires installing the app on Android and Mac |
+| **LAN Tools (LocalSend / Snapdrop)** | Yes | No | Router dependent | Device memory / app dependent | Fails when devices sit on different networks or AP client isolation is on |
+| **USB / MTP** | No | Yes | 20 to 40 MB/s | None | Needs a cable and third-party MTP software on macOS |
+| **Cloud Drives / Chat Apps** | Internet on both | No | Upload speed bound | 2 to 15 GB | Uploads to remote servers and uses cellular or home bandwidth |
+
+## Measured 5 GHz Performance
+
+Measured on pure 5 GHz Wi-Fi Direct (Band 4, 80 MHz channel width) with 1 MiB chunk framing and 4 MiB socket buffers:
+
+| Payload Size | Elapsed Time | Average Speed | Notes |
+| :--- | :--- | :--- | :--- |
+| **100 MB** (Photos / Documents) | ~2.1 s | 47.6 MB/s | Verified |
+| **1.50 GB** (Video Clip) | ~32.8 s | 45.7 MB/s | Verified |
+| **3.00 GB** (1080p Film) | ~66.2 s | 45.3 MB/s | Continuous stream, no stall |
+| **10.0+ GB** (Large Media Archive) | ~221.0 s | 45.2 MB/s | Extended `070764` CPIO stream |
+
+## Build From Source
 
 ### Prerequisites
 
-* **Android**: Android 12 (API level 31) or newer with Wi-Fi Direct and BLE support.
-* **macOS**: macOS 13 (Ventura), macOS 14 (Sonoma), or macOS 15 (Sequoia). Works on Apple Silicon (M1/M2/M3/M4) and Intel Macs.
-* **Tools**:
-  * macOS: Xcode Command Line Tools (`xcode-select --install`) and Python 3.9+.
-  * Android: Android Studio or JDK 17+ with the Android SDK.
+* **Android**: Android 12 (API level 31) or newer with BLE and Wi-Fi Direct hardware; JDK 17+ and Android SDK (compileSdk 36) to build.
+* **macOS**: macOS 13 Ventura or newer on Apple Silicon or Intel; Xcode Command Line Tools (`xcode-select --install`) and Python 3.9+ to build.
 
----
+### 1. macOS App & CLI Daemon
 
-### Installation
-
-#### 1. macOS Receiver & Daemon
-
-Build and package the native daemon:
+Compile `AirDrop P2P.app` and install the local binary into `~/.airdrop-p2p`:
 
 ```bash
 cd macos
@@ -119,101 +103,74 @@ chmod +x build.sh mac-airdrop-p2p.sh
 ./build.sh
 ```
 
-To start the background daemon:
+Control the background receiver from the terminal if preferred over the GUI app:
 
 ```bash
-./mac-airdrop-p2p.sh on
+./mac-airdrop-p2p.sh on      # start receiver and BLE daemon
+./mac-airdrop-p2p.sh status  # inspect running ports and PIDs
+./mac-airdrop-p2p.sh send    # send Finder selection or pick files
+./mac-airdrop-p2p.sh off     # stop all daemons
 ```
 
-To check daemon status:
+### 2. Android Client
 
-```bash
-./mac-airdrop-p2p.sh status
-```
-
-To stop the daemon:
-
-```bash
-./mac-airdrop-p2p.sh off
-```
-
-#### 2. Android Client
-
-Build and install the debug APK:
+Build the APK and run unit tests with Gradle:
 
 ```bash
 cd android
+./gradlew testDebugUnitTest
 ./gradlew assembleDebug
 adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 ```
 
----
+### 3. Deterministic Release Packaging
 
-## Claude AI Ingestion Engine
-
-AirDrop P2P features an automated AI processing pipeline that analyzes files as soon as they are received on macOS:
-
-* **Images (`.png`, `.jpg`, `.webp`)**: Runs Claude 3.5 Sonnet Vision to extract text (OCR), transcribe tables and receipts, or describe UI screens.
-* **Documents & Code (`.pdf`, `.txt`, `.md`, `.py`, `.kt`, `.json`)**: Generates a structured summary, key takeaways, and semantic topic tags.
-* **Output**: Writes a companion `<filename>.claude.md` alongside the downloaded file in `~/Downloads`.
-
-### Configuring Claude AI
-
-Set your Anthropic API key in your environment:
+To generate versioned `.apk`, `.dmg`, `.pkg`, and `SHA256SUMS.txt` artifacts under `release/`:
 
 ```bash
-export ANTHROPIC_API_KEY="your-anthropic-api-key"
+./scripts/build-release.sh
 ```
 
-Or save it permanently to the local config:
+## Optional File Analysis (Local or Claude API)
+
+`macos/claude_processor.py` can write a companion `<filename>.claude.md` summary alongside files received in `~/Downloads`. This hook is **disabled by default** so nothing leaves your Mac unless you opt in.
+
+When enabled without an API key, the local offline path uses macOS Apple Vision OCR for images, structural code/text outlines, and a local Ollama server (`http://localhost:11434`, preferring `llama3.2`, `llama3.1`, `llama3`, `mistral`, `qwen2.5`, or `phi3`).
+
+If you configure an Anthropic key, `claude_processor.py` runs a Privacy Guard before any upload: it blocks `.pem`, `.key`, `.env*`, SSH keys, certificate stores, and text files containing private key headers or API token patterns (`sk-ant-`, `sk-`, `AKIA`, `ghp_`, `xoxb-`).
 
 ```bash
+# Enable local/offline processing or configure Anthropic Claude
+python3 macos/claude_processor.py --enable
 python3 macos/claude_processor.py --set-key "your-anthropic-api-key"
-```
 
-To verify connectivity:
-
-```bash
+# Verify API connectivity and run the 9-check privacy/OCR audit
 python3 macos/claude_processor.py --test
+python3 macos/claude_processor.py --audit
 ```
 
-#### Protocol Versioning & Advanced Features
-* **Protocol Version (`ANTHROPIC_VERSION`)**: In Anthropic's Messages REST API (`/v1/messages`), `2023-06-01` is the canonical protocol specification version identifier (similar to HTTP/1.1 or TLS 1.3). Future capability flags and features are negotiated via beta headers.
-* **Modern Model Configuration**: Default models use current active Anthropic endpoints (`claude-3-5-sonnet-latest` and `claude-3-5-haiku-latest`). Fallback models include `claude-3-opus-latest`. The integration includes automatic fallback across valid production models. Override anytime via:
-  ```bash
-  export ANTHROPIC_MODEL="claude-3-5-sonnet-latest"
-  export ANTHROPIC_FAST_MODEL="claude-3-5-haiku-latest"
-  export ANTHROPIC_BETA="prompt-caching-2024-07-31,pdfs-2024-09-25"
-  ```
+Optional model overrides (`ANTHROPIC_MODEL`, `ANTHROPIC_FAST_MODEL`, `ANTHROPIC_OPUS_MODEL`, `ANTHROPIC_VERSION`, `ANTHROPIC_BETA`, `OLLAMA_HOST`) default to `claude-3-5-sonnet-latest`, `claude-3-5-haiku-latest`, and `claude-3-opus-latest` with automatic fallback if a model returns HTTP 404/429/529.
 
----
+## FAQ
 
-## Usage
+**Can I transfer files from Mac to Android as well as Android to Mac?**
+Yes. Both apps act as sender and receiver. On Mac, drag files onto the menu bar icon or the Send tab, click a file category, import the current Finder selection or clipboard, or share through Finder's AirDrop menu when an Android peer is nearby.
 
-1. Open the **AirDrop P2P** app on your Android device.
-2. Select any file, video, or photo in your gallery/file manager and tap **Share** -> **AirDrop P2P**.
-3. Your Mac will appear in the peer radar. Tap your Mac's name to begin the transfer.
-4. The file will transfer at 45+ MB/s directly into `~/Downloads`.
-5. If Claude AI is configured, a structured `.claude.md` summary will be generated immediately after reception.
+**Why does AirDrop P2P ask before joining a Wi-Fi network on Mac?**
+Leaving your home Wi-Fi to join an unknown `DIRECT-*` hotspot without confirmation would let any nearby BLE broadcaster redirect your Mac's network traffic. Mac therefore always prompts before joining a Wi-Fi Direct SSID, even when auto-accept is turned on for incoming files.
 
----
+**How do I keep internet access on my Mac during a large transfer?**
+Open **Settings** on the Android app and make sure **Mac Internet Sharing Proxy** is set to **Share Internet**. Android starts an SSRF-filtered SOCKS5 and HTTP `CONNECT` proxy on port `1080` bound to your active cellular or internet interface, and macOS configures and tears down system proxy settings automatically without `sudo`.
 
-## Security & Privacy
+**Where do received files go?**
+macOS writes received files to `~/Downloads` (with duplicate filename numbering and `com.apple.quarantine` attributes set). Android writes received files to `Downloads/AirDrop` and triggers Android's MediaScanner so photos and videos show up in your gallery.
 
-* **Direct Point-to-Point**: Files travel directly over encrypted peer-to-peer Wi-Fi frames without passing through external routers or cloud intermediaries.
-* **End-to-End Encryption**: BLE handshakes and HTTPS transports utilize ephemeral ECDH key pairs (curve P-256) and AES-GCM-256.
-* **Ephemeral Credentials**: Wi-Fi Direct passphrases are generated randomly per session and purged immediately upon connection teardown.
+## Security & Contributing
 
----
-
-## Contributing & Security
-
-* **Contributing**: Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, development guidelines, and pull request procedures.
-* **Security & Vulnerabilities**: Please review [SECURITY.md](SECURITY.md) for our security architecture, public beta boundary advisory, and responsible disclosure process.
-
----
+* **Security Architecture & Disclosure**: Read [SECURITY.md](SECURITY.md) for the four-layer threat model, SSRF controls, and vulnerability disclosure process.
+* **Contributing**: Read [CONTRIBUTING.md](CONTRIBUTING.md) for repository layout, coding conventions, and local test commands.
+* **Release History**: See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
-
+MIT License. See [LICENSE](LICENSE).

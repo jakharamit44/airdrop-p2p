@@ -42,12 +42,12 @@ def generate_release_body(version: str) -> str:
 
     body = f"""# AirDrop P2P v{version}
 
-Pure peer-to-peer AirDrop between macOS and all modern Android devices.
+Pure peer-to-peer AirDrop between macOS and Android devices over BLE and 5 GHz Wi-Fi Direct.
 
 {notes}
 
 ### Release Assets
-- `AirDrop-P2P-v{version}.apk`: Universal Android application (API 29+).
+- `AirDrop-P2P-v{version}.apk`: Universal Android application (Android 12+ / API 31+).
 - `AirDrop-P2P-v{version}.pkg`: macOS Native Installer package (installs directly to /Applications and auto-unquarantines; eliminates Gatekeeper "damaged" alert).
 - `AirDrop-P2P-v{version}.dmg`: macOS drag-and-drop application with built-in Gatekeeper launcher.
 - `SHA256SUMS.txt`: Cryptographic checksums.

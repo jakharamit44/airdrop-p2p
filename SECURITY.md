@@ -4,63 +4,46 @@
 
 > [!WARNING]
 > **Active Public Beta Stage (v2.4.1)**
-> AirDrop P2P is currently in active public beta. While the core peer-to-peer transport protocols (BLE L2CAP, 5GHz Wi-Fi Direct, TLS 1.3) are functional and hardened, protocol edge cases are being actively discovered and resolved.
-> 
-> * Do not use for transferring highly sensitive or unencrypted regulated data in hostile RF environments.
-> * Always verify the identity of the discovered peer before accepting incoming transfers.
-> * Maintain awareness of your RF environment when operating in public spaces.
-
----
+> Core peer-to-peer protocols (BLE L2CAP, ECDH P-256 credential exchange, pinned TLS 1.2/1.3, 5 GHz Wi-Fi Direct, and the embedded proxy) are functional and backed by automated tests, while hardware and OS edge cases are still being refined.
+>
+> * Do not transfer unencrypted regulated data in hostile RF environments.
+> * Verify the peer device name before accepting incoming transfers or Wi-Fi Direct prompts.
 
 ## Supported Versions
 
 | Version | Supported | Status |
 | :--- | :--- | :--- |
-| **2.4.x** | :white_check_mark: | Active Beta |
-| < 2.4.0 | :x: | Deprecated (Unsupported) |
+| **2.4.x** | Yes | Active Beta |
+| **< 2.4.0** | No | Unsupported |
 
----
+## Threat Model & Security Controls
 
-## Threat Model & Security Architecture
+### 1. BLE Discovery & Key Agreement (`W2P2`)
+* **Ephemeral ECDH P-256**: During Wi-Fi Direct negotiation, Android and macOS generate ephemeral `secp256r1` keypairs, derive a 32-byte session key (`SHA-256(shared_secret || "AirDropP2P-v2-SessionKey")`), and encrypt the Wi-Fi Direct SSID and WPA2 passphrase with AES-256-GCM.
+* **Explicit Wi-Fi Join Consent**: On macOS, `handleIncomingWp2pJoin` requires user approval (`forcePrompt: true`) even when `autoAccept` is turned on for files, preventing silent Wi-Fi hijacking by nearby BLE senders.
+* **Bounded BLE Frames**: Both sides enforce size ceilings on incoming BLE L2CAP headers, and encrypted BLE fallback archives on Android are capped at 30 MB.
 
-AirDrop P2P operates across four distinct defensive layers:
+### 2. 5 GHz Wi-Fi Direct & Transport Layer
+* **Ephemeral Credentials**: Per-session Wi-Fi Direct passphrases are generated using platform CSPRNGs (`SecureRandom` on Android, `arc4random_buf` / system P2P stack) and purged after completion or cancellation (`DIRECT-*` entries removed from preferred wireless networks on macOS).
+* **Pinned TLS Certificates**: Both peers exchange SHA-256 fingerprints of their local self-signed EC P-256 TLS certificates inside the BLE handshake and verify them during `TLSv1.3`/`TLSv1.2` connections on `/Discover`, `/Ask`, and `/Upload`.
+* **Port Confinement**: The macOS HTTPS receiver (`8772`) and Android HTTPS receiver (`8771`) reject connections outside `192.168.49.x` and loopback (unless a time-bounded fallback flag is active). The macOS Finder AWDL proxy (`8773`) binds strictly to `127.0.0.1`.
 
-### 1. Radio Layer (BLE L2CAP)
-* **Out-of-Band Channel Negotiation**: macOS and Android exchange channel parameters (L2CAP PSM, Wi-Fi Direct SSID, WPA2 passphrase) over direct Bluetooth Low Energy.
-* **Payload Encryption**: Out-of-band BLE payload blocks are encrypted with AES-256-GCM using ephemeral session keys.
-* **Scan Isolation**: Advertisements use compact service UUIDs to avoid leaking user identifiable metadata.
+### 3. Embedded Internet Proxy (`EmbeddedProxyServer.kt`)
+* **Client Allowlist**: Port `1080` accepts connections strictly from `192.168.49.0/24` and loopback (`127.0.0.1`, `::1`), capped at 128 concurrent clients and 8,192-byte HTTP header blocks.
+* **SSRF Prevention**: Hostnames and post-DNS resolved IP addresses are checked to block loopback and `192.168.49.0/24` targets on sensitive ports (`8771`, `1080`).
+* **Advisory Proxy Lock on macOS**: `mac-ble-airdrop.swift` snapshots and restores existing `networksetup` proxy settings under an advisory `flock` lock (`proxy_state.lock`) and only touches loopback port `1080` on crash cleanup without a snapshot.
 
-### 2. Transport Layer (5GHz Wi-Fi Direct)
-* **Ephemeral Credentials**: Wi-Fi Direct group owner passphrases are randomly generated per session using cryptographic random byte generators (`java.security.SecureRandom` on Android, `arc4random_buf` on macOS).
-* **Credential Zeroing**: Wi-Fi credentials are deleted from persistent storage immediately upon transfer completion or cancellation. Ephemeral `DIRECT-*` networks are purged from the macOS preferred wireless networks list.
-* **Air-Gapped Operation**: Transfers require zero Internet access, zero cellular data, and zero shared local router access.
-
-### 3. Application Layer (HTTP / TLS / Archive Codec)
-* **TLS 1.3 Transport**: Point-to-point HTTP requests (`/Discover`, `/Ask`, `/Upload`) operate over dedicated TLS sockets.
-* **Path Traversal & CPIO Slip Defense**: File extraction in both Android and macOS implementations strictly verifies canonical file path boundaries (`File.canonicalPath.startsWith(destDir.canonicalPath)`). Any archive entry containing directory traversal elements (`../`, absolute paths, null bytes) is rejected with a `SecurityException`.
-* **Bounded Deserialization**: Binary plist decoders (`bplist00`) enforce recursion depth limits and payload size ceilings to mitigate deserialization memory exhaustion attacks.
-* **Process Execution Safety**: All system utility invocations (e.g. `osascript`, `networksetup`) pass arguments strictly via argv arrays (`on run argv`) without shell string interpolation, eliminating subprocess injection risks.
-
-### 4. Claude AI & API Credential Safety
-* **Local Storage Isolation**: Configuration files (`~/.airdrop-p2p/claude_config.json`) are stored with strict file permissions (`0o600` for files, `0o700` for directories).
-* **Zero Dependency Ingestion**: The Claude ingestion processor uses Python standard library `urllib` without unverified third-party HTTP client libraries.
-* **Payload Ceilings**: Files processed by Claude AI are bounded by strict payload guards (`MAX_IMAGE_BYTES = 15 MB`, `MAX_TEXT_CHARS = 120,000`) to prevent API credit exhaustion and out-of-memory crashes.
-
----
+### 4. Archive Extraction, URLs & AI Sidecars
+* **Path Traversal Protection**: CPIO extractors verify canonical destination paths (`File.canonicalPath.startsWith(destDirCanonical)` on Android, `target.resolve().parent == dest_dir.resolve()` on macOS), strip leading dots/separators, and stage writes via `.part` files.
+* **Safe URL Handling**: Incoming URLs are regex-validated (`http://` or `https://`), copied to the macOS clipboard, and presented in a confirmation dialog rather than auto-launched.
+* **Subprocess & OCR Safety**: System tools (`osascript`, `networksetup`, `/usr/bin/swift` Vision OCR) receive arguments via argv arrays without shell string interpolation.
+* **AI Privacy Guard (Opt-In Only)**: Cloud processing is off by default (`is_claude_enabled()`). When enabled, `claude_processor.py` blocks `.pem`, `.key`, `.env*`, SSH keys, and files containing private key headers or API token patterns from leaving the device, and offers an offline path via Apple Vision OCR and local Ollama (`localhost:11434`). Config files use `0o600` inside `0o700` `~/.airdrop-p2p`.
 
 ## Reporting a Vulnerability
 
-We appreciate responsible disclosure of security vulnerabilities:
+Please report security issues privately rather than opening a public issue:
 
-1. **Email Disclosure**: Email security reports directly to `jakharamit44@gmail.com`.
-2. **GitHub Private Vulnerability Reporting**: Submit an advisory through [GitHub Security Advisories](https://github.com/jakharamit44/airdrop-p2p/security/advisories/new).
-3. **Response Timeline**:
-   * **Acknowledgment**: Within 48 hours.
-   * **Triage & Assessment**: Within 5 business days.
-   * **Patch Release**: Bounded security fixes are prioritized for release within 14 business days.
+1. **GitHub Private Reporting**: Open an advisory at [GitHub Security Advisories](https://github.com/jakharamit44/airdrop-p2p/security/advisories/new).
+2. **Email**: Contact `jakharamit44@gmail.com`.
 
-Please include:
-* Description of the vulnerability and attack vector.
-* Reproducible proof-of-concept steps or payload.
-* Affected platform and version (Android version, macOS version, hardware architecture).
-
+Target response times: initial acknowledgment within 48 hours, triage within 5 business days, and prioritized fixes for confirmed vulnerabilities within 14 business days. Please include attack vector details, reproduction steps, and OS/version information.
