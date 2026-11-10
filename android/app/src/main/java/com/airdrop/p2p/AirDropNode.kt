@@ -87,6 +87,7 @@ import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.SecureRandom
+import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.X509EncodedKeySpec
@@ -103,6 +104,7 @@ import javax.net.ssl.SSLPeerUnverifiedException
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManager
+import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 import javax.security.auth.x500.X500Principal
 
@@ -155,6 +157,42 @@ data class TransferProgress(
  * - Zero Same-IP / LAN router mDNS dependency
  */
 class AirDropNode(private val context: Context) {
+
+    /**
+     * Strict X509TrustManager enforcing exact SHA-256 leaf certificate pinning
+     * negotiated out-of-band during the ECDH-authenticated BLE W2P2 handshake.
+     */
+    @SuppressLint("CustomX509TrustManager")
+    class PinnedTlsTrustManager(expectedFingerprint: String) : X509TrustManager {
+        private val expectedDigest: ByteArray = parseSha256FingerprintBytes(expectedFingerprint)
+
+        @Throws(CertificateException::class)
+        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+            throw CertificateException("Client certificates are not accepted by peer-pinning TrustManager")
+        }
+
+        @Throws(CertificateException::class)
+        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+            if (chain.isNullOrEmpty()) {
+                throw CertificateException("Server TLS certificate chain is empty")
+            }
+            val serverCert = chain[0]
+            val actualDigest = try {
+                MessageDigest.getInstance("SHA-256").digest(serverCert.encoded)
+            } catch (e: Exception) {
+                throw CertificateException("Unable to compute server TLS certificate fingerprint", e)
+            }
+            if (!MessageDigest.isEqual(actualDigest, expectedDigest)) {
+                val expectedHex = expectedDigest.joinToString("") { "%02x".format(it) }
+                val actualHex = actualDigest.joinToString("") { "%02x".format(it) }
+                throw CertificateException(
+                    "TLS certificate fingerprint pinning mismatch: expected $expectedHex, got $actualHex"
+                )
+            }
+        }
+
+        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+    }
 
     companion object {
         const val AIRDROP_PORT = 8771
@@ -231,6 +269,60 @@ class AirDropNode(private val context: Context) {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(sessionKeyBytes, "AES"), GCMParameterSpec(128, packet, 0, 12))
             return cipher.doFinal(packet, 12, packet.size - 12)
+        }
+
+        fun parseW2P2Line(line: String): Pair<String, String?> {
+            val rawParts = line.trimStart('\t').split('\t')
+            val parts = rawParts.filter { it.isNotEmpty() }
+            return when {
+                parts.size >= 3 && (parts[0] == "2" || parts[0] == "1") -> parts[1] to parts[2]
+                parts.size == 2 && (parts[0] == "2" || parts[0] == "1") -> parts[1] to null
+                parts.size >= 2 -> parts[0] to parts[1]
+                parts.size == 1 -> parts[0] to null
+                else -> "" to null
+            }
+        }
+
+        fun normalizeTlsFingerprint(raw: String): String {
+            return raw.replace(":", "").replace("-", "").trim().lowercase(java.util.Locale.US)
+        }
+
+        fun parseSha256FingerprintBytes(raw: String): ByteArray {
+            val hex = normalizeTlsFingerprint(raw)
+            require(hex.length == 64 && hex.all { it in '0'..'9' || it in 'a'..'f' }) {
+                "Invalid SHA-256 TLS certificate fingerprint"
+            }
+            return ByteArray(32) { idx ->
+                val hi = Character.digit(hex[idx * 2], 16)
+                val lo = Character.digit(hex[idx * 2 + 1], 16)
+                ((hi shl 4) or lo).toByte()
+            }
+        }
+
+        fun sha256FingerprintHex(cert: X509Certificate): String {
+            val digest = MessageDigest.getInstance("SHA-256").digest(cert.encoded)
+            return digest.joinToString("") { "%02x".format(it) }
+        }
+
+        fun buildPinnedClientSslContext(
+            pinnedFingerprint: String,
+            secureRandom: SecureRandom = SecureRandom()
+        ): SSLContext {
+            val trustManagers = arrayOf<TrustManager>(PinnedTlsTrustManager(pinnedFingerprint))
+            return SSLContext.getInstance("TLS").apply {
+                init(null, trustManagers, secureRandom)
+            }
+        }
+
+        fun buildDefaultClientSslContext(
+            secureRandom: SecureRandom = SecureRandom()
+        ): SSLContext {
+            val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
+                init(null as KeyStore?)
+            }
+            return SSLContext.getInstance("TLS").apply {
+                init(null, tmf.trustManagers, secureRandom)
+            }
         }
 
         fun formatBytes(bytes: Long): String {
@@ -448,6 +540,7 @@ class AirDropNode(private val context: Context) {
         runCatching { activeTransferSocket?.close() }
         activeTransferSocket = null
         lastMacP2pIp = ""
+        lastMacTlsFingerprint = ""
         stopWifiDirectGroup()
         log("Transfer cancelled by user")
     }
@@ -592,7 +685,7 @@ class AirDropNode(private val context: Context) {
         onTransferProgress?.invoke(label, pct, done, total, speedBps, isSending, false, phaseLabel)
     }
 
-    private val sslContext: SSLContext by lazy { buildSslContext() }
+    private val serverSslContext: SSLContext by lazy { buildServerSslContext() }
     private var serverSocket: SSLServerSocket? = null
     private var bleAdvertiser: BluetoothLeAdvertiser? = null
     private val activeAdvertiseCallbacks = Collections.synchronizedList(mutableListOf<AdvertiseCallback>())
@@ -614,6 +707,8 @@ class AirDropNode(private val context: Context) {
     private var learnedMacName: String? = null
     @Volatile
     private var lastMacP2pIp: String = ""
+    @Volatile
+    private var lastMacTlsFingerprint: String = ""
     private var wifiTeardownJob: Job? = null
 
     private class PendingMacTx(
@@ -1144,6 +1239,7 @@ class AirDropNode(private val context: Context) {
         }
         wifiDirectCreds = ""
         lastMacP2pIp = ""
+        lastMacTlsFingerprint = ""
         if (localBlePsm > 0) {
             _p2pStatus.value = "BLE PSM $localBlePsm • 5GHz On-Demand Ready"
         }
@@ -1198,13 +1294,9 @@ class AirDropNode(private val context: Context) {
 
     fun getLocalTlsFingerprint(): String {
         return try {
-            val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-            val cert = (ks.getCertificate(KEYSTORE_ALIAS) ?: run {
-                buildSslContext()
-                ks.getCertificate(KEYSTORE_ALIAS)
-            }) as? X509Certificate ?: return ""
-            val md = MessageDigest.getInstance("SHA-256").digest(cert.encoded)
-            md.joinToString("") { "%02x".format(it) }
+            val ks = getOrCreateIdentityKeyStore()
+            val cert = ks.getCertificate(KEYSTORE_ALIAS) as? X509Certificate ?: return ""
+            sha256FingerprintHex(cert)
         } catch (_: Throwable) {
             ""
         }
@@ -1324,7 +1416,10 @@ class AirDropNode(private val context: Context) {
                                                             val macIp = joinReply.removePrefix("OK ").trim()
                                                             if (isValidPeerTransferIp(macIp)) {
                                                                 wp2pJoined = true
-                                                                if (macIp.startsWith("192.168.49.")) lastMacP2pIp = macIp
+                                                                if (macIp.startsWith("192.168.49.")) {
+                                                                    lastMacP2pIp = macIp
+                                                                    lastMacTlsFingerprint = pinnedPeerFingerprint.orEmpty()
+                                                                }
                                                                 log("Mac ready at $macIp:8772 (TLS pinned: $pinnedPeerFingerprint) — streaming over 5GHz Wi-Fi…")
                                                                 txOk = sendOverWifiDirectHttps(macIp, 8772, tx.metaBytes, tx.archiveBytes, tx.entries, tx.url, tx.label, tx.fileCount, pinnedPeerFingerprint)
                                                                 runCatching {
@@ -1351,6 +1446,7 @@ class AirDropNode(private val context: Context) {
                                                         wp2pJoined = true
                                                         if (macIp.startsWith("192.168.49.")) {
                                                             lastMacP2pIp = macIp
+                                                            lastMacTlsFingerprint = ""
                                                         }
                                                         log("Mac ready at $macIp:8772 — streaming over 5GHz Wi-Fi…")
                                                         txOk = sendOverWifiDirectHttps(
@@ -1469,19 +1565,10 @@ class AirDropNode(private val context: Context) {
                 }
                 if (magicStr == "W2P2") {
                     val reqLine = readHttpLine(dis).orEmpty()
-                    val rawParts = reqLine.trimStart('\t').split('\t')
-                    val parts = rawParts.filter { it.isNotEmpty() }
-                    val (macPubB64, macCertFingerprint) = when {
-                        parts.size >= 3 && (parts[0] == "2" || parts[0] == "1") -> parts[1] to parts[2]
-                        parts.size == 2 && (parts[0] == "2" || parts[0] == "1") -> parts[1] to null
-                        parts.size >= 2 -> parts[0] to parts[1]
-                        parts.size == 1 -> parts[0] to null
-                        else -> "" to null
-                    }
+                    val (macPubB64, macCertFingerprint) = parseW2P2Line(reqLine)
                     if (macPubB64.isNotEmpty()) {
                         try {
                             val macPubBytes = Base64.getDecoder().decode(macPubB64)
-                            val macCertFingerprint = parts.getOrNull(1)?.trim()
                             reportConnecting(
                                 label = "Incoming transfer",
                                 total = 0L,
@@ -1501,6 +1588,7 @@ class AirDropNode(private val context: Context) {
                                 val encCredsB64 = Base64.getEncoder().encodeToString(encCreds)
                                 out.write("OK\t$androidPubB64\t$encCredsB64\n".toByteArray(StandardCharsets.UTF_8))
                                 out.flush()
+                                lastMacTlsFingerprint = macCertFingerprint?.trim().orEmpty()
                                 reportConnecting(
                                     label = "Incoming transfer",
                                     total = 0L,
@@ -1527,6 +1615,7 @@ class AirDropNode(private val context: Context) {
                     continue
                 }
                 if (magicStr == "WP2P") {
+                    lastMacTlsFingerprint = ""
                     val isAuthorized = (pendingMacTx != null && (pendingMacTx?.targetPeerAddress == null || pendingMacTx?.targetPeerAddress == remoteAddr)) ||
                                        (learnedMacName != null && bleMacDevice?.address == remoteAddr)
                     if (isAuthorized) {
@@ -1789,15 +1878,17 @@ class AirDropNode(private val context: Context) {
                     startWifiDirectGroup()
                 }
 
-                // 1. Fast path: if Mac is already joined to our 5GHz Wi-Fi Direct group, stream directly at 5GHz speed!
+                // 1. Fast path: if Mac is already joined to our 5GHz Wi-Fi Direct group with a pinned fingerprint, stream directly at 5GHz speed!
                 val cachedIp = lastMacP2pIp
-                if (cachedIp.startsWith("192.168.49.")) {
+                val cachedFp = lastMacTlsFingerprint
+                if (cachedIp.startsWith("192.168.49.") && cachedFp.isNotBlank()) {
                     reportConnecting(label, totalRawBytes, fileCount, isSending = true, phase = "Connecting over 5GHz Wi-Fi Direct…", peerName = targetPeerLabel)
                     log("Streaming directly over active 5GHz Wi-Fi Direct link ($cachedIp:8772)…")
-                    if (sendOverWifiDirectHttps(cachedIp, 8772, metaBytes, archiveBytes, entries, url, label, fileCount)) {
+                    if (sendOverWifiDirectHttps(cachedIp, 8772, metaBytes, archiveBytes, entries, url, label, fileCount, cachedFp)) {
                         return@withLock true
                     }
                     lastMacP2pIp = ""
+                    lastMacTlsFingerprint = ""
                 }
 
                 // 2. Queue transfer for Mac's 1.5s BLE L2CAP heartbeat (works even when Android BLE scan is blocked by OS Location toggle)
@@ -1891,7 +1982,10 @@ class AirDropNode(private val context: Context) {
                                                         if (joinReply.startsWith("OK ")) {
                                                             val macIp = joinReply.removePrefix("OK ").trim()
                                                             if (isValidPeerTransferIp(macIp)) {
-                                                                if (macIp.startsWith("192.168.49.")) lastMacP2pIp = macIp
+                                                                if (macIp.startsWith("192.168.49.")) {
+                                                                    lastMacP2pIp = macIp
+                                                                    lastMacTlsFingerprint = pinnedPeerFingerprint.orEmpty()
+                                                                }
                                                                 log("Mac ready at $macIp:8772 (TLS pinned: $pinnedPeerFingerprint) — streaming over 5GHz Wi-Fi…")
                                                                 val p2pOk = sendOverWifiDirectHttps(macIp, 8772, metaBytes, archiveBytes, entries, url, label, fileCount, pinnedPeerFingerprint)
                                                                 runCatching {
@@ -1922,6 +2016,7 @@ class AirDropNode(private val context: Context) {
                                                 if (isValidPeerTransferIp(macIp)) {
                                                     if (macIp.startsWith("192.168.49.")) {
                                                         lastMacP2pIp = macIp
+                                                        lastMacTlsFingerprint = ""
                                                     }
                                                     log("Mac ready at $macIp:8772 — streaming over 5GHz Wi-Fi…")
                                                     val p2pOk = sendOverWifiDirectHttps(macIp, 8772, metaBytes, archiveBytes, entries, url, label, fileCount, null)
@@ -2081,7 +2176,12 @@ class AirDropNode(private val context: Context) {
         var writeWatchdogJob: Job? = null
         var txSuccess = false
         return try {
-            val sslCtx = sslContext
+            val normalizedPin = pinnedFingerprint?.let { normalizeTlsFingerprint(it) }.orEmpty()
+            val sslCtx = if (normalizedPin.isNotEmpty()) {
+                buildPinnedClientSslContext(normalizedPin, random)
+            } else {
+                buildDefaultClientSslContext(random)
+            }
             var rawSock: Socket? = null
             var lastConnErr: Throwable? = null
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
@@ -2156,17 +2256,24 @@ class AirDropNode(private val context: Context) {
                 (sslCtx.socketFactory.createSocket(raw, host, port, true) as SSLSocket).use { tls ->
                     activeTransferSocket = tls
                     configureHighThroughputTls(tls)
+                    if (normalizedPin.isEmpty()) {
+                        tls.sslParameters = tls.sslParameters.apply {
+                            endpointIdentificationAlgorithm = "HTTPS"
+                        }
+                    }
                     tls.startHandshake()
-                    if (!pinnedFingerprint.isNullOrBlank()) {
+                    if (normalizedPin.isNotEmpty()) {
                         val peerCerts = tls.session.peerCertificates
                         val serverCert = peerCerts.firstOrNull() as? X509Certificate
                             ?: throw SSLPeerUnverifiedException("No server certificate presented by $host:$port")
-                        val sha256 = MessageDigest.getInstance("SHA-256").digest(serverCert.encoded)
-                        val actualFp = sha256.joinToString("") { "%02x".format(it) }.lowercase()
-                        val expectedFp = pinnedFingerprint.replace(":", "").replace("-", "").trim().lowercase()
-                        if (actualFp != expectedFp) {
-                            log("FATAL: TLS certificate fingerprint pinning mismatch! Expected: $expectedFp, Actual: $actualFp")
-                            throw SSLPeerUnverifiedException("Certificate fingerprint pinning failed! Expected $expectedFp, got $actualFp")
+                        val actualFp = sha256FingerprintHex(serverCert)
+                        if (!MessageDigest.isEqual(
+                                actualFp.toByteArray(StandardCharsets.US_ASCII),
+                                normalizedPin.toByteArray(StandardCharsets.US_ASCII)
+                            )
+                        ) {
+                            log("FATAL: TLS certificate fingerprint pinning mismatch! Expected: $normalizedPin, Actual: $actualFp")
+                            throw SSLPeerUnverifiedException("Certificate fingerprint pinning failed! Expected $normalizedPin, got $actualFp")
                         }
                         log("TLS certificate fingerprint pinned and verified: $actualFp")
                     }
@@ -2374,6 +2481,7 @@ class AirDropNode(private val context: Context) {
             releaseTransferLocks()
             activeTransferSocket = null
             lastMacP2pIp = ""
+            lastMacTlsFingerprint = ""
             // Tear down ephemeral 5GHz Wi-Fi Direct group immediately if cancelled or failed, or after grace period on success
             if (host.startsWith("192.168.49.")) {
                 wifiTeardownJob?.cancel()
@@ -2432,12 +2540,12 @@ class AirDropNode(private val context: Context) {
     private fun startHttpsReceiver() {
         scope.launch {
             try {
-                val srv = sslContext.serverSocketFactory
+                val srv = serverSslContext.serverSocketFactory
                     .createServerSocket() as SSLServerSocket
                 srv.reuseAddress = true
                 runCatching { srv.receiveBufferSize = 4_194_304 }
                 srv.bind(InetSocketAddress(AIRDROP_PORT), 32)
-                srv.wantClientAuth = true
+                srv.wantClientAuth = false
                 srv.needClientAuth = false
                 serverSocket = srv
                 log("5GHz P2P HTTPS receiver listening on port $AIRDROP_PORT")
@@ -2729,6 +2837,7 @@ class AirDropNode(private val context: Context) {
             }
             if (didUpload || transferCancelled) {
                 lastMacP2pIp = ""
+                lastMacTlsFingerprint = ""
                 // Tear down ephemeral 5GHz Wi-Fi Direct group with grace period so consecutive transfers reuse group
                 wifiTeardownJob?.cancel()
                 wifiTeardownJob = scope.launch {
@@ -2922,8 +3031,7 @@ class AirDropNode(private val context: Context) {
     // TLS 1.2/1.3 & HTTP/1.1 Chunked Framing Helpers
     // =========================================================================
 
-    @SuppressLint("CustomX509TrustManager")
-    private fun buildSslContext(): SSLContext {
+    private fun getOrCreateIdentityKeyStore(): KeyStore {
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         if (!ks.containsAlias(KEYSTORE_ALIAS)) {
             val kpg = KeyPairGenerator.getInstance(
@@ -2949,20 +3057,19 @@ class AirDropNode(private val context: Context) {
             kpg.initialize(spec)
             kpg.generateKeyPair()
         }
+        return ks
+    }
+
+    private fun buildServerSslContext(): SSLContext {
+        val ks = getOrCreateIdentityKeyStore()
         val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply {
             init(ks, null)
         }
-        val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-                require(!chain.isNullOrEmpty()) { "Client TLS certificate chain is empty" }
-            }
-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-                require(!chain.isNullOrEmpty()) { "Server TLS certificate chain is empty" }
-            }
-            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
-        })
+        val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
+            init(null as KeyStore?)
+        }
         return SSLContext.getInstance("TLS").apply {
-            init(kmf.keyManagers, trustAll, random)
+            init(kmf.keyManagers, tmf.trustManagers, random)
         }
     }
 

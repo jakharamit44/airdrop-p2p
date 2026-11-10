@@ -830,7 +830,7 @@ def main():
         if not key:
             print("[-] No Anthropic API key configured. Set ANTHROPIC_API_KEY or use --set-key.")
             sys.exit(1)
-        print(f"[+] Verifying Claude API key (prefix: {key[:8]}...)...")
+        print("[+] Verifying configured Claude API key...")
         try:
             resp = call_claude_api(
                 messages=[{"role": "user", "content": "Respond with 'Claude API connection successful!' and nothing else."}],

@@ -11,18 +11,31 @@ import java.io.BufferedInputStream
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
+import java.io.File
 import java.math.BigInteger
+import java.net.InetAddress
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.security.AlgorithmParameters
 import java.security.KeyFactory
+import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.cert.CertificateException
+import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.ECParameterSpec
 import java.security.spec.ECPrivateKeySpec
 import java.security.spec.InvalidKeySpecException
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import javax.crypto.KeyAgreement
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLServerSocket
+import javax.net.ssl.SSLSocket
 
 class AirDropSecurityTest {
 
@@ -180,36 +193,23 @@ class AirDropSecurityTest {
 
     @Test
     fun w2p2PayloadParsingHandlesVersionedAndUnversioned() {
-        // Helper to test the parsing logic added to AirDropNode
-        fun parseW2P2Line(line: String): Pair<String, String?> {
-            val rawParts = line.trimStart('\t').split('\t')
-            val parts = rawParts.filter { it.isNotEmpty() }
-            return when {
-                parts.size >= 3 && (parts[0] == "2" || parts[0] == "1") -> parts[1] to parts[2]
-                parts.size == 2 && (parts[0] == "2" || parts[0] == "1") -> parts[1] to null
-                parts.size >= 2 -> parts[0] to parts[1]
-                parts.size == 1 -> parts[0] to null
-                else -> "" to null
-            }
-        }
-
         // 1. Version 2 format: "\t2\t<macPubB64>\t<fingerprint>"
-        val v2Res = parseW2P2Line("\t2\tPUB_KEY_B64\tFINGERPRINT_HEX")
+        val v2Res = AirDropNode.parseW2P2Line("\t2\tPUB_KEY_B64\tFINGERPRINT_HEX")
         assertEquals("PUB_KEY_B64", v2Res.first)
         assertEquals("FINGERPRINT_HEX", v2Res.second)
 
         // 2. Unversioned format: "\t<macPubB64>\t<fingerprint>"
-        val unvRes = parseW2P2Line("\tPUB_KEY_B64\tFINGERPRINT_HEX")
+        val unvRes = AirDropNode.parseW2P2Line("\tPUB_KEY_B64\tFINGERPRINT_HEX")
         assertEquals("PUB_KEY_B64", unvRes.first)
         assertEquals("FINGERPRINT_HEX", unvRes.second)
 
         // 3. Version without fingerprint: "\t2\t<macPubB64>"
-        val noFpRes = parseW2P2Line("\t2\tPUB_KEY_B64")
+        val noFpRes = AirDropNode.parseW2P2Line("\t2\tPUB_KEY_B64")
         assertEquals("PUB_KEY_B64", noFpRes.first)
         assertNull(noFpRes.second)
 
         // 4. Empty/whitespace string
-        val emptyRes = parseW2P2Line("")
+        val emptyRes = AirDropNode.parseW2P2Line("")
         assertEquals("", emptyRes.first)
         assertNull(emptyRes.second)
     }
@@ -276,5 +276,181 @@ class AirDropSecurityTest {
         // Multi-file label formatting
         assertEquals("photo.jpg", AirDropNode.formatMultiFileDisplayLabel("photo.jpg", 1))
         assertEquals("photo.jpg (+2 more)", AirDropNode.formatMultiFileDisplayLabel("photo.jpg", 3))
+    }
+
+    private fun generateTestKeyStore(alias: String, commonName: String): KeyStore {
+        val tmpDir = Files.createTempDirectory("airdrop-tls-test")
+        try {
+            val ksFile = tmpDir.resolve("$alias.p12").toFile()
+            val keytoolPath = File(System.getProperty("java.home"), "bin/keytool").absolutePath
+            val passStr = "test-keystore-pass"
+            val proc = ProcessBuilder(
+                keytoolPath,
+                "-genkeypair",
+                "-alias", alias,
+                "-keyalg", "EC",
+                "-groupname", "secp256r1",
+                "-sigalg", "SHA256withECDSA",
+                "-dname", "CN=$commonName",
+                "-validity", "365",
+                "-storetype", "PKCS12",
+                "-keystore", ksFile.absolutePath,
+                "-storepass", passStr,
+                "-keypass", passStr
+            )
+                .redirectErrorStream(true)
+                .start()
+            val output = proc.inputStream.bufferedReader().readText()
+            val rc = proc.waitFor()
+            require(rc == 0) { "keytool failed (exit $rc): $output" }
+            return KeyStore.getInstance("PKCS12").apply {
+                ksFile.inputStream().use { load(it, passStr.toCharArray()) }
+            }
+        } finally {
+            tmpDir.toFile().deleteRecursively()
+        }
+    }
+
+    private fun buildServerContextFromKeyStore(ks: KeyStore): SSLContext {
+        val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply {
+            init(ks, "test-keystore-pass".toCharArray())
+        }
+        return SSLContext.getInstance("TLS").apply {
+            init(kmf.keyManagers, null, null)
+        }
+    }
+
+    @Test
+    fun pinnedTlsTrustManagerValidatesExactCertificateAndRejectsMismatch() {
+        val ksA = generateTestKeyStore("peerA", "airdrop-peer-a")
+        val ksB = generateTestKeyStore("peerB", "airdrop-peer-b")
+        val certA = ksA.getCertificate("peerA") as X509Certificate
+        val certB = ksB.getCertificate("peerB") as X509Certificate
+
+        val fpA = AirDropNode.sha256FingerprintHex(certA)
+        val colonFpA = fpA.chunked(2).joinToString(":").uppercase()
+        val dashFpA = fpA.chunked(2).joinToString("-")
+
+        // Matching fingerprint (raw, colon-delimited uppercase, dash-delimited) must succeed
+        AirDropNode.PinnedTlsTrustManager(fpA).checkServerTrusted(arrayOf(certA), "ECDHE_ECDSA")
+        AirDropNode.PinnedTlsTrustManager(colonFpA).checkServerTrusted(arrayOf(certA), "ECDHE_ECDSA")
+        AirDropNode.PinnedTlsTrustManager("  $dashFpA  ").checkServerTrusted(arrayOf(certA), "ECDHE_ECDSA")
+
+        val tm = AirDropNode.PinnedTlsTrustManager(fpA)
+
+        // Mismatched certificate must throw CertificateException
+        try {
+            tm.checkServerTrusted(arrayOf(certB), "ECDHE_ECDSA")
+            fail("Mismatched peer certificate must throw CertificateException")
+        } catch (_: CertificateException) {
+            // Expected
+        }
+
+        // Empty or null chain must throw CertificateException
+        try {
+            tm.checkServerTrusted(emptyArray<X509Certificate>(), "ECDHE_ECDSA")
+            fail("Empty certificate chain must throw CertificateException")
+        } catch (_: CertificateException) {
+            // Expected
+        }
+        try {
+            tm.checkServerTrusted(null, "ECDHE_ECDSA")
+            fail("Null certificate chain must throw CertificateException")
+        } catch (_: CertificateException) {
+            // Expected
+        }
+
+        // Client cert auth on server-pinning TrustManager must reject with CertificateException
+        try {
+            tm.checkClientTrusted(arrayOf(certA), "ECDHE_ECDSA")
+            fail("checkClientTrusted must throw CertificateException")
+        } catch (_: CertificateException) {
+            // Expected
+        }
+
+        // Invalid or empty pin strings must fail closed at construction
+        for (badPin in listOf("", "   ", "deadbeef", "zz".repeat(32))) {
+            try {
+                AirDropNode.PinnedTlsTrustManager(badPin)
+                fail("Invalid fingerprint '$badPin' must be rejected")
+            } catch (_: IllegalArgumentException) {
+                // Expected
+            }
+        }
+    }
+
+    @Test
+    fun pinnedClientSslContextEnforcesHandshakePinningOverLoopbackTls() {
+        val ksA = generateTestKeyStore("srvA", "airdrop-srv-a")
+        val ksB = generateTestKeyStore("srvB", "airdrop-srv-b")
+        val certA = ksA.getCertificate("srvA") as X509Certificate
+        val certB = ksB.getCertificate("srvB") as X509Certificate
+        val fpA = AirDropNode.sha256FingerprintHex(certA)
+        val fpB = AirDropNode.sha256FingerprintHex(certB)
+
+        val serverCtx = buildServerContextFromKeyStore(ksA)
+        val srv = (serverCtx.serverSocketFactory.createServerSocket(0, 8, InetAddress.getByName("127.0.0.1")) as SSLServerSocket).apply {
+            soTimeout = 5_000
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val serverFuture = executor.submit {
+                repeat(3) {
+                    try {
+                        (srv.accept() as SSLSocket).use { client ->
+                            client.soTimeout = 5_000
+                            client.startHandshake()
+                            client.outputStream.write("OK".toByteArray(StandardCharsets.US_ASCII))
+                            client.outputStream.flush()
+                        }
+                    } catch (_: Throwable) {
+                        // Expected on rejected client handshakes
+                    }
+                }
+            }
+
+            // 1. Pinned fingerprint matching server cert A must succeed
+            val matchingCtx = AirDropNode.buildPinnedClientSslContext(fpA)
+            (matchingCtx.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
+                tls.soTimeout = 5_000
+                tls.startHandshake()
+                val buf = ByteArray(2)
+                assertEquals(2, tls.inputStream.read(buf))
+                assertEquals("OK", String(buf, StandardCharsets.US_ASCII))
+            }
+
+            // 2. Mismatched fingerprint (simulating MitM cert) must abort TLS handshake
+            val wrongPinCtx = AirDropNode.buildPinnedClientSslContext(fpB)
+            (wrongPinCtx.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
+                tls.soTimeout = 5_000
+                try {
+                    tls.startHandshake()
+                    fail("TLS handshake with mismatched pinned fingerprint must fail")
+                } catch (_: SSLHandshakeException) {
+                    // Expected
+                } catch (_: CertificateException) {
+                    // Expected
+                }
+            }
+
+            // 3. Default platform SSLContext without pin must reject untrusted self-signed cert
+            val defaultCtx = AirDropNode.buildDefaultClientSslContext()
+            (defaultCtx.socketFactory.createSocket("127.0.0.1", srv.localPort) as SSLSocket).use { tls ->
+                tls.soTimeout = 5_000
+                try {
+                    tls.startHandshake()
+                    fail("Default TrustManager must reject untrusted self-signed server certificate")
+                } catch (_: SSLHandshakeException) {
+                    // Expected
+                } catch (_: CertificateException) {
+                    // Expected
+                }
+            }
+
+            serverFuture.get(5, TimeUnit.SECONDS)
+        } finally {
+            runCatching { srv.close() }
+            executor.shutdownNow()
+        }
     }
 }
