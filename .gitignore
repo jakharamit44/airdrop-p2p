@@ -27,8 +27,6 @@ tokens.json
 *id_rsa*
 
 # Local runtime state, temporary files & logs
-.mac-airdrop-v2/
-.airdrop-p2p/
 .glidedrop/
 .gravitas/
 *.pid
@@ -75,7 +73,6 @@ android/*.iml
 android/app/*.iml
 
 # macOS binaries, app bundles & releases
-AirDrop P2P.app/
 GlideDrop.app/
 *.app/
 *.dmg

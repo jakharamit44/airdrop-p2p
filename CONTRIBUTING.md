@@ -19,26 +19,26 @@ Contributions, bug reports, protocol fixes, and documentation improvements are w
 ├── android/
 │   └── app/src/
 │       ├── main/java/io/github/jakharamit44/glidedrop/
-│       │   ├── MainActivity.kt        # Jetpack Compose UI (Send, Receive, History, Settings)
-│       │   ├── GlideDropNode.kt         # BLE L2CAP, ECDH P-256, 5 GHz Wi-Fi Direct & TLS engine
-│       │   ├── GlideDropCodec.kt        # bplist00 & DVZip/CPIO (070707 / 070764) codec
-│       │   ├── EmbeddedProxyServer.kt # Dual-protocol SOCKS5 + HTTP CONNECT proxy (:1080)
-│       │   └── GlideDropService.kt      # Connected-device foreground service & notifications
+│       │   ├── MainActivity.kt            # Jetpack Compose UI (Send, Receive, History, Settings)
+│       │   ├── GlideDropNode.kt           # BLE L2CAP, ECDH P-256, 5 GHz Wi-Fi Direct & TLS engine
+│       │   ├── GlideDropCodec.kt          # bplist00 & DVZip/CPIO (070707 / 070764) codec
+│       │   ├── EmbeddedProxyServer.kt     # Dual-protocol SOCKS5 + HTTP CONNECT proxy (:1080)
+│       │   └── GlideDropService.kt        # Connected-device foreground service & notifications
 │       └── test/java/io/github/jakharamit44/glidedrop/ # Codec, security, and proxy unit tests
 ├── macos/
-│   ├── glidedrop-daemon.swift          # SwiftUI app, menu bar daemon, BLE & proxy lifecycle
-│   ├── glidedrop.sh             # HTTPS AirDrop receiver/sender & awdl0 Finder proxy
-│   ├── claude_processor.py            # Optional offline (Vision OCR/Ollama) & Claude AI hook
-│   ├── test_claude_processor.py       # Python unit tests for AI & Privacy Guard
-│   ├── generate-icon.swift            # macOS squircle AppIcon.icns generator
-│   └── build.sh                       # Builds GlideDrop.app bundle
+│   ├── glidedrop-daemon.swift             # SwiftUI app, menu bar daemon, BLE & proxy lifecycle
+│   ├── glidedrop.sh                       # HTTPS GlideDrop receiver/sender & awdl0 Finder proxy
+│   ├── claude_processor.py                # Optional offline (Vision OCR/Ollama) & Claude AI hook
+│   ├── test_claude_processor.py           # Python unit tests for AI & Privacy Guard
+│   ├── generate-icon.swift                # macOS squircle AppIcon.icns generator
+│   └── build.sh                           # Builds GlideDrop.app bundle
 ├── docs/
-│   ├── index.html                     # Project landing page (GitHub Pages)
-│   └── ARCHITECTURE.md                # Protocol & subsystem specification
+│   ├── index.html                         # Project landing page (GitHub Pages)
+│   └── ARCHITECTURE.md                    # Protocol & subsystem specification
 ├── scripts/
-│   ├── build-release.sh               # Builds APK, DMG, PKG, and SHA256SUMS.txt
-│   └── publish-release.py             # Publishes release artifacts & backup branch
-└── VERSION                            # Semantic version string
+│   ├── build-release.sh                   # Builds APK, DMG, PKG, and SHA256SUMS.txt
+│   └── publish-release.py                 # Publishes release artifacts & backup branch
+└── VERSION                                # Semantic version string
 ```
 
 ## Local Build & Test Commands

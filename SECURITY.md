@@ -13,8 +13,8 @@
 
 | Version | Supported | Status |
 | :--- | :--- | :--- |
-| **2.4.x** | Yes | Active Beta |
-| **< 2.4.0** | No | Unsupported |
+| **2.5.x** | Yes | Active Beta |
+| **< 2.5.0** | No | Unsupported |
 
 ## Threat Model & Security Controls
 

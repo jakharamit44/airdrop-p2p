@@ -43,8 +43,11 @@ ensure_ble_bin() {
     mkdir -p "$APP_MACOS" "$APP_RES"
     cp -f "$BLE_BIN" "$APP_MACOS/GlideDrop" 2>/dev/null || true
     cp -f "$SCRIPT_DIR/glidedrop.sh" "$APP_RES/glidedrop.sh" 2>/dev/null || true
+    if [[ -f "$SCRIPT_DIR/AppIcon.icns" ]]; then
+      cp -f "$SCRIPT_DIR/AppIcon.icns" "$APP_RES/AppIcon.icns" 2>/dev/null || true
+    fi
     chmod +x "$APP_RES/glidedrop.sh" 2>/dev/null || true
-    APP_VER="$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "2.4.1")"
+    APP_VER="$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "2.5.0")"
     cat > "$SCRIPT_DIR/GlideDrop.app/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
