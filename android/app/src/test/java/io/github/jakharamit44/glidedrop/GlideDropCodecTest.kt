@@ -68,13 +68,6 @@ class GlideDropCodecTest {
         } finally {
             tempDir.deleteRecursively()
         }
-
-        // Verify BLE Continuity AirDrop wake frame (0x05 + 18 len + 0x40 Arm A + 3 tag bytes + 0x03)
-        val ble = GlideDropCodec.bleWakePayload(byteArrayOf(0x11, 0x22, 0x33))
-        assertEquals(20, ble.size)
-        assertEquals(0x05.toByte(), ble[0])
-        assertEquals(18.toByte(), ble[1])
-        assertEquals(0x03.toByte(), ble[10])
     }
 
     @Test
@@ -283,6 +276,81 @@ class GlideDropCodecTest {
             val extracted = GlideDropCodec.extractDvzipCpio(ByteArrayInputStream(out.toByteArray()), tempDir)
             assertEquals(1, extracted.size)
             assertArrayEquals(payload, File(tempDir, "movie_4k.mp4").readBytes())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun insufficientStorageCheckRejectsOversizedArchiveEntry() {
+        val hugeSize = 900_000_000_000_000L // ~900 TB declared in 070764 header
+        val name = "oversized.bin"
+        val nameBytes = name.toByteArray(Charsets.UTF_8)
+        val hdr = String.format(
+            java.util.Locale.US,
+            "070764%016x%08x%08x%08x%08x%016x%016x%08x%08x",
+            1L,
+            33188,
+            0,
+            0,
+            1,
+            1731050000L,
+            hugeSize,
+            nameBytes.size + 1,
+            0
+        ).toByteArray(Charsets.US_ASCII)
+        val archiveBytes = ByteArrayOutputStream().apply {
+            write(hdr)
+            write(nameBytes)
+            write(0)
+        }.toByteArray()
+
+        val tempDir = Files.createTempDirectory("glidedrop-space-test").toFile()
+        try {
+            var threwIo = false
+            try {
+                GlideDropCodec.extractDvzipCpio(ByteArrayInputStream(archiveBytes), tempDir)
+            } catch (e: java.io.IOException) {
+                threwIo = e.message?.contains("Insufficient storage space") == true
+            }
+            assertTrue("Expected IOException for insufficient storage space", threwIo)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun signedOverflowCpio64BitSizeIsRejected() {
+        val name = "overflow.bin"
+        val nameBytes = name.toByteArray(Charsets.UTF_8)
+        val hdr = (
+            "070764" +
+                "0000000000000001" +
+                "000081a4" +
+                "00000000" +
+                "00000000" +
+                "00000001" +
+                "00000000672dd650" +
+                "8000000000000000" + // wraps negative if unchecked after parseUnsignedLong
+                String.format(java.util.Locale.US, "%08x", nameBytes.size + 1) +
+                "00000000"
+            ).toByteArray(Charsets.US_ASCII)
+        val archiveBytes = ByteArrayOutputStream().apply {
+            write(hdr)
+            write(nameBytes)
+            write(0)
+        }.toByteArray()
+
+        val tempDir = Files.createTempDirectory("glidedrop-overflow-test").toFile()
+        try {
+            var threw = false
+            try {
+                GlideDropCodec.extractDvzipCpio(ByteArrayInputStream(archiveBytes), tempDir)
+            } catch (_: IllegalArgumentException) {
+                threw = true
+            }
+            assertTrue("Expected IllegalArgumentException for >= 8 EiB CPIO size", threw)
+            assertEquals(0, tempDir.listFiles()?.size ?: 0)
         } finally {
             tempDir.deleteRecursively()
         }

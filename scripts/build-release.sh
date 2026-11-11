@@ -14,6 +14,14 @@ mkdir -p "$RELEASE_DIR"
 
 # 1. Build Android APK
 echo "[1/4] Building Android APK..."
+if [ -n "${GLIDEDROP_KEYSTORE_PATH:-}" ]; then
+    if [ ! -f "$GLIDEDROP_KEYSTORE_PATH" ] && [ -f "$ROOT_DIR/$GLIDEDROP_KEYSTORE_PATH" ]; then
+        GLIDEDROP_KEYSTORE_PATH="$ROOT_DIR/$GLIDEDROP_KEYSTORE_PATH"
+    fi
+    if [ -f "$GLIDEDROP_KEYSTORE_PATH" ]; then
+        export GLIDEDROP_KEYSTORE_PATH="$(cd "$(dirname "$GLIDEDROP_KEYSTORE_PATH")" && pwd)/$(basename "$GLIDEDROP_KEYSTORE_PATH")"
+    fi
+fi
 cd "$ROOT_DIR/android"
 if [ -z "${JAVA_HOME:-}" ] || [[ "$("${JAVA_HOME}/bin/java" -version 2>&1)" =~ "1.8." ]]; then
     if [ -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]; then
@@ -26,8 +34,26 @@ if [ -z "${JAVA_HOME:-}" ] || [[ "$("${JAVA_HOME}/bin/java" -version 2>&1)" =~ "
         export JAVA_HOME="/usr/local/opt/openjdk@17"
     fi
 fi
-./gradlew assembleDebug --no-daemon
-APK_SRC="$ROOT_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
+if [ -n "${GLIDEDROP_KEYSTORE_PATH:-}" ] && [ -n "${GLIDEDROP_KEYSTORE_PASSWORD:-}" ] && [ -n "${GLIDEDROP_KEY_ALIAS:-}" ]; then
+    if [ ! -f "$GLIDEDROP_KEYSTORE_PATH" ]; then
+        echo "[-] ERROR: GLIDEDROP_KEYSTORE_PATH does not exist: $GLIDEDROP_KEYSTORE_PATH" >&2
+        exit 1
+    fi
+    echo "  -> Building signed non-debuggable release APK..."
+    ./gradlew assembleRelease --no-daemon
+    APK_SRC="$ROOT_DIR/android/app/build/outputs/apk/release/app-release.apk"
+    if [ ! -f "$APK_SRC" ]; then
+        echo "[-] ERROR: Expected signed release APK not found at $APK_SRC" >&2
+        exit 1
+    fi
+elif [ "${GLIDEDROP_REQUIRE_RELEASE_SIGNING:-0}" = "1" ]; then
+    echo "[-] ERROR: GLIDEDROP_REQUIRE_RELEASE_SIGNING=1 but GLIDEDROP_KEYSTORE_PATH / GLIDEDROP_KEYSTORE_PASSWORD / GLIDEDROP_KEY_ALIAS are not set." >&2
+    exit 1
+else
+    echo "  -> [WARN] Release signing env vars not set; falling back to debug APK (set GLIDEDROP_KEYSTORE_PATH, GLIDEDROP_KEYSTORE_PASSWORD, GLIDEDROP_KEY_ALIAS for signed release)."
+    ./gradlew assembleDebug --no-daemon
+    APK_SRC="$ROOT_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
+fi
 APK_DEST="$RELEASE_DIR/GlideDrop-v${VERSION}.apk"
 cp -f "$APK_SRC" "$APK_DEST"
 echo "  -> Created: $APK_DEST ($(du -h "$APK_DEST" | cut -f1))"

@@ -206,7 +206,7 @@ class TestClaudeProcessor(unittest.TestCase):
 
     @patch("time.sleep", return_value=None)
     def test_api_model_fallback_on_404_or_overloaded(self, mock_sleep):
-        """Verify model fallback cascade when a model is not found or retired."""
+        """Verify model fallback cascade uses current Anthropic 4.x IDs when a model returns 404."""
         mock_resp = MagicMock()
         mock_resp.read.return_value = json.dumps({"content": [{"type": "text", "text": "Fallback Success"}]}).encode("utf-8")
         mock_resp.__enter__.return_value = mock_resp
@@ -221,7 +221,16 @@ class TestClaudeProcessor(unittest.TestCase):
             fp=mock_fp
         )
 
-        with patch("urllib.request.urlopen", side_effect=[http_404, mock_resp]):
+        attempted_models = []
+
+        def fake_urlopen(req, timeout=90.0):
+            body = json.loads(req.data.decode("utf-8"))
+            attempted_models.append(body.get("model"))
+            if len(attempted_models) == 1:
+                raise http_404
+            return mock_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
             res = claude_processor.call_claude_api(
                 messages=[{"role": "user", "content": "hi"}],
                 system_prompt="test",
@@ -229,6 +238,22 @@ class TestClaudeProcessor(unittest.TestCase):
                 api_key="test-key"
             )
             self.assertEqual(res, "Fallback Success")
+            self.assertEqual(attempted_models, ["claude-sonnet-4-6", "claude-haiku-4-5"])
+
+    def test_default_model_ids_and_clean_imports(self):
+        """Verify current Anthropic 4.x model defaults and absence of unused imports."""
+        self.assertEqual(claude_processor.DEFAULT_MODEL, "claude-sonnet-4-6")
+        self.assertEqual(claude_processor.FAST_MODEL, "claude-haiku-4-5")
+        self.assertEqual(claude_processor.OPUS_MODEL, "claude-opus-4-6")
+        self.assertEqual(
+            claude_processor.FALLBACK_MODELS,
+            ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-6"],
+        )
+        src = (Path(__file__).resolve().parent / "claude_processor.py").read_text(encoding="utf-8")
+        self.assertNotIn("claude-3-5-sonnet-latest", src)
+        self.assertNotIn("claude-3-5-haiku-latest", src)
+        self.assertNotIn("claude-3-opus-latest", src)
+        self.assertNotIn("import mimetypes", src)
 
     def test_cli_test_mode_never_logs_api_key_or_prefix(self):
         """CLI --test must not print any portion or prefix of the API key in cleartext."""
@@ -494,6 +519,536 @@ class TestClaudeProcessor(unittest.TestCase):
             stop_event.set()
             srv_sock.close()
             srv_thread.join(timeout=2)
+
+    def _extract_send_python_script(self) -> str:
+        sh_path = Path(__file__).resolve().parent / "glidedrop.sh"
+        sh_text = sh_path.read_text(encoding="utf-8")
+        marker = 'STATE_DIR="$STATE_DIR" python3 - "$@" << \'PYEOF\' &\n'
+        start_idx = sh_text.find(marker)
+        self.assertNotEqual(start_idx, -1, "Could not locate send python block in glidedrop.sh")
+        body_start = start_idx + len(marker)
+        end_idx = sh_text.find("\nPYEOF\n", body_start)
+        self.assertNotEqual(end_idx, -1, "Could not locate end of send python block")
+        return sh_text[body_start:end_idx]
+
+    def test_glidedrop_send_preserves_progress_on_ble_handoff(self):
+        """Without --peer, failing discover_android() must preserve transfer_progress.json for BLE handoff."""
+        send_script = self._extract_send_python_script()
+        state_dir = self.dir_path / "state_handoff"
+        state_dir.mkdir(exist_ok=True)
+        prog_file = state_dir / "transfer_progress.json"
+        initial_prog = {
+            "active": True,
+            "direction": "Sending",
+            "fileName": "test.bin",
+            "phase": "Connecting via Bluetooth LE…",
+            "updatedAt": time.time(),
+        }
+        prog_file.write_text(json.dumps(initial_prog), encoding="utf-8")
+
+        sample = self.dir_path / "sample.bin"
+        sample.write_bytes(b"glidedrop-test-payload")
+
+        # Force discover_android() to fail without touching any real 192.168.49.1 device
+        harness = (
+            "import socket as _orig_sock\n"
+            "def _fail_conn(*a, **kw):\n"
+            "    raise OSError('P2P unreachable in unit test')\n"
+            "_orig_sock.create_connection = _fail_conn\n"
+        ) + send_script
+
+        env = {**os.environ, "GLIDEDROP_STATE_DIR": str(state_dir)}
+        res = subprocess.run(
+            [sys.executable, "-", str(sample)],
+            input=harness,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertTrue(
+            prog_file.exists(),
+            f"transfer_progress.json must NOT be deleted when handing off to BLE send (stderr={res.stderr})",
+        )
+        saved = json.loads(prog_file.read_text(encoding="utf-8"))
+        self.assertTrue(saved.get("active"))
+
+    def test_glidedrop_send_clears_progress_on_peer_fail_decline_cancel_success(self):
+        """transfer_progress.json must be cleared when --peer fails, receiver declines (43), cancelled (44), or succeeds."""
+        openssl_bin = shutil.which("openssl")
+        if not openssl_bin:
+            self.skipTest("openssl binary not available")
+
+        send_script = self._extract_send_python_script()
+        cert_path = self.dir_path / "srv_cert2.pem"
+        key_path = self.dir_path / "srv_key2.pem"
+        subprocess.run(
+            [
+                openssl_bin, "req", "-x509", "-newkey", "ec",
+                "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                "-keyout", str(key_path), "-out", str(cert_path),
+                "-days", "7", "-nodes", "-subj", "/CN=glidedrop-test"
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        import base64
+        pem_lines = [
+            line.strip() for line in cert_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("-----")
+        ]
+        actual_fp = hashlib.sha256(base64.b64decode("".join(pem_lines))).hexdigest().lower()
+
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(str(cert_path), str(key_path))
+
+        ask_status_code = {"code": 200}
+        stop_event = threading.Event()
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(8)
+        srv_sock.settimeout(0.2)
+        port = srv_sock.getsockname()[1]
+
+        def serve_loop():
+            while not stop_event.is_set():
+                try:
+                    raw_conn, _ = srv_sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    with raw_conn:
+                        raw_conn.settimeout(3.0)
+                        with server_ctx.wrap_socket(raw_conn, server_side=True) as tls_conn:
+                            f = tls_conn.makefile("rb")
+                            while True:
+                                req_line = f.readline().decode("iso-8859-1").strip()
+                                if not req_line:
+                                    break
+                                headers = {}
+                                while True:
+                                    hl = f.readline().decode("iso-8859-1").strip()
+                                    if not hl:
+                                        break
+                                    if ":" in hl:
+                                        k, v = hl.split(":", 1)
+                                        headers[k.strip().lower()] = v.strip()
+                                if "chunked" in headers.get("transfer-encoding", "").lower():
+                                    while True:
+                                        raw_sz = f.readline()
+                                        if not raw_sz:
+                                            break
+                                        sz_line = raw_sz.decode("iso-8859-1").strip()
+                                        if not sz_line:
+                                            continue
+                                        sz = int(sz_line.split(";", 1)[0], 16)
+                                        if sz == 0:
+                                            f.readline()
+                                            break
+                                        f.read(sz)
+                                        f.read(2)
+                                else:
+                                    clen = int(headers.get("content-length", "0"))
+                                    if clen > 0:
+                                        f.read(clen)
+                                if "/Discover" in req_line:
+                                    body = plistlib.dumps({"ReceiverComputerName": "LoopbackPeer"}, fmt=plistlib.FMT_BINARY)
+                                    tls_conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
+                                elif "/Ask" in req_line:
+                                    code = ask_status_code["code"]
+                                    reason = "Forbidden" if code == 403 else "OK"
+                                    tls_conn.sendall(f"HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n\r\n".encode("ascii"))
+                                    if code != 200:
+                                        break
+                                elif "/Upload" in req_line:
+                                    tls_conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                    break
+                except Exception:
+                    pass
+
+        srv_thread = threading.Thread(target=serve_loop, daemon=True)
+        srv_thread.start()
+
+        state_dir = self.dir_path / "state_clear"
+        state_dir.mkdir(exist_ok=True)
+        prog_file = state_dir / "transfer_progress.json"
+        env = {**os.environ, "GLIDEDROP_STATE_DIR": str(state_dir)}
+        sample = self.dir_path / "upload_test.bin"
+        sample.write_bytes(b"hello-glidedrop" * 100)
+
+        def seed_progress():
+            prog_file.write_text(json.dumps({"active": True, "updatedAt": time.time()}), encoding="utf-8")
+
+        try:
+            # 1. --peer failure (wrong pin) must clear progress
+            seed_progress()
+            wrong_fp = ("0" if actual_fp[0] != "0" else "1") + actual_fp[1:]
+            res_peer_fail = subprocess.run(
+                [sys.executable, "-", "--peer", f"127.0.0.1:{port}", "--pin", wrong_fp, str(sample)],
+                input=send_script, text=True, capture_output=True, env=env, timeout=10,
+            )
+            self.assertEqual(res_peer_fail.returncode, 46, f"Expected exit 46 on pin mismatch, got {res_peer_fail.returncode}: {res_peer_fail.stderr}")
+            self.assertFalse(prog_file.exists(), "transfer_progress.json must be cleared on --peer pin failure")
+
+            # 2. Receiver decline (403 -> rc 43) must clear progress
+            ask_status_code["code"] = 403
+            seed_progress()
+            res_decline = subprocess.run(
+                [sys.executable, "-", "--peer", f"127.0.0.1:{port}", "--pin", actual_fp, str(sample)],
+                input=send_script, text=True, capture_output=True, env=env, timeout=10,
+            )
+            self.assertEqual(res_decline.returncode, 43)
+            self.assertFalse(prog_file.exists(), "transfer_progress.json must be cleared on rc=43 decline")
+
+            # 3. Cancelled transfer (cancel_transfer.flag -> rc 44) must clear progress
+            ask_status_code["code"] = 200
+            seed_progress()
+            (state_dir / "cancel_transfer.flag").write_text(str(time.time()), encoding="utf-8")
+            res_cancel = subprocess.run(
+                [sys.executable, "-", "--peer", f"127.0.0.1:{port}", "--pin", actual_fp, str(sample)],
+                input=send_script, text=True, capture_output=True, env=env, timeout=10,
+            )
+            self.assertEqual(res_cancel.returncode, 44)
+            self.assertFalse(prog_file.exists(), "transfer_progress.json must be cleared on rc=44 cancel")
+            (state_dir / "cancel_transfer.flag").unlink(missing_ok=True)
+
+            # 4. Success (rc 0) must clear progress
+            seed_progress()
+            res_ok = subprocess.run(
+                [sys.executable, "-", "--peer", f"127.0.0.1:{port}", "--pin", actual_fp, str(sample)],
+                input=send_script, text=True, capture_output=True, env=env, timeout=10,
+            )
+            self.assertEqual(res_ok.returncode, 0, res_ok.stderr)
+            self.assertFalse(prog_file.exists(), "transfer_progress.json must be cleared on success")
+
+            # 5. Leading --pin before --peer failure must clear progress
+            seed_progress()
+            res_pin_first = subprocess.run(
+                [sys.executable, "-", "--pin", wrong_fp, "--peer", f"127.0.0.1:{port}", str(sample)],
+                input=send_script, text=True, capture_output=True, env=env, timeout=10,
+            )
+            self.assertNotEqual(res_pin_first.returncode, 0)
+            self.assertFalse(prog_file.exists(), "transfer_progress.json must be cleared when --pin precedes --peer")
+
+            # 6. Invalid --pin syntax or missing file must clear progress and exit 45
+            seed_progress()
+            res_bad_pin = subprocess.run(
+                [sys.executable, "-", "--peer", f"127.0.0.1:{port}", "--pin", "not-a-sha256", str(sample)],
+                input=send_script, text=True, capture_output=True, env=env, timeout=10,
+            )
+            self.assertEqual(res_bad_pin.returncode, 45)
+            self.assertFalse(prog_file.exists(), "transfer_progress.json must be cleared on invalid --pin")
+
+            seed_progress()
+            res_missing = subprocess.run(
+                [sys.executable, "-", str(self.dir_path / "does_not_exist.bin")],
+                input=send_script, text=True, capture_output=True, env=env, timeout=10,
+            )
+            self.assertEqual(res_missing.returncode, 45)
+            self.assertFalse(prog_file.exists(), "transfer_progress.json must be cleared on missing input file")
+        finally:
+            stop_event.set()
+            srv_sock.close()
+            srv_thread.join(timeout=2)
+
+    def test_glidedrop_phase1_daemon_invariants_and_swift_suite(self):
+        """Verify Phase 1 & Phase 2 structural invariants and compile+run Swift daemon regression tests."""
+        mac_dir = Path(__file__).resolve().parent
+        swift_src = (mac_dir / "glidedrop-daemon.swift").read_text(encoding="utf-8")
+        self.assertNotIn("retriedJoin", swift_src, "Synchronous retriedJoin must be removed")
+        self.assertNotIn('Data("WP2P\\n".utf8)', swift_src, "Sender WP2P must be removed")
+        self.assertNotIn('Data("WP2P".utf8)', swift_src, "Unpinned legacy WP2P downgrade must be removed")
+        self.assertNotIn("BLE_E2EE_KEY", swift_src, "Hardcoded static BLE_E2EE_KEY must be eliminated")
+        self.assertIn("deriveBleFrameKey", swift_src)
+        self.assertIn("deriveSessionToken", swift_src)
+        self.assertIn("registerP2pSessionToken", swift_src)
+        self.assertIn("clearP2pSessionTokens", swift_src)
+        self.assertIn("isValidSha256Fingerprint", swift_src)
+        self.assertIn("BLEK", swift_src)
+        self.assertIn("txProc.terminationStatus == 46", swift_src)
+        self.assertIn("currentRawWifiSsid()", swift_src)
+        self.assertIn("Date().addingTimeInterval(25.0)", swift_src, "25s DHCP wait must be present")
+        self.assertIn("didFailToConnect", swift_src)
+        self.assertIn("didDisconnectPeripheral", swift_src)
+        self.assertIn("didModifyServices", swift_src)
+        self.assertIn("TX_LOCK_TTL_SECONDS: TimeInterval = 180.0", swift_src)
+        self.assertIn("MAX_ENCRYPTED_BLE_ARCHIVE_BYTES = 30_000_000", swift_src)
+        self.assertIn("Waiting for receiver confirmation…", swift_src)
+
+        swift_test_file = mac_dir / "test_glidedrop_daemon.swift"
+        self.assertTrue(swift_test_file.exists(), "Missing macos/test_glidedrop_daemon.swift")
+        xcrun_bin = shutil.which("xcrun")
+        if not xcrun_bin:
+            self.skipTest("xcrun not available")
+
+        test_bin = self.dir_path / "glidedrop-swift-tests"
+        compile_res = subprocess.run(
+            [
+                xcrun_bin, "swiftc", "-D", "GLIDEDROP_TESTING", "-parse-as-library",
+                str(mac_dir / "glidedrop-daemon.swift"),
+                str(swift_test_file),
+                "-o", str(test_bin),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(compile_res.returncode, 0, f"Swift test compilation failed:\n{compile_res.stderr}")
+        run_res = subprocess.run([str(test_bin)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(run_res.returncode, 0, f"Swift regression tests failed:\n{run_res.stdout}\n{run_res.stderr}")
+        self.assertIn("All Swift regression checks PASSED", run_res.stdout)
+
+    def test_glidedrop_sh_bash_send_dispatch(self):
+        """Exercise glidedrop.sh bash send dispatch: BLE handoff vs --pin/--peer fail vs missing file."""
+        mac_dir = Path(__file__).resolve().parent
+        sh_src = (mac_dir / "glidedrop.sh").read_text(encoding="utf-8")
+
+        state_dir = self.dir_path / "sh_state"
+        state_dir.mkdir(exist_ok=True)
+        ble_calls_log = self.dir_path / "ble_calls.log"
+        stub_ble = self.dir_path / "stub_ble"
+        stub_ble.write_text(
+            "#!/usr/bin/env bash\n"
+            f'echo "$*" >> "{ble_calls_log}"\n'
+            f'test -f "{state_dir}/transfer_progress.json" && echo "PROGRESS_PRESENT" >> "{ble_calls_log}" || echo "PROGRESS_MISSING" >> "{ble_calls_log}"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        stub_ble.chmod(0o755)
+
+        test_sh = self.dir_path / "glidedrop_test.sh"
+        patched_sh = sh_src.replace(
+            'if [[ -x "/Applications/GlideDrop.app/Contents/MacOS/GlideDrop" ]]; then\n'
+            '  BLE_BIN="/Applications/GlideDrop.app/Contents/MacOS/GlideDrop"\n'
+            'elif [[ -x "$SCRIPT_DIR/GlideDrop.app/Contents/MacOS/GlideDrop" ]]; then\n'
+            '  BLE_BIN="$SCRIPT_DIR/GlideDrop.app/Contents/MacOS/GlideDrop"\n'
+            'else\n'
+            '  BLE_BIN="$STATE_DIR/glidedrop-daemon"\n'
+            'fi',
+            f'BLE_BIN="{stub_ble}"',
+        ).replace(
+            '        with socket.create_connection(("192.168.49.1", 8771), timeout=0.25):\n'
+            '            return "192.168.49.1", 8771',
+            '        raise OSError("unit test P2P unreachable")',
+        )
+        self.assertIn(f'BLE_BIN="{stub_ble}"', patched_sh)
+        self.assertIn('unit test P2P unreachable', patched_sh)
+        test_sh.write_text(patched_sh, encoding="utf-8")
+        test_sh.chmod(0o755)
+
+        sample = self.dir_path / "payload.bin"
+        sample.write_bytes(b"hello-bash-send")
+        prog_file = state_dir / "transfer_progress.json"
+        env = {**os.environ, "GLIDEDROP_STATE_DIR": str(state_dir)}
+
+        # 1. Without --peer: preserves transfer_progress.json across Python exit -> invokes stub_ble send
+        prog_file.write_text(json.dumps({"active": True, "updatedAt": time.time()}), encoding="utf-8")
+        r1 = subprocess.run(["bash", str(test_sh), "send", str(sample)], capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        calls1 = ble_calls_log.read_text(encoding="utf-8")
+        self.assertIn(f"send {sample}", calls1)
+        self.assertIn("PROGRESS_PRESENT", calls1, "transfer_progress.json must remain present when BLE handoff starts")
+
+        # 2. Leading --pin before --peer failure: must NOT fall back to BLE and must clear progress
+        ble_calls_log.unlink()
+        prog_file.write_text(json.dumps({"active": True, "updatedAt": time.time()}), encoding="utf-8")
+        r2 = subprocess.run(
+            ["bash", str(test_sh), "send", "--pin", "0" * 64, "--peer", "127.0.0.1:1", str(sample)],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+        self.assertNotEqual(r2.returncode, 0)
+        self.assertFalse(ble_calls_log.exists(), "--pin before --peer must not trigger BLE fallback")
+        self.assertFalse(prog_file.exists(), f"transfer_progress.json must be cleared on --peer failure (stderr={r2.stderr})")
+
+        # 3. Missing input file: must NOT invoke BLE fallback, must clear progress and exit 1
+        prog_file.write_text(json.dumps({"active": True, "updatedAt": time.time()}), encoding="utf-8")
+        r3 = subprocess.run(
+            ["bash", str(test_sh), "send", str(self.dir_path / "missing_file.bin")],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(r3.returncode, 1, r3.stderr)
+        self.assertFalse(ble_calls_log.exists(), "Missing file must not invoke BLE fallback")
+        self.assertFalse(prog_file.exists(), f"transfer_progress.json must be cleared on missing file (stderr={r3.stderr})")
+
+        # 4. TLS fingerprint mismatch (exit 46) even WITHOUT --peer must fail closed and NOT fall back to BLE
+        tls_script_dir = self.dir_path / "tls_fail_test"
+        tls_script_dir.mkdir(exist_ok=True)
+        cert_pem = tls_script_dir / "cert.pem"
+        key_pem = tls_script_dir / "key.pem"
+        openssl_bin = shutil.which("openssl") or "/usr/bin/openssl"
+        subprocess.run(
+            [openssl_bin, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+             "-keyout", str(key_pem), "-out", str(cert_pem), "-days", "1", "-nodes", "-subj", "/CN=test"],
+            check=True, capture_output=True, text=True,
+        )
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(4)
+        srv_port = srv_sock.getsockname()[1]
+        stop_ev = threading.Event()
+        srv_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        srv_ctx.load_cert_chain(str(cert_pem), str(key_pem))
+
+        def _tls_srv():
+            srv_sock.settimeout(0.2)
+            while not stop_ev.is_set():
+                try:
+                    c, _ = srv_sock.accept()
+                    try:
+                        with srv_ctx.wrap_socket(c, server_side=True) as tls:
+                            tls.recv(1024)
+                    except Exception:
+                        pass
+                except socket.timeout:
+                    continue
+
+        t = threading.Thread(target=_tls_srv, daemon=True)
+        t.start()
+        try:
+            patched_p2p_sh = test_sh.read_text(encoding="utf-8").replace(
+                '        raise OSError("unit test P2P unreachable")',
+                f'        return "127.0.0.1", {srv_port}',
+            )
+            test_sh_tls = tls_script_dir / "glidedrop_tls_test.sh"
+            test_sh_tls.write_text(patched_p2p_sh, encoding="utf-8")
+            test_sh_tls.chmod(0o755)
+            prog_file.write_text(json.dumps({"active": True, "updatedAt": time.time()}), encoding="utf-8")
+            r4 = subprocess.run(
+                ["bash", str(test_sh_tls), "send", "--pin", "f" * 64, str(sample)],
+                capture_output=True, text=True, env=env, timeout=15,
+            )
+            self.assertEqual(r4.returncode, 46, f"Expected exit 46 on TLS mismatch without --peer, got {r4.returncode}: {r4.stderr}")
+            self.assertFalse(ble_calls_log.exists(), "TLS pin failure (rc=46) must NOT trigger BLE fallback")
+            self.assertFalse(prog_file.exists(), "transfer_progress.json must be cleared on rc=46")
+        finally:
+            stop_ev.set()
+            srv_sock.close()
+            t.join(timeout=2)
+
+    def test_glidedrop_receiver_session_token_and_recent_uploads_cap(self):
+        """Verify constant-time X-GlideDrop-Token validation on :8772, 127.0.0.1 Finder proxy bypass on :8773, and bounded RECENT_UPLOADS."""
+        mac_dir = Path(__file__).resolve().parent
+        sh_src = (mac_dir / "glidedrop.sh").read_text(encoding="utf-8")
+        start_marker = 'nohup python3 -u - "$STATE_DIR/cert.pem" "$STATE_DIR/key.pem" "$PORT" "$PROXY_PORT" "$SCRIPT_DIR/glidedrop.sh" >"$LOG_FILE" 2>&1 << \'PYEOF\' &\n'
+        end_marker = '\nctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)'
+        self.assertIn(start_marker, sh_src)
+        self.assertIn(end_marker, sh_src)
+
+        py_part = sh_src.split(start_marker, 1)[1].split(end_marker, 1)[0]
+        # Avoid spawning background worker threads during unit test import
+        py_part = py_part.replace(
+            "for _ in range(2):\n    threading.Thread(target=_claude_processor_worker, daemon=True).start()",
+            "pass",
+        )
+
+        rx_state = self.dir_path / "rx_state"
+        rx_state.mkdir(exist_ok=True)
+        ns = {}
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "glidedrop_rx_test",
+                str(rx_state / "cert.pem"),
+                str(rx_state / "key.pem"),
+                "8772",
+                "8773",
+                str(mac_dir / "glidedrop.sh"),
+            ]
+            exec(compile(py_part, "glidedrop_rx_extract.py", "exec"), ns)
+        finally:
+            sys.argv = old_argv
+
+        handle_client = ns["handle_client"]
+        check_recent = ns["check_and_record_recent_upload"]
+        recent_map = ns["RECENT_UPLOADS"]
+
+        def run_discover(addr, is_p2p_proxy: bool, extra_headers: str = "") -> bytes:
+            s_srv, s_cli = socket.socketpair()
+            s_cli.settimeout(3.0)
+            th = threading.Thread(target=handle_client, args=(s_srv, addr, is_p2p_proxy), daemon=True)
+            th.start()
+            try:
+                body = plistlib.dumps({"DeviceSupportFlags": 111611}, fmt=plistlib.FMT_BINARY)
+                req = (
+                    f"POST /Discover HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:8772\r\n"
+                    f"{extra_headers}"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii") + body
+                s_cli.sendall(req)
+                s_cli.shutdown(socket.SHUT_WR)
+                chunks = []
+                while True:
+                    d = s_cli.recv(4096)
+                    if not d:
+                        break
+                    chunks.append(d)
+                return b"".join(chunks)
+            finally:
+                s_cli.close()
+                th.join(timeout=3)
+
+        token_file = rx_state / "p2p_session_token.json"
+        valid_tok = "a1b2c3d4" * 8
+        wrong_tok = "f" * 64
+        now = time.time()
+
+        # 1. Missing token file on :8772 -> 401 Unauthorized, no last_peer_ip / rx lock written
+        resp1 = run_discover(("192.168.49.25", 50001), is_p2p_proxy=False)
+        self.assertTrue(resp1.startswith(b"HTTP/1.1 401 Unauthorized"), resp1)
+        self.assertFalse((rx_state / "last_peer_ip").exists())
+        self.assertFalse((rx_state / "rx_in_progress.lock").exists())
+
+        # 2. Expired token -> 401 Unauthorized
+        token_file.write_text(json.dumps({
+            "tokens": [{"token": valid_tok, "created_at": now - 400, "expires_at": now - 10}]
+        }), encoding="utf-8")
+        resp2 = run_discover(("192.168.49.25", 50002), is_p2p_proxy=False, extra_headers=f"X-GlideDrop-Token: {valid_tok}\r\n")
+        self.assertTrue(resp2.startswith(b"HTTP/1.1 401 Unauthorized"), resp2)
+
+        # 2b. Malformed non-dict p2p_session_token.json (e.g. JSON list) must fail closed with 401
+        token_file.write_text("[]", encoding="utf-8")
+        resp_malformed = run_discover(("192.168.49.25", 50008), is_p2p_proxy=False, extra_headers=f"X-GlideDrop-Token: {valid_tok}\r\n")
+        self.assertTrue(resp_malformed.startswith(b"HTTP/1.1 401 Unauthorized"), resp_malformed)
+
+        # 3. Wrong token when valid token is active -> 401 Unauthorized
+        token_file.write_text(json.dumps({
+            "tokens": [{"token": valid_tok, "created_at": now, "expires_at": now + 300}]
+        }), encoding="utf-8")
+        resp3 = run_discover(("192.168.49.25", 50003), is_p2p_proxy=False, extra_headers=f"X-GlideDrop-Token: {wrong_tok}\r\n")
+        self.assertTrue(resp3.startswith(b"HTTP/1.1 401 Unauthorized"), resp3)
+
+        # 4. Even loopback hitting :8772 directly without token -> 401 Unauthorized
+        resp4 = run_discover(("127.0.0.1", 50004), is_p2p_proxy=False)
+        self.assertTrue(resp4.startswith(b"HTTP/1.1 401 Unauthorized"), resp4)
+
+        # 5. Valid X-GlideDrop-Token on :8772 -> 200 OK
+        resp5 = run_discover(("192.168.49.25", 50005), is_p2p_proxy=False, extra_headers=f"X-GlideDrop-Token: {valid_tok}\r\n")
+        self.assertTrue(resp5.startswith(b"HTTP/1.1 200 OK"), resp5)
+
+        # 6. Finder awdl0 loopback proxy (:8773, is_p2p_proxy=True) works on 127.0.0.1 WITHOUT token
+        resp6 = run_discover(("127.0.0.1", 50006), is_p2p_proxy=True)
+        self.assertTrue(resp6.startswith(b"HTTP/1.1 200 OK"), resp6)
+
+        # 7. Finder proxy (:8773) rejects non-loopback address with 403 Forbidden
+        resp7 = run_discover(("192.168.1.42", 50007), is_p2p_proxy=True)
+        self.assertTrue(resp7.startswith(b"HTTP/1.1 403 Forbidden"), resp7)
+
+        # 8. RECENT_UPLOADS TTL pruning and max size cap (256)
+        recent_map.clear()
+        sig0 = (("a.txt", 10),)
+        self.assertFalse(check_recent(sig0, now=1000.0))
+        self.assertTrue(check_recent(sig0, now=1010.0), "Duplicate upload within 60s TTL must be detected")
+        self.assertFalse(check_recent(sig0, now=1061.0), "Expired entry after 60s TTL must be pruned and accepted again")
+
+        for i in range(300):
+            check_recent(((f"f_{i}.bin", i),), now=2000.0 + (i * 0.01))
+        self.assertLessEqual(len(recent_map), 256, "RECENT_UPLOADS must be bounded to <= 256 entries")
 
 
 if __name__ == "__main__":

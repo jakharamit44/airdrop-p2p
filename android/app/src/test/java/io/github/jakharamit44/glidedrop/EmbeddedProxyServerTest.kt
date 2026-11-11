@@ -8,6 +8,7 @@ import org.junit.Test
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.charset.StandardCharsets
@@ -31,29 +32,102 @@ class EmbeddedProxyServerTest {
         assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("8.8.8.8")))
     }
 
+    private fun newRelayTestProxy(mockPort: Int): EmbeddedProxyServer {
+        val publicTestIp = byteArrayOf(93.toByte(), 184.toByte(), 216.toByte(), 34)
+        return EmbeddedProxyServer(
+            context = null,
+            port = 0,
+            outboundAddressResolver = { _, host ->
+                if (host == "relay.example.test" || host == "93.184.216.34") {
+                    arrayOf(InetAddress.getByAddress(host, publicTestIp))
+                } else {
+                    InetAddress.getAllByName(host)
+                }
+            },
+            outboundSocketConnectHook = { sock, addr, port, timeoutMs ->
+                if (addr.address.contentEquals(publicTestIp) && port == mockPort) {
+                    sock.connect(InetSocketAddress(InetAddress.getByName("127.0.0.1"), mockPort), timeoutMs)
+                } else {
+                    sock.connect(InetSocketAddress(addr, port), timeoutMs)
+                }
+            }
+        )
+    }
+
     @Test
     fun testIsTargetSafe() {
         assertTrue(EmbeddedProxyServer.isTargetSafe("example.com", 443))
         assertTrue(EmbeddedProxyServer.isTargetSafe("1.1.1.1", 80))
-        assertTrue(EmbeddedProxyServer.isTargetSafe("127.0.0.1", 8080))
-        assertTrue(EmbeddedProxyServer.isTargetSafe("127.0.0.2", 8080))
+        assertTrue(EmbeddedProxyServer.isTargetSafe("93.184.216.34", 8080))
+        assertTrue(EmbeddedProxyServer.isTargetSafe("2606:4700:4700::1111", 443))
+        // Non-RFC1918 boundary checks around 172.16.0.0/12 and 192.168.0.0/16
+        assertTrue(EmbeddedProxyServer.isTargetSafe("172.15.255.255", 80))
+        assertTrue(EmbeddedProxyServer.isTargetSafe("172.32.0.1", 80))
+        assertTrue(EmbeddedProxyServer.isTargetSafe("192.167.1.1", 80))
+        assertTrue(EmbeddedProxyServer.isTargetSafe("11.0.0.1", 80))
 
-        // Blocked SSRF loopback to local GlideDrop or proxy daemon across all loopback variants
-        assertFalse(EmbeddedProxyServer.isTargetSafe("127.0.0.1", 8771))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("127.0.0.2", 8771))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("127.1", 8771))
+        // Blocked SSRF loopback across ALL ports (not just 8771/1080)
+        for (port in listOf(80, 443, 8080, 8771, 1080, 22, 65535)) {
+            assertFalse(EmbeddedProxyServer.isTargetSafe("127.0.0.1", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("127.0.0.2", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("127.255.255.254", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("127.1", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("2130706433", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("0177.0.0.1", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("0x7f.0.0.1", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("localhost", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("localhost.", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("localhost.localdomain", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("api.localhost", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("::1", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("[::1]", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("0:0:0:0:0:0:0:1", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("::ffff:127.0.0.1", port))
+            assertFalse(EmbeddedProxyServer.isTargetSafe("::ffff:7f00:1", port))
+        }
+
+        // Wildcard / unspecified addresses across all ports
+        assertFalse(EmbeddedProxyServer.isTargetSafe("0.0.0.0", 80))
         assertFalse(EmbeddedProxyServer.isTargetSafe("0.0.0.0", 8771))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("0", 8771))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("::1", 8771))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("::", 8771))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("::ffff:127.0.0.1", 8771))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("localhost", 1080))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("localhost.", 1080))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("0.1.2.3", 8080))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("0", 8080))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("::", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("[::]", 443))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("0:0:0:0:0:0:0:0", 8080))
+
+        // RFC 1918 private LAN ranges across all ports
+        assertFalse(EmbeddedProxyServer.isTargetSafe("10.0.0.1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("10.255.255.254", 443))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("172.16.0.1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("172.31.255.254", 8080))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("192.168.1.1", 80))
         assertFalse(EmbeddedProxyServer.isTargetSafe("192.168.49.1", 8771))
         assertFalse(EmbeddedProxyServer.isTargetSafe("192.168.49.1", 1080))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("::ffff:192.168.49.1", 1080))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("::ffff:192.168.1.1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("::ffff:10.0.0.1", 443))
 
-        // Invalid ports
+        // Cloud metadata & IPv4/IPv6 link-local across all ports
+        assertFalse(EmbeddedProxyServer.isTargetSafe("169.254.169.254", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("169.254.0.1", 443))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("2852039166", 80)) // 169.254.169.254
+        assertFalse(EmbeddedProxyServer.isTargetSafe("::ffff:169.254.169.254", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("metadata.google.internal", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("fe80::1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("[fe80::1]", 443))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("fe80::1%eth0", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("febf:ffff::1", 8080))
+
+        // IPv6 ULA (fc00::/7) & site-local (fec0::/10) & multicast across all ports
+        assertFalse(EmbeddedProxyServer.isTargetSafe("fd00::1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("fc00::1", 443))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("fd12:3456:789a::1", 8080))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("fec0::1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("224.0.0.1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("239.255.255.250", 1900))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("ff02::1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("255.255.255.255", 80))
+
+        // Invalid ports / empty / malformed
         assertFalse(EmbeddedProxyServer.isTargetSafe("example.com", 0))
         assertFalse(EmbeddedProxyServer.isTargetSafe("example.com", -1))
         assertFalse(EmbeddedProxyServer.isTargetSafe("example.com", 65536))
@@ -86,7 +160,7 @@ class EmbeddedProxyServerTest {
         serverThread.isDaemon = true
         serverThread.start()
 
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = newRelayTestProxy(mockPort)
         assertTrue(proxy.start())
         val proxyPort = proxy.actualPort
 
@@ -104,12 +178,12 @@ class EmbeddedProxyServerTest {
             assertEquals(0x05, ver)
             assertEquals(0x00, method)
 
-            // Step 2: SOCKS5 connect to 127.0.0.1:mockPort
+            // Step 2: SOCKS5 connect to public test IP 93.184.216.34:mockPort
             val portHi = (mockPort shr 8) and 0xFF
             val portLo = mockPort and 0xFF
             val connectReq = byteArrayOf(
                 0x05, 0x01, 0x00, 0x01,
-                127, 0, 0, 1,
+                93, 184.toByte(), 216.toByte(), 34,
                 portHi.toByte(), portLo.toByte()
             )
             clientOut.write(connectReq)
@@ -164,7 +238,7 @@ class EmbeddedProxyServerTest {
         serverThread.isDaemon = true
         serverThread.start()
 
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = newRelayTestProxy(mockPort)
         assertTrue(proxy.start())
         val proxyPort = proxy.actualPort
 
@@ -173,7 +247,7 @@ class EmbeddedProxyServerTest {
             val clientIn = client.getInputStream()
             val clientOut = client.getOutputStream()
 
-            val req = "CONNECT 127.0.0.1:$mockPort HTTP/1.1\r\nHost: 127.0.0.1:$mockPort\r\n\r\n"
+            val req = "CONNECT relay.example.test:$mockPort HTTP/1.1\r\nHost: relay.example.test:$mockPort\r\n\r\n"
             clientOut.write(req.toByteArray(StandardCharsets.US_ASCII))
             clientOut.flush()
 
@@ -233,7 +307,7 @@ class EmbeddedProxyServerTest {
         serverThread.isDaemon = true
         serverThread.start()
 
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = newRelayTestProxy(mockPort)
         assertTrue(proxy.start())
 
         try {
@@ -241,8 +315,15 @@ class EmbeddedProxyServerTest {
             val clientIn = client.getInputStream()
             val clientOut = client.getOutputStream()
 
-            // Standard HTTP forward proxy request
-            val req = "GET http://127.0.0.1:$mockPort/index.html HTTP/1.1\r\nHost: 127.0.0.1:$mockPort\r\nUser-Agent: curl/8.0\r\n\r\n"
+            // Standard HTTP forward proxy request with hop-by-hop & proxy auth headers that MUST be stripped
+            val req = "GET http://relay.example.test:$mockPort/index.html HTTP/1.1\r\n" +
+                "Host: relay.example.test:$mockPort\r\n" +
+                "Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n" +
+                "Proxy-Authenticate: Basic realm=\"proxy\"\r\n" +
+                "Proxy-Connection: keep-alive\r\n" +
+                "Connection: keep-alive, X-Custom-Hop\r\n" +
+                "X-Custom-Hop: leak-me\r\n" +
+                "User-Agent: curl/8.0\r\n\r\n"
             clientOut.write(req.toByteArray(StandardCharsets.US_ASCII))
             clientOut.flush()
 
@@ -261,6 +342,12 @@ class EmbeddedProxyServerTest {
             client.close()
             assertTrue(requestLatch.await(5, TimeUnit.SECONDS))
             assertTrue(receivedRequest.startsWith("GET /index.html HTTP/1.1"))
+            assertFalse(receivedRequest.contains("Proxy-Authorization", ignoreCase = true))
+            assertFalse(receivedRequest.contains("Proxy-Authenticate", ignoreCase = true))
+            assertFalse(receivedRequest.contains("Proxy-Connection", ignoreCase = true))
+            assertFalse(receivedRequest.contains("X-Custom-Hop", ignoreCase = true))
+            assertFalse(receivedRequest.contains("keep-alive", ignoreCase = true))
+            assertTrue(receivedRequest.contains("Connection: close\r\n"))
         } finally {
             proxy.stop()
             mockServer.close()
@@ -420,18 +507,39 @@ class EmbeddedProxyServerTest {
 
     @Test
     fun testForwardHttpHeaderNormalization() {
-        val raw = "GET http://example.com/test HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: Keep-Alive\r\nConnection: keep-alive\r\nUser-Agent: curl/8.0\r\n\r\n"
+        val raw = "GET http://example.com/test HTTP/1.1\r\n" +
+            "Host: example.com\r\n" +
+            "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n" +
+            "Proxy-Authenticate: Basic realm=\"test\"\r\n" +
+            "Proxy-Connection: Keep-Alive\r\n" +
+            "Connection: keep-alive, X-Hop-Secret, X-Other-Hop\r\n" +
+            "X-Hop-Secret: secret123\r\n" +
+            "X-Other-Hop: leak\r\n" +
+            "Keep-Alive: timeout=5\r\n" +
+            "TE: trailers\r\n" +
+            "Trailer: X-Checksum\r\n" +
+            "User-Agent: curl/8.0\r\n\r\n"
         val rewritten = EmbeddedProxyServer.rewriteForwardHttpHeaders("GET", "/test", "HTTP/1.1", raw)
         assertTrue(rewritten.startsWith("GET /test HTTP/1.1\r\n"))
+        assertFalse(rewritten.contains("Proxy-Authorization", ignoreCase = true))
+        assertFalse(rewritten.contains("Proxy-Authenticate", ignoreCase = true))
         assertFalse(rewritten.contains("Proxy-Connection", ignoreCase = true))
-        assertFalse(rewritten.contains("keep-alive", ignoreCase = true))
+        assertFalse(rewritten.contains("X-Hop-Secret", ignoreCase = true))
+        assertFalse(rewritten.contains("X-Other-Hop", ignoreCase = true))
+        assertFalse(rewritten.contains("Keep-Alive", ignoreCase = true))
+        assertFalse(rewritten.contains("TE:", ignoreCase = true))
+        assertFalse(rewritten.contains("Trailer:", ignoreCase = true))
+        assertTrue(rewritten.contains("Host: example.com\r\n"))
+        assertTrue(rewritten.contains("User-Agent: curl/8.0\r\n"))
         assertTrue(rewritten.contains("Connection: close\r\n"))
         assertTrue(rewritten.endsWith("\r\n\r\n"))
 
+        // Upgrade headers must also be stripped if rewriteForwardHttpHeaders is invoked directly, enforcing Connection: close
         val upgradeRaw = "GET http://example.com/ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+        assertTrue(EmbeddedProxyServer.hasUpgradeHeader(upgradeRaw))
         val upgradeRewritten = EmbeddedProxyServer.rewriteForwardHttpHeaders("GET", "/ws", "HTTP/1.1", upgradeRaw)
-        assertTrue(upgradeRewritten.contains("Connection: Upgrade\r\n"))
-        assertFalse(upgradeRewritten.contains("Connection: close"))
+        assertFalse(upgradeRewritten.contains("Upgrade", ignoreCase = true))
+        assertTrue(upgradeRewritten.contains("Connection: close\r\n"))
     }
 
     @Test
@@ -537,14 +645,14 @@ class EmbeddedProxyServerTest {
         serverThread.isDaemon = true
         serverThread.start()
 
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = newRelayTestProxy(mockPort)
         assertTrue(proxy.start())
 
         try {
             Socket("127.0.0.1", proxy.actualPort).use { client ->
                 val inp = client.getInputStream()
                 val out = client.getOutputStream()
-                val req = "POST http://127.0.0.1:$mockPort/submit?a=1|2 HTTP/1.1\r\nHost: 127.0.0.1:$mockPort\r\nProxy-Connection: keep-alive\r\nContent-Length: ${reqBodyPayload.length}\r\n\r\n$reqBodyPayload"
+                val req = "POST http://relay.example.test:$mockPort/submit?a=1|2 HTTP/1.1\r\nHost: relay.example.test:$mockPort\r\nProxy-Connection: keep-alive\r\nContent-Length: ${reqBodyPayload.length}\r\n\r\n$reqBodyPayload"
                 out.write(req.toByteArray(StandardCharsets.UTF_8))
                 out.flush()
 
@@ -591,12 +699,12 @@ class EmbeddedProxyServerTest {
         serverThread.isDaemon = true
         serverThread.start()
 
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = newRelayTestProxy(mockPort)
         assertTrue(proxy.start())
 
         try {
             // Exact 8192-byte HTTP request header must succeed (not spuriously rejected with 431)
-            val prefix = "GET http://127.0.0.1:$mockPort/ HTTP/1.1\r\nHost: 127.0.0.1:$mockPort\r\nX-Pad: "
+            val prefix = "GET http://relay.example.test:$mockPort/ HTTP/1.1\r\nHost: relay.example.test:$mockPort\r\nX-Pad: "
             val suffix = "\r\n\r\n"
             val padLen = 8192 - prefix.length - suffix.length
             val exactReq = prefix + "A".repeat(padLen) + suffix
@@ -686,6 +794,238 @@ class EmbeddedProxyServerTest {
         } finally {
             proxy.stop()
         }
+    }
+
+    @Test
+    fun testSsrfBlockedAcrossAllPortsAndAddressClassesOverHttpAndSocks5() {
+        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        assertTrue(proxy.start())
+        val proxyPort = proxy.actualPort
+
+        val blockedConnectTargets = listOf(
+            "127.0.0.1:8080",
+            "127.0.0.1:80",
+            "[::1]:80",
+            "[::1]:8080",
+            "localhost:8080",
+            "10.0.0.1:80",
+            "172.16.0.1:443",
+            "192.168.1.1:8080",
+            "169.254.169.254:80",
+            "[fe80::1]:80",
+            "[fd00::1]:80",
+            "[fc00::1]:443",
+            "0.0.0.0:80",
+            "[::]:80"
+        )
+
+        try {
+            // 1. HTTP CONNECT SSRF targets across arbitrary ports
+            for (target in blockedConnectTargets) {
+                Socket("127.0.0.1", proxyPort).use { client ->
+                    val out = client.getOutputStream()
+                    val inp = client.getInputStream()
+                    out.write("CONNECT $target HTTP/1.1\r\nHost: $target\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+                    val status = readLine(inp).orEmpty()
+                    assertTrue("Expected 403 Forbidden for CONNECT $target, got: $status", status.contains("403"))
+                }
+            }
+
+            // 2. HTTP Forward GET SSRF targets across arbitrary ports
+            for (target in listOf("127.0.0.1:8080", "[::1]:80", "10.0.0.1:80", "172.16.0.1:80", "192.168.1.1:80", "169.254.169.254:80", "[fe80::1]:80", "[fd00::1]:80")) {
+                Socket("127.0.0.1", proxyPort).use { client ->
+                    val out = client.getOutputStream()
+                    val inp = client.getInputStream()
+                    out.write("GET http://$target/latest/meta-data/ HTTP/1.1\r\nHost: $target\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+                    val status = readLine(inp).orEmpty()
+                    assertTrue("Expected 403 Forbidden for GET http://$target/, got: $status", status.contains("403"))
+                }
+            }
+
+            // 3. SOCKS5 IPv4 & IPv6 targets across arbitrary ports
+            val socksTargets: List<Pair<Byte, ByteArray>> = listOf(
+                0x01.toByte() to byteArrayOf(127, 0, 0, 1),
+                0x01.toByte() to byteArrayOf(10, 0, 0, 1),
+                0x01.toByte() to byteArrayOf(172.toByte(), 16, 0, 1),
+                0x01.toByte() to byteArrayOf(192.toByte(), 168.toByte(), 1, 1),
+                0x01.toByte() to byteArrayOf(169.toByte(), 254.toByte(), 169.toByte(), 254.toByte()),
+                0x04.toByte() to InetAddress.getByName("::1").address,
+                0x04.toByte() to InetAddress.getByName("fe80::1").address,
+                0x04.toByte() to InetAddress.getByName("fd00::1").address
+            )
+            for ((atyp, addrBytes) in socksTargets) {
+                Socket("127.0.0.1", proxyPort).use { client ->
+                    val inp = client.getInputStream()
+                    val out = client.getOutputStream()
+                    out.write(byteArrayOf(0x05, 0x01, 0x00))
+                    out.flush()
+                    assertEquals(0x05, inp.read())
+                    assertEquals(0x00, inp.read())
+
+                    val req = ByteArray(4 + addrBytes.size + 2)
+                    req[0] = 0x05
+                    req[1] = 0x01
+                    req[2] = 0x00
+                    req[3] = atyp
+                    System.arraycopy(addrBytes, 0, req, 4, addrBytes.size)
+                    req[4 + addrBytes.size] = 0x00
+                    req[5 + addrBytes.size] = 0x50 // port 80
+                    out.write(req)
+                    out.flush()
+
+                    val reply = ByteArray(10)
+                    readFully(inp, reply)
+                    assertEquals(0x05, reply[0].toInt() and 0xFF)
+                    assertEquals(0x02, reply[1].toInt() and 0xFF)
+                }
+            }
+        } finally {
+            proxy.stop()
+        }
+    }
+
+    @Test
+    fun testPostDnsRebindingSsrfBlockedAcrossAllPorts() {
+        val rebindIps = listOf(
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "::1",
+            "fe80::1",
+            "fd00::1"
+        )
+        var currentIdx = 0
+        val proxy = EmbeddedProxyServer(
+            context = null,
+            port = 0,
+            outboundAddressResolver = { _, host ->
+                arrayOf(InetAddress.getByAddress(host, InetAddress.getByName(rebindIps[currentIdx]).address))
+            }
+        )
+        assertTrue(proxy.start())
+        try {
+            for (idx in rebindIps.indices) {
+                currentIdx = idx
+                Socket("127.0.0.1", proxy.actualPort).use { client ->
+                    val out = client.getOutputStream()
+                    val inp = client.getInputStream()
+                    out.write("CONNECT rebind.example.test:8080 HTTP/1.1\r\nHost: rebind.example.test:8080\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+                    val status = readLine(inp).orEmpty()
+                    assertTrue("Expected post-DNS 403 for ${rebindIps[idx]}, got: $status", status.contains("403"))
+                }
+            }
+        } finally {
+            proxy.stop()
+        }
+    }
+
+    @Test
+    fun testUpgradeRequestsRejectedOnRawProxySockets() {
+        val mockServer = ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"))
+        val mockPort = mockServer.localPort
+        val upstreamTouched = CountDownLatch(1)
+        val serverThread = Thread {
+            try {
+                mockServer.accept().use {
+                    upstreamTouched.countDown()
+                }
+            } catch (_: Exception) {
+            }
+        }
+        serverThread.isDaemon = true
+        serverThread.start()
+
+        val proxy = newRelayTestProxy(mockPort)
+        assertTrue(proxy.start())
+        try {
+            // 1. Forward HTTP with Connection: Upgrade + Upgrade: websocket must be rejected with 403 without hitting upstream
+            Socket("127.0.0.1", proxy.actualPort).use { client ->
+                val out = client.getOutputStream()
+                val inp = client.getInputStream()
+                val req = "GET http://relay.example.test:$mockPort/ws HTTP/1.1\r\n" +
+                    "Host: relay.example.test:$mockPort\r\n" +
+                    "Connection: Upgrade\r\n" +
+                    "Upgrade: websocket\r\n\r\n"
+                out.write(req.toByteArray(StandardCharsets.US_ASCII))
+                out.flush()
+                val status = readLine(inp).orEmpty()
+                assertTrue("Expected 403 Forbidden for Upgrade request, got: $status", status.contains("403"))
+            }
+
+            // 2. Standalone Upgrade: h2c header without Connection: Upgrade must also be rejected
+            Socket("127.0.0.1", proxy.actualPort).use { client ->
+                val out = client.getOutputStream()
+                val inp = client.getInputStream()
+                val req = "GET http://relay.example.test:$mockPort/ HTTP/1.1\r\n" +
+                    "Host: relay.example.test:$mockPort\r\n" +
+                    "Upgrade: h2c\r\n\r\n"
+                out.write(req.toByteArray(StandardCharsets.US_ASCII))
+                out.flush()
+                val status = readLine(inp).orEmpty()
+                assertTrue("Expected 403 Forbidden for Upgrade: h2c, got: $status", status.contains("403"))
+            }
+
+            // 3. Proxy-Connection: Upgrade must also be rejected
+            Socket("127.0.0.1", proxy.actualPort).use { client ->
+                val out = client.getOutputStream()
+                val inp = client.getInputStream()
+                val req = "GET http://relay.example.test:$mockPort/ HTTP/1.1\r\n" +
+                    "Host: relay.example.test:$mockPort\r\n" +
+                    "Proxy-Connection: Upgrade\r\n\r\n"
+                out.write(req.toByteArray(StandardCharsets.US_ASCII))
+                out.flush()
+                val status = readLine(inp).orEmpty()
+                assertTrue("Expected 403 Forbidden for Proxy-Connection: Upgrade, got: $status", status.contains("403"))
+            }
+
+            // 4. Bare CR smuggling of Upgrade / Proxy-Authorization must be rejected with 400 Bad Request
+            for (smuggled in listOf(
+                "GET http://relay.example.test:$mockPort/ HTTP/1.1\rUpgrade: websocket\r\nHost: relay.example.test:$mockPort\r\n\r\n",
+                "GET http://relay.example.test:$mockPort/ HTTP/1.1\r\nHost: relay.example.test:$mockPort\r\nX-Foo: 1\rUpgrade: websocket\r\n\r\n",
+                "GET http://relay.example.test:$mockPort/ HTTP/1.1\r\nHost: relay.example.test:$mockPort\r\nX-Foo: 1\rProxy-Authorization: Basic secret\r\n\r\n"
+            )) {
+                Socket("127.0.0.1", proxy.actualPort).use { client ->
+                    val out = client.getOutputStream()
+                    val inp = client.getInputStream()
+                    out.write(smuggled.toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+                    val status = readLine(inp).orEmpty()
+                    assertTrue("Expected 400 Bad Request for bare-CR header smuggling, got: $status", status.contains("400"))
+                }
+            }
+
+            // 5. Explicit :0 port in forward HTTP URI must be rejected with 403 (not coerced to port 80)
+            Socket("127.0.0.1", proxy.actualPort).use { client ->
+                val out = client.getOutputStream()
+                val inp = client.getInputStream()
+                val req = "GET http://relay.example.test:0/ HTTP/1.1\r\nHost: relay.example.test:0\r\n\r\n"
+                out.write(req.toByteArray(StandardCharsets.US_ASCII))
+                out.flush()
+                val status = readLine(inp).orEmpty()
+                assertTrue("Expected 403 Forbidden for explicit :0 port, got: $status", status.contains("403"))
+            }
+
+            assertFalse("Rejected Upgrade/smuggled requests must not dial upstream server", upstreamTouched.await(250, TimeUnit.MILLISECONDS))
+        } finally {
+            proxy.stop()
+            mockServer.close()
+        }
+    }
+
+    @Test
+    fun testAdditionalEdgeBlockedTargetsAndHeaderHelpers() {
+        assertFalse(EmbeddedProxyServer.isTargetSafe("64:ff9b:1::1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("64:ff9b::127.0.0.1", 80))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("foo.localdomain", 80))
+        assertTrue(EmbeddedProxyServer.hasInvalidHttpHeaderSyntax("GET / HTTP/1.1\r\nX-A: 1\rUpgrade: ws\r\n\r\n"))
+        assertFalse(EmbeddedProxyServer.hasInvalidHttpHeaderSyntax("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
+        assertTrue(EmbeddedProxyServer.hasUpgradeHeader("GET / HTTP/1.1\rUpgrade: websocket\r\nHost: example.com\r\n\r\n"))
+        assertTrue(EmbeddedProxyServer.hasUpgradeHeader("GET / HTTP/1.1\r\nProxy-Connection: keep-alive, Upgrade\r\n\r\n"))
     }
 
     private fun readFully(inp: InputStream, buf: ByteArray) {

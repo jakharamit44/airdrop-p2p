@@ -47,7 +47,7 @@ ensure_ble_bin() {
       cp -f "$SCRIPT_DIR/AppIcon.icns" "$APP_RES/AppIcon.icns" 2>/dev/null || true
     fi
     chmod +x "$APP_RES/glidedrop.sh" 2>/dev/null || true
-    APP_VER="$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "2.5.0")"
+    APP_VER="$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "2.6.0")"
     cat > "$SCRIPT_DIR/GlideDrop.app/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -96,13 +96,31 @@ stop_http_daemons() {
 
 stop_daemons() {
   stop_http_daemons
+  local ble_pid=""
   if [[ -f "$BLE_PID_FILE" ]]; then
-    kill "$(cat "$BLE_PID_FILE")" 2>/dev/null || true
+    ble_pid="$(cat "$BLE_PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$ble_pid" ]]; then
+      kill "$ble_pid" 2>/dev/null || true
+    fi
     rm -f "$BLE_PID_FILE"
   fi
-  pkill -f "glidedrop-daemon" 2>/dev/null || true
+  pkill -x "glidedrop-daemon" 2>/dev/null || true
   pkill -x "GlideDrop" 2>/dev/null || true
-  rm -f "$STATE_DIR/tx_in_progress.lock" "$STATE_DIR/rx_in_progress.lock" "$STATE_DIR/transfer_progress.json" "$STATE_DIR/cancel_transfer.flag" "$STATE_DIR/lan_fallback_active.flag" "$STATE_DIR/pending_ask.json" "$STATE_DIR/wp2p_authorized_session.json" 2>/dev/null || true
+  local _wait=0
+  while [[ $_wait -lt 30 ]]; do
+    if [[ -n "$ble_pid" ]] && kill -0 "$ble_pid" 2>/dev/null; then
+      sleep 0.1
+      _wait=$((_wait + 1))
+      continue
+    fi
+    if pgrep -x "GlideDrop" >/dev/null 2>&1 || pgrep -x "glidedrop-daemon" >/dev/null 2>&1; then
+      sleep 0.1
+      _wait=$((_wait + 1))
+      continue
+    fi
+    break
+  done
+  rm -f "$STATE_DIR/tx_in_progress.lock" "$STATE_DIR/rx_in_progress.lock" "$STATE_DIR/transfer_progress.json" "$STATE_DIR/cancel_transfer.flag" "$STATE_DIR/lan_fallback_active.flag" "$STATE_DIR/pending_ask.json" "$STATE_DIR/wp2p_authorized_session.json" "$STATE_DIR/p2p_session_token.json" "$STATE_DIR/pinned_peer_tls_fingerprint.txt" 2>/dev/null || true
 }
 
 start_daemons() {
@@ -134,7 +152,7 @@ start_daemons() {
 
   # Start HTTPS receiver (8772) + Finder Share Android proxy (8773)
   nohup python3 -u - "$STATE_DIR/cert.pem" "$STATE_DIR/key.pem" "$PORT" "$PROXY_PORT" "$SCRIPT_DIR/glidedrop.sh" >"$LOG_FILE" 2>&1 << 'PYEOF' &
-import gzip, io, json, os, plistlib, queue, re, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, uuid, zlib
+import gzip, hmac, io, json, os, plistlib, queue, re, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, uuid, zlib
 from pathlib import Path
 
 CERT_FILE, KEY_FILE, PORT, PROXY_PORT, SCRIPT_PATH = (
@@ -983,7 +1001,60 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
             write_progress(False)
 
 FORWARD_LOCK = threading.Lock()
+RECENT_UPLOADS_LOCK = threading.Lock()
 RECENT_UPLOADS = {}
+RECENT_UPLOADS_TTL = 60.0
+RECENT_UPLOADS_MAX = 256
+
+def check_and_record_recent_upload(sig, now: float = None) -> bool:
+    if not sig:
+        return False
+    ts = time.time() if now is None else now
+    with RECENT_UPLOADS_LOCK:
+        expired = [k for k, v in RECENT_UPLOADS.items() if (ts - v) >= RECENT_UPLOADS_TTL]
+        for k in expired:
+            del RECENT_UPLOADS[k]
+        if sig in RECENT_UPLOADS:
+            return True
+        while len(RECENT_UPLOADS) >= RECENT_UPLOADS_MAX:
+            oldest_k = min(RECENT_UPLOADS, key=RECENT_UPLOADS.get)
+            del RECENT_UPLOADS[oldest_k]
+        RECENT_UPLOADS[sig] = ts
+        return False
+
+def is_valid_p2p_session_token(presented: str, now: float = None) -> bool:
+    clean = str(presented or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", clean):
+        return False
+    token_file = STATE_DIR / "p2p_session_token.json"
+    try:
+        raw = token_file.read_text(encoding="utf-8")
+        obj = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(obj, dict):
+        return False
+    ts = time.time() if now is None else now
+    entries = obj.get("tokens")
+    if isinstance(entries, list):
+        matched = False
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            tok = str(item.get("token") or "").strip().lower()
+            try:
+                exp = float(item.get("expires_at") or 0.0)
+            except Exception:
+                exp = 0.0
+            if tok and exp > ts and hmac.compare_digest(clean, tok):
+                matched = True
+        return matched
+    tok = str(obj.get("token") or "").strip().lower()
+    try:
+        exp = float(obj.get("expires_at") or 0.0)
+    except Exception:
+        exp = 0.0
+    return bool(tok and exp > ts and hmac.compare_digest(clean, tok))
 
 def forward_to_peer_worker(tmp_dir: Path, saved_files):
     with FORWARD_LOCK:
@@ -993,8 +1064,9 @@ def forward_to_peer_worker(tmp_dir: Path, saved_files):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-def send_resp(conn, status: int, reason: str, body: bytes = b""):
-    hdr = f"HTTP/1.1 {status} {reason}\r\nContent-Length: {len(body)}\r\n\r\n".encode("ascii")
+def send_resp(conn, status: int, reason: str, body: bytes = b"", close: bool = False):
+    conn_hdr = "Connection: close\r\n" if close else ""
+    hdr = f"HTTP/1.1 {status} {reason}\r\n{conn_hdr}Content-Length: {len(body)}\r\n\r\n".encode("ascii")
     conn.sendall(hdr + body)
 
 def handle_client(conn, addr, is_p2p_proxy: bool = False):
@@ -1019,8 +1091,6 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
             pass
 
     try:
-        if not is_p2p_proxy:
-            touch_rx_lock()
         conn.settimeout(30.0)
         f = conn.makefile("rb", buffering=1048576)
         while True:
@@ -1037,6 +1107,18 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                 if ":" in l:
                     k, v = l.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
+            if not is_p2p_proxy:
+                if not is_valid_p2p_session_token(headers.get("x-glidedrop-token", "")):
+                    print(f"[P2P-Receiver] Rejected unauthorized {method} {path} from {addr} (invalid or missing X-GlideDrop-Token)")
+                    sys.stdout.flush()
+                    send_resp(conn, 401, "Unauthorized", b"", close=True)
+                    break
+                touch_rx_lock()
+            elif peer_ip not in ("127.0.0.1", "::1"):
+                print(f"[Finder-Proxy] Rejected non-loopback connection from {addr}")
+                sys.stdout.flush()
+                send_resp(conn, 403, "Forbidden", b"", close=True)
+                break
             is_upload = (method == "POST" and path == "/Upload")
             exp_tot = int(headers.get("totalbytes", "0") or 0) or last_total
             body = b"" if is_upload else read_body_bytes(
@@ -1156,14 +1238,11 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     saved, rx_len = stream_upload_to_dir(f, headers, tmp_dir, track_progress=False, file_label=last_label, expected_total=exp_tot, file_count=last_count)
                     print(f"[{role}] {method} {path} from {addr} ({rx_len} B)")
                     sig = tuple((p.name, p.stat().st_size) for p in saved)
-                    now = time.time()
                     send_resp(conn, 200, "OK", b"")
-                    if sig and (now - RECENT_UPLOADS.get(sig, 0.0)) < 60.0:
+                    if check_and_record_recent_upload(sig):
                         print(f"[Finder-Proxy] Skipping duplicate retry for {[p.name for p in saved]}")
                         shutil.rmtree(tmp_dir, ignore_errors=True)
                     else:
-                        if sig:
-                            RECENT_UPLOADS[sig] = now
                         print(f"[Finder-Proxy] Forwarding {len(saved)} file(s) from Finder Share Proxy to {active_peer_name}: {[p.name for p in saved]}")
                         threading.Thread(target=forward_to_peer_worker, args=(tmp_dir, saved), daemon=True).start()
                     break
@@ -1285,6 +1364,26 @@ def serve_port(bind_port: int, is_p2p_proxy: bool):
         except Exception:
             raw.close()
 
+def _is_lock_active(lock_path: Path, ttl: float) -> bool:
+    if not lock_path.exists():
+        return False
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+        ts = float(raw.split("\t")[-1])
+        if (time.time() - ts) < ttl:
+            return True
+    except Exception:
+        try:
+            if (time.time() - lock_path.stat().st_mtime) < ttl:
+                return True
+        except Exception:
+            return False
+    try:
+        lock_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return False
+
 def watch_awdl_mdns():
     pid_file = STATE_DIR / "awdl-mdns.pid"
     rx_lock = STATE_DIR / "rx_in_progress.lock"
@@ -1293,7 +1392,7 @@ def watch_awdl_mdns():
     proc = None
     while True:
         try:
-            if rx_lock.exists() or tx_lock.exists():
+            if _is_lock_active(rx_lock, 30.0) or _is_lock_active(tx_lock, 180.0):
                 if proc and proc.poll() is None:
                     proc.terminate()
                 proc = None
@@ -1393,6 +1492,20 @@ case "$MODE" in
       set -- "$SELECTED"
     fi
     ensure_ble_bin
+    HAS_PEER_ARG=0
+    _scan_args=("$@")
+    _idx=0
+    while [[ $_idx -lt ${#_scan_args[@]} ]]; do
+      _cur="${_scan_args[$_idx]}"
+      if [[ "$_cur" == "--peer" ]]; then
+        HAS_PEER_ARG=1
+        break
+      elif [[ "$_cur" == "--pin" ]]; then
+        _idx=$((_idx + 2))
+      else
+        break
+      fi
+    done
     PY_PID=""
     SIGNAL_CANCELLED=0
     cleanup_send_py() {
@@ -1517,22 +1630,6 @@ if peer_pin is None:
         except Exception:
             pass
 
-expected_fp = None
-if peer_pin is not None:
-    normalized_pin = peer_pin.replace(":", "").replace("-", "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", normalized_pin):
-        raise ssl.SSLError("Invalid SHA-256 peer TLS certificate fingerprint")
-    expected_fp = normalized_pin
-
-urls = [a for a in args if a.startswith("http://") or a.startswith("https://")]
-file_args = [a for a in args if a not in urls]
-files = [Path(a).expanduser().resolve() for a in file_args]
-for f in files:
-    if not f.is_file():
-        sys.exit(f"File not found: {f}")
-
-total_bytes = sum(f.stat().st_size for f in files)
-
 def discover_android():
     try:
         with socket.create_connection(("192.168.49.1", 8771), timeout=0.25):
@@ -1541,7 +1638,28 @@ def discover_android():
         pass
     raise RuntimeError("Deferring to BLE L2CAP + 5GHz Wi-Fi Direct P2P")
 
+transfer_succeeded = False
+terminal_exit_code = None
+
 try:
+    expected_fp = None
+    if peer_pin is not None:
+        normalized_pin = peer_pin.replace(":", "").replace("-", "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized_pin):
+            print("[-] Invalid SHA-256 peer TLS certificate fingerprint", file=sys.stderr)
+            sys.exit(45)
+        expected_fp = normalized_pin
+
+    urls = [a for a in args if a.startswith("http://") or a.startswith("https://")]
+    file_args = [a for a in args if a not in urls]
+    files = [Path(a).expanduser().resolve() for a in file_args]
+    for f in files:
+        if not f.is_file():
+            print(f"File not found: {f}", file=sys.stderr)
+            sys.exit(45)
+
+    total_bytes = sum(f.stat().st_size for f in files)
+
     if peer_override:
         host, _, port_s = peer_override.partition(":")
         port = int(port_s) if port_s else 8771
@@ -1676,6 +1794,7 @@ try:
                 s.sendall(hdr_bytes)
                 tx_start = time.time()
                 last_emit = 0.0
+                last_lock_refresh = time.time()
                 off = 0
                 write_progress(True, "Sending", label, 0, tot, 0, 0, 0, fcount, phase="Sending files", peer_name=peer_name, is_connecting=False)
 
@@ -1714,6 +1833,14 @@ try:
                             send_dvzip_block(chunk)
                             off += len(chunk)
                             now = time.time()
+                            if now - last_lock_refresh >= 30.0:
+                                last_lock_refresh = now
+                                tx_lock = STATE_DIR / "tx_in_progress.lock"
+                                if tx_lock.exists():
+                                    try:
+                                        tx_lock.write_text(str(now), encoding="utf-8")
+                                    except Exception:
+                                        pass
                             if now - last_emit >= 0.25 or off >= tot:
                                 last_emit = now
                                 el = max(0.08, now - tx_start)
@@ -1723,7 +1850,7 @@ try:
                                 write_progress(True, "Sending", label, min(off, tot), tot, spd, eta, pct, fcount, phase="Sending files", peer_name=peer_name, is_connecting=False)
                 send_dvzip_block(make_odc_hdr(0, 0, "TRAILER!!!", 0))
                 s.sendall(b"0\r\n\r\n")
-                write_progress(False)
+                write_progress(True, "Sending", label, tot, tot, 0, 0, 99, fcount, phase="Finalizing transfer…", peer_name=peer_name, is_connecting=False)
                 st3, _ = read_http_response(f)
                 elapsed = time.time() - t0
                 print(f"[+] /Upload complete: {st3} ({elapsed:.2f}s)")
@@ -1736,10 +1863,27 @@ try:
                 names = ", ".join(urls)
                 for u in urls:
                     append_history("URL", u, len(u), "sent", peer_name)
+            transfer_succeeded = True
             safe_notify(f"Sent {names} to {peer_name} in {elapsed:.1f}s", "GlideDrop Complete")
+except SystemExit as se:
+    terminal_exit_code = se.code
+    raise
+except ssl.SSLError as e:
+    print(f"[-] FATAL TLS/pinning verification failure: {e}", file=sys.stderr)
+    terminal_exit_code = 46
+    sys.exit(46)
+except RuntimeError as e:
+    if not peer_override and "Deferring to BLE" in str(e):
+        print(f"[*] {e}")
+        terminal_exit_code = 1
+        sys.exit(1)
+    raise
 finally:
     _active_raw_sock[0] = None
-    write_progress(False)
+    # Preserve transfer_progress.json when falling back from glidedrop.sh to "$BLE_BIN" send.
+    # Only clear progress when --peer is set, transfer succeeded, or terminal decline/cancel/input/pinning error occurred.
+    if peer_override or transfer_succeeded or terminal_exit_code in (43, 44, 45, 46):
+        write_progress(False)
 PYEOF
     PY_PID=$!
     wait "$PY_PID" || rc=$?
@@ -1749,15 +1893,24 @@ PYEOF
     fi
     trap - TERM INT
     if [[ "$rc" -ne 0 ]]; then
-      if [[ "$rc" -eq 43 || "$rc" -eq 44 || "${1:-}" == "--peer" ]]; then
-        if [[ "${1:-}" != "--peer" ]]; then
+      if [[ "$rc" -eq 45 ]]; then
+        exit 1
+      fi
+      if [[ "$rc" -eq 43 || "$rc" -eq 44 || "$rc" -eq 46 || "$HAS_PEER_ARG" -eq 1 ]]; then
+        if [[ "$HAS_PEER_ARG" -ne 1 ]]; then
           rm -f "$STATE_DIR/cancel_transfer.flag"
         fi
         exit "$rc"
       fi
       echo "[*] Wi-Fi unreachable — switching to Direct Bluetooth LE L2CAP..."
-      "$BLE_BIN" send "$@"
-      osascript -e "display notification \"Sent to Android device over Direct Bluetooth\" with title \"GlideDrop Complete\"" 2>/dev/null || true
+      if [[ -x "$BLE_BIN" ]]; then
+        "$BLE_BIN" send "$@"
+        osascript -e "display notification \"Sent to Android device over Direct Bluetooth\" with title \"GlideDrop Complete\"" 2>/dev/null || true
+      else
+        rm -f "$STATE_DIR/transfer_progress.json" "$STATE_DIR/tx_in_progress.lock"
+        echo "[-] GlideDrop BLE binary not found at $BLE_BIN" >&2
+        exit 1
+      fi
     fi
     ;;
   ui)

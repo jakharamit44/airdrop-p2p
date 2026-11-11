@@ -30,7 +30,10 @@ import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLHandshakeException
@@ -39,6 +42,13 @@ import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManagerFactory
 
 class GlideDropSecurityTest {
+
+    private fun testDecryptAesGcm(packet: ByteArray, sessionKeyBytes: ByteArray): ByteArray {
+        if (packet.size < 28) throw java.io.IOException("Encrypted frame too short")
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(sessionKeyBytes, "AES"), GCMParameterSpec(128, packet, 0, 12))
+        return cipher.doFinal(packet, 12, packet.size - 12)
+    }
 
     @Test
     fun ecdhP256SharedSecretDerivationMatchesBetweenPeers() {
@@ -79,7 +89,7 @@ class GlideDropSecurityTest {
         val encryptedPacket = GlideDropNode.encryptAesGcm(plainText, sessionKey)
         assertTrue("Ciphertext must include 12-byte IV + payload + 16-byte tag", encryptedPacket.size >= 28 + plainText.size)
 
-        val decryptedBytes = GlideDropNode.decryptAesGcm(encryptedPacket, sessionKey)
+        val decryptedBytes = testDecryptAesGcm(encryptedPacket, sessionKey)
         assertArrayEquals(plainText, decryptedBytes)
 
         val decryptedStr = String(decryptedBytes, StandardCharsets.UTF_8)
@@ -101,7 +111,7 @@ class GlideDropSecurityTest {
         encryptedPacket[15] = (encryptedPacket[15].toInt() xor 0x01).toByte()
 
         try {
-            GlideDropNode.decryptAesGcm(encryptedPacket, sessionKey)
+            testDecryptAesGcm(encryptedPacket, sessionKey)
             fail("Decryption of tampered ciphertext must throw an AEAD authentication exception")
         } catch (_: javax.crypto.AEADBadTagException) {
             // Expected
@@ -114,7 +124,7 @@ class GlideDropSecurityTest {
     fun aes256GcmRejectsShortPackets() {
         val key = ByteArray(32) { 0x42 }
         try {
-            GlideDropNode.decryptAesGcm(ByteArray(27), key)
+            testDecryptAesGcm(ByteArray(27), key)
             fail("Packets shorter than 28 bytes (12 IV + 16 Tag) must be rejected")
         } catch (_: java.io.IOException) {
             // Expected
@@ -488,5 +498,105 @@ class GlideDropSecurityTest {
             runCatching { srv.close() }
             executor.shutdownNow()
         }
+    }
+
+    @Test
+    fun ephemeralBleFrameKeyAndBearerTokenDomainSeparation() {
+        val pairA = GlideDropNode.generateEphemeralEcdhKeyPair()
+        val pairB = GlideDropNode.generateEphemeralEcdhKeyPair()
+
+        val sessionKeyA = GlideDropNode.deriveSessionKey(pairA.privateKey, pairB.publicKey.encoded)
+        val bleFrameKeyA = GlideDropNode.deriveBleFrameKey(pairA.privateKey, pairB.publicKey.encoded)
+        val bleFrameKeyB = GlideDropNode.deriveBleFrameKey(pairB.privateKey, pairA.publicKey.encoded)
+        val tokenA = GlideDropNode.deriveSessionToken(pairA.privateKey, pairB.publicKey.encoded)
+        val tokenB = GlideDropNode.deriveSessionToken(pairB.privateKey, pairA.publicKey.encoded)
+        val (comboKey, comboToken) = GlideDropNode.deriveSessionKeyAndToken(pairA.privateKey, pairB.publicKey.encoded)
+
+        assertEquals(32, bleFrameKeyA.size)
+        assertArrayEquals("Both peers must derive identical ephemeral BLE frame keys", bleFrameKeyA, bleFrameKeyB)
+        assertFalse("BLE frame key must be domain-separated from W2P2 session key", bleFrameKeyA.contentEquals(sessionKeyA))
+        assertArrayEquals(sessionKeyA, comboKey)
+
+        assertEquals(64, tokenA.length)
+        assertTrue("Session token must be lowercase hex", tokenA.all { it in '0'..'9' || it in 'a'..'f' })
+        assertEquals("Both peers must derive identical session bearer tokens", tokenA, tokenB)
+        assertEquals(tokenA, comboToken)
+
+        // Ensure BLE frame payload encrypted under pairA/pairB ephemeral key cannot be decrypted under another pair or static string
+        val payload = "ephemeral-ble-metadata-and-archive".toByteArray(StandardCharsets.UTF_8)
+        val encrypted = GlideDropNode.encryptAesGcm(payload, bleFrameKeyA)
+        assertArrayEquals(payload, testDecryptAesGcm(encrypted, bleFrameKeyB))
+
+        val pairC = GlideDropNode.generateEphemeralEcdhKeyPair()
+        val wrongKey = GlideDropNode.deriveBleFrameKey(pairC.privateKey, pairB.publicKey.encoded)
+        try {
+            testDecryptAesGcm(encrypted, wrongKey)
+            fail("Decrypting ADRE payload with wrong ephemeral ECDH key must fail")
+        } catch (_: java.security.GeneralSecurityException) {
+            // Expected
+        }
+    }
+
+    @Test
+    fun crossLanguageBleFrameKeyAndSessionTokenVectorMatchesSwift() {
+        val p2Data = ByteArray(32) { (it + 33).toByte() }
+        val s = BigInteger(1, p2Data)
+
+        val params = AlgorithmParameters.getInstance("EC")
+        params.init(ECGenParameterSpec("secp256r1"))
+        val ecSpec = params.getParameterSpec(ECParameterSpec::class.java)
+        val priv2 = KeyFactory.getInstance("EC").generatePrivate(ECPrivateKeySpec(s, ecSpec))
+
+        val pub1Der = Base64.getDecoder().decode(
+            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEUVw9brnjlrkE0/7Kf1T9zQzB6Ze/N13KUVrQpsO0A19FNr46UPMY+/mlR1kCoiFQK+8NV+CMU7LMClbxfZ+TVA=="
+        )
+
+        val bleFrameKey = GlideDropNode.deriveBleFrameKey(priv2, pub1Der)
+        val sessionToken = GlideDropNode.deriveSessionToken(priv2, pub1Der)
+        val (comboKey, comboToken) = GlideDropNode.deriveSessionKeyAndToken(priv2, pub1Der)
+
+        assertEquals("yC4CQspFyUEHQ8fiY9BhEhGOrB0F1UGUUtwaSF3WA/4=", Base64.getEncoder().encodeToString(comboKey))
+        assertEquals(sessionToken, comboToken)
+
+        val rawSecret = GlideDropNode.deriveEcdhRawSecret(priv2, pub1Der)
+        val expectedBle = MessageDigest.getInstance("SHA-256").run {
+            update(rawSecret)
+            update("GlideDrop-v2-BleFrameKey".toByteArray(StandardCharsets.UTF_8))
+            digest()
+        }
+        val expectedToken = MessageDigest.getInstance("SHA-256").run {
+            update(rawSecret)
+            update("GlideDrop-v2-BearerToken".toByteArray(StandardCharsets.UTF_8))
+            digest().joinToString("") { "%02x".format(java.util.Locale.US, it) }
+        }
+        assertArrayEquals(expectedBle, bleFrameKey)
+        assertEquals(expectedToken, sessionToken)
+        // Hardcoded literal check matching Swift CryptoKit vector:
+        assertEquals("YrIYKl4YCHCjpy5kHceecyO0ix53rFC6MNbj+dzP6Rg=", Base64.getEncoder().encodeToString(bleFrameKey))
+        assertEquals("e17df0a3f490020f6fa1834856fca83007dbf426c3a07f58207eb1adb31b415e", sessionToken)
+    }
+
+    @Test
+    fun sha256FingerprintValidationRejectsEmptyAndMalformedPins() {
+        val valid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        assertTrue(GlideDropNode.isValidSha256Fingerprint(valid))
+        assertTrue(GlideDropNode.isValidSha256Fingerprint(valid.uppercase().chunked(2).joinToString(":")))
+        assertFalse(GlideDropNode.isValidSha256Fingerprint(null))
+        assertFalse(GlideDropNode.isValidSha256Fingerprint(""))
+        assertFalse(GlideDropNode.isValidSha256Fingerprint("   "))
+        assertFalse(GlideDropNode.isValidSha256Fingerprint("012345"))
+        assertFalse(GlideDropNode.isValidSha256Fingerprint("z".repeat(64)))
+    }
+
+    @Test
+    fun w2p2JoinReplyTimeoutAccommodatesMacDhcpAndInteractivePrompt() {
+        assertTrue(
+            "Android W2P2 joinReply timeout must exceed Mac 60s prompt + 25s DHCP + overhead",
+            GlideDropNode.W2P2_JOIN_REPLY_TIMEOUT_MS >= 95_000L
+        )
+        assertTrue(
+            "Android ADRE ACK timeout must accommodate Mac 60s interactive prompt",
+            GlideDropNode.ADRE_ACK_TIMEOUT_MS >= 60_000L
+        )
     }
 }

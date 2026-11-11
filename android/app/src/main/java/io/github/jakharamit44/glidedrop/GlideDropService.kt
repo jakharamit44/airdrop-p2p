@@ -7,11 +7,12 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.net.toUri
+import java.lang.ref.WeakReference
 
 class GlideDropService : Service() {
 
@@ -23,15 +24,21 @@ class GlideDropService : Service() {
         private var rxNotifId = 2000
 
         @Volatile
-        private var instance: GlideDropNode? = null
-        private var wakeLock: PowerManager.WakeLock? = null
+        private var nodeRef = WeakReference<GlideDropNode>(null)
+
+        private fun peekNode(): GlideDropNode? = nodeRef.get()
 
         fun getNode(context: Context): GlideDropNode {
-            return instance ?: synchronized(this) {
-                instance ?: GlideDropNode(context.applicationContext).also { instance = it }
+            nodeRef.get()?.let { return it }
+            return synchronized(this) {
+                nodeRef.get()?.let { return it }
+                GlideDropNode(context.applicationContext).also { nodeRef = WeakReference(it) }
             }
         }
     }
+
+    private var activeNode: GlideDropNode? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -94,6 +101,7 @@ class GlideDropService : Service() {
         }
 
         val node = getNode(applicationContext)
+        activeNode = node
         node.onTransferProgress = { fileName, pct, doneBytes, totalBytes, speedBps, isSending, isConnecting, phase ->
             if (pct >= 100 || pct < 0) {
                 runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
@@ -132,7 +140,7 @@ class GlideDropService : Service() {
             nm.cancel(1999)
             val notifId = 2000 + (rxNotifId++ % 50)
             val targetIntent = if (item.isUrl) {
-                Intent(Intent.ACTION_VIEW, Uri.parse(item.pathOrUrl))
+                Intent(Intent.ACTION_VIEW, item.pathOrUrl.toUri())
             } else {
                 Intent(this, MainActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -159,19 +167,22 @@ class GlideDropService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            instance?.stop()
+            (activeNode ?: peekNode())?.stop()
             stopSelf()
             return START_NOT_STICKY
         }
-        getNode(applicationContext).start()
+        val node = getNode(applicationContext)
+        activeNode = node
+        node.start()
         return START_NOT_STICKY
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         // If no active file transfer is running, cleanly exit service when app is dismissed from recents
-        if (instance?.isTransferInProgress != true) {
-            instance?.stop()
+        val node = activeNode ?: peekNode()
+        if (node?.isTransferInProgress != true) {
+            node?.stop()
             stopSelf()
         }
     }
@@ -179,9 +190,11 @@ class GlideDropService : Service() {
     override fun onDestroy() {
         runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
         wakeLock = null
-        instance?.onTransferProgress = null
-        instance?.onItemReceived = null
-        instance?.stop()
+        val node = activeNode ?: peekNode()
+        node?.onTransferProgress = null
+        node?.onItemReceived = null
+        node?.stop()
+        activeNode = null
         runCatching {
             val nm = getSystemService(NotificationManager::class.java)
             nm.cancelAll()

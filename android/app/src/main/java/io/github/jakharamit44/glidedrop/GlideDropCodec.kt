@@ -1,5 +1,8 @@
 package io.github.jakharamit44.glidedrop
 
+import android.content.Context
+import android.os.StatFs
+import android.os.storage.StorageManager
 import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -11,6 +14,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.util.zip.Deflater
 import java.util.zip.GZIPInputStream
 import java.util.zip.Inflater
@@ -19,7 +23,6 @@ import java.util.zip.Inflater
  * GlideDrop wire codecs (compatible with Apple bplist00 & DVZip/CPIO):
  * 1. Binary plist (bplist00) encoder/decoder for /Discover and /Ask
  * 2. DVZip + CPIO (070707 odc / 070701 newc / 070764 64-bit) streaming archive encoder/decoder for /Upload
- * 3. Apple Continuity BLE (0x004C, type 0x05) wake payload
  */
 object GlideDropCodec {
 
@@ -39,23 +42,6 @@ object GlideDropCodec {
     val MEDIA_CAPABILITIES_BYTES: ByteArray =
         """{"SupportsAdjustmentBaseResources":true,"Version":3,"Codecs":{"hvc1":{"Profiles":{"VTIsHDRAllowedOnDevice":true,"VTSupportedProfiles":[1,2,3,4],"VTDoViIsHardwareAccelerated":true,"VTDoViSupportedLevels":["01","02","03","04","05","06","07","08","09"],"VTPerProfileSupport":{"3":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"1":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"4":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"2":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186}},"VTDoViSupportedProfiles":["05","08"]}},"CodecSupport":{"VTIsHDRAllowedOnDevice":true,"VTCodecSupportDict":{"apcs":{"VTIsHardwareAccelerated":true},"hvc1":{"VTIsHDRAllowedOnDevice":true,"VTPerProfileSupport":{"3":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"1":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"4":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186},"2":{"VTMaxPlaybackLevel":186,"VTIsHardwareAccelerated":true,"VTMaxDecodeLevel":186}},"VTSupportedProfiles":[1,2,3,4]},"apcn":{"VTIsHardwareAccelerated":true},"apch":{"VTIsHardwareAccelerated":true},"apco":{"VTIsHardwareAccelerated":true},"ap4x":{"VTIsHardwareAccelerated":true},"ap4h":{"VTIsHardwareAccelerated":true}}}},"ContainerFormats":{"public.heif-standard":{"HeifSubtypes":["public.avci","public.avif","public.heic","public.heics","public.heif"]}},"Vendor":{"com.apple":{"LivePhotoFormatVersion":"1","AssetBundleFormatVersion":"1"}}}"""
             .toByteArray(StandardCharsets.UTF_8)
-
-    /** Continuity AirDrop (type 0x05) Arm A (OS 26+) BLE manufacturer data for company 0x004C. */
-    fun bleWakePayload(tag3Bytes: ByteArray): ByteArray {
-        require(tag3Bytes.size == 3)
-        val out = ByteArray(20)
-        out[0] = 0x05 // Continuity type: AirDrop
-        out[1] = 0x12 // Length: 18 bytes
-        out[2] = 0x40 // Arm A (OS 26+)
-        out[3] = tag3Bytes[0]
-        out[4] = tag3Bytes[1]
-        out[5] = tag3Bytes[2]
-        // bytes 6..9 = 0x00
-        out[10] = 0x03
-        // bytes 11..18 = 4 x 2-byte contact hashes (zeros for Everyone mode)
-        // byte 19 = 0x00
-        return out
-    }
 
     fun utiForName(name: String): String {
         val dot = name.lastIndexOf('.')
@@ -538,11 +524,25 @@ object GlideDropCodec {
         dvzipOut.close()
     }
 
+    private fun availableStorageBytes(destDir: File, context: Context?): Long {
+        if (context != null) {
+            val allocatable = runCatching {
+                val sm = context.getSystemService(StorageManager::class.java) ?: return@runCatching null
+                val uuid = sm.getUuidForPath(destDir)
+                sm.getAllocatableBytes(uuid)
+            }.getOrNull()
+            if (allocatable != null) return allocatable
+        }
+        val statBytes = runCatching { StatFs(destDir.absolutePath).availableBytes }.getOrNull()
+        if (statBytes != null) return statBytes
+        return Files.getFileStore(destDir.toPath()).usableSpace
+    }
+
     /**
      * Decodes a DVZip or Gzip stream containing a 070707 (odc) or 070701/070702 (newc)
      * CPIO archive and extracts regular files into destDir.
      */
-    fun extractDvzipCpio(rawIn: InputStream, destDir: File): List<File> {
+    fun extractDvzipCpio(rawIn: InputStream, destDir: File, context: Context? = null): List<File> {
         destDir.mkdirs()
         val cpioStream = openDvzipOrGzipStream(rawIn)
         val saved = ArrayList<File>()
@@ -601,6 +601,7 @@ object GlideDropCodec {
                 else -> throw IllegalArgumentException("Invalid CPIO magic: $magic")
             }
 
+            require(fileSize >= 0L) { "Invalid negative CPIO file size: $fileSize" }
             require(nameSize in 1..4097) { "Invalid CPIO name size: $nameSize" }
             val nameBuf = ByteArray(nameSize)
             if (readExact(cpioStream, nameBuf, nameSize) < nameSize) {
@@ -621,8 +622,9 @@ object GlideDropCodec {
                 if (!outFile.canonicalPath.startsWith(destCanonical)) {
                     throw SecurityException("CPIO path traversal detected: $rawName")
                 }
-                if (destDir.usableSpace < fileSize) {
-                    throw IOException("Insufficient storage space for $baseName: required $fileSize B, available ${destDir.usableSpace} B")
+                val availableBytes = availableStorageBytes(destDir, context)
+                if (availableBytes < fileSize) {
+                    throw IOException("Insufficient storage space for $baseName: required $fileSize B, available $availableBytes B")
                 }
                 var suffix = 1
                 while (outFile.exists()) {

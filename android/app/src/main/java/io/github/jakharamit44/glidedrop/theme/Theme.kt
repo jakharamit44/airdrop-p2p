@@ -10,25 +10,25 @@ import ds.tokens.DsLightColors
 import ds.tokens.LocalDsColors
 
 private val DarkColorScheme = darkColorScheme(
-    primary = AppDarkColors.bgActionPrimary,
-    onPrimary = AppDarkColors.textOnAction,
-    secondary = AppDarkColors.bgAccentSubtle,
-    onSecondary = AppDarkColors.textAccent,
-    background = AppDarkColors.surfaceBase,
-    onBackground = AppDarkColors.textPrimary,
-    surface = AppDarkColors.surfaceRaised,
-    onSurface = AppDarkColors.textPrimary
+    primary = DsDarkColors.bgActionPrimary,
+    onPrimary = DsDarkColors.textOnAction,
+    secondary = DsDarkColors.bgAccentSubtle,
+    onSecondary = DsDarkColors.textAccent,
+    background = DsDarkColors.surfaceBase,
+    onBackground = DsDarkColors.textPrimary,
+    surface = DsDarkColors.surfaceRaised,
+    onSurface = DsDarkColors.textPrimary
 )
 
 private val LightColorScheme = lightColorScheme(
-    primary = AppLightColors.bgActionPrimary,
-    onPrimary = AppLightColors.textOnAction,
-    secondary = AppLightColors.bgAccentSubtle,
-    onSecondary = AppLightColors.textAccent,
-    background = AppLightColors.surfaceBase,
-    onBackground = AppLightColors.textPrimary,
-    surface = AppLightColors.surfaceRaised,
-    onSurface = AppLightColors.textPrimary
+    primary = DsLightColors.bgActionPrimary,
+    onPrimary = DsLightColors.textOnAction,
+    secondary = DsLightColors.bgAccentSubtle,
+    onSecondary = DsLightColors.textAccent,
+    background = DsLightColors.surfaceBase,
+    onBackground = DsLightColors.textPrimary,
+    surface = DsLightColors.surfaceRaised,
+    onSurface = DsLightColors.textPrimary
 )
 
 @Composable

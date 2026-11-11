@@ -31,18 +31,17 @@ import base64
 import random
 import fnmatch
 import tempfile
-import mimetypes
 import subprocess
 import urllib.request
 import urllib.error
 import email.utils
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Callable, Iterator
+from typing import Optional, List, Tuple, Callable
 
 # API Model Configurations
-DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
-FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-3-5-haiku-latest")
-OPUS_MODEL = os.environ.get("ANTHROPIC_OPUS_MODEL", "claude-3-opus-latest")
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-haiku-4-5")
+OPUS_MODEL = os.environ.get("ANTHROPIC_OPUS_MODEL", "claude-opus-4-6")
 FALLBACK_MODELS = [
     DEFAULT_MODEL,
     FAST_MODEL,
@@ -872,30 +871,26 @@ def main():
         print(f"[+] Saved API key securely to {CONFIG_FILE}")
         sys.exit(0)
 
-    if cmd == "--enable":
+    if cmd in ("--enable", "--disable"):
+        enabled_val = cmd == "--enable"
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            CONFIG_DIR.chmod(0o700)
+        except Exception:
+            pass
         cfg = {}
         if CONFIG_FILE.exists():
             try:
                 cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             except Exception:
                 pass
-        cfg["enabled"] = True
+        cfg["enabled"] = enabled_val
         CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-        print("[+] Claude AI auto-processing is now ENABLED.")
-        sys.exit(0)
-
-    if cmd == "--disable":
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        cfg = {}
-        if CONFIG_FILE.exists():
-            try:
-                cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        cfg["enabled"] = False
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-        print("[+] Claude AI auto-processing is now DISABLED.")
+        try:
+            CONFIG_FILE.chmod(0o600)
+        except Exception:
+            pass
+        print(f"[+] Claude AI auto-processing is now {'ENABLED' if enabled_val else 'DISABLED'}.")
         sys.exit(0)
 
     target_file = Path(cmd)

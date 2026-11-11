@@ -10,19 +10,44 @@ android {
     }
 
     namespace = "io.github.jakharamit44.glidedrop"
-    compileSdk = 36
+    compileSdk = 37
     defaultConfig {
         applicationId = "io.github.jakharamit44.glidedrop"
         minSdk = 31
-        targetSdk = 36
-        versionCode = 250
+        targetSdk = 37
+        versionCode = 260
         versionName = appVersionName
+    }
+
+    val releaseKeystorePath = providers.environmentVariable("GLIDEDROP_KEYSTORE_PATH").orNull?.trim()?.takeIf { it.isNotEmpty() }
+    val releaseStorePassword = providers.environmentVariable("GLIDEDROP_KEYSTORE_PASSWORD").orNull
+    val releaseKeyAlias = providers.environmentVariable("GLIDEDROP_KEY_ALIAS").orNull?.trim()?.takeIf { it.isNotEmpty() }
+    val releaseKeyPassword = providers.environmentVariable("GLIDEDROP_KEY_PASSWORD").orNull?.takeIf { it.isNotEmpty() } ?: releaseStorePassword
+    val hasReleaseSigning = releaseKeystorePath != null &&
+        file(releaseKeystorePath).isFile &&
+        !releaseStorePassword.isNullOrEmpty() &&
+        releaseKeyAlias != null &&
+        !releaseKeyPassword.isNullOrEmpty()
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseKeystorePath)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
         release {
+            isDebuggable = false
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {

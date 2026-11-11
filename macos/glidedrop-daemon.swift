@@ -8,7 +8,105 @@ import CryptoKit
 import CoreWLAN
 import Darwin
 
-private let BLE_E2EE_KEY = SymmetricKey(data: SHA256.hash(data: Data("GlideDrop-E2EE-AES256GCM-v2".utf8)))
+private let p2pSessionTokenLock = NSLock()
+private let P2P_SESSION_TOKEN_TTL: TimeInterval = 300.0
+private let MAX_P2P_SESSION_TOKENS = 4
+
+func normalizeSha256Fingerprint(_ raw: String) -> String {
+    return raw
+        .replacingOccurrences(of: ":", with: "")
+        .replacingOccurrences(of: "-", with: "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+}
+
+func isValidSha256Fingerprint(_ raw: String?) -> Bool {
+    guard let raw = raw else { return false }
+    let hex = normalizeSha256Fingerprint(raw)
+    guard hex.count == 64 else { return false }
+    return hex.unicodeScalars.allSatisfy {
+        ($0.value >= 48 && $0.value <= 57) || ($0.value >= 97 && $0.value <= 102)
+    }
+}
+
+func registerP2pSessionToken(_ token: String, stateDir: URL = STATE_DIR, ttl: TimeInterval = P2P_SESSION_TOKEN_TTL) {
+    let clean = token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard clean.count == 64,
+          clean.unicodeScalars.allSatisfy({ ($0.value >= 48 && $0.value <= 57) || ($0.value >= 97 && $0.value <= 102) }) else {
+        return
+    }
+    p2pSessionTokenLock.lock()
+    defer { p2pSessionTokenLock.unlock() }
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    let tokenFile = stateDir.appendingPathComponent("p2p_session_token.json")
+    let now = Date().timeIntervalSince1970
+    var activeTokens: [[String: Any]] = []
+    if let existingData = try? Data(contentsOf: tokenFile),
+       let existingObj = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any],
+       let rawList = existingObj["tokens"] as? [[String: Any]] {
+        for item in rawList {
+            guard let t = item["token"] as? String,
+                  let exp = item["expires_at"] as? Double,
+                  exp > now,
+                  t != clean else { continue }
+            activeTokens.append(item)
+        }
+    }
+    activeTokens.append([
+        "token": clean,
+        "created_at": now,
+        "expires_at": now + max(1.0, ttl)
+    ])
+    if activeTokens.count > MAX_P2P_SESSION_TOKENS {
+        activeTokens = Array(activeTokens.suffix(MAX_P2P_SESSION_TOKENS))
+    }
+    let payload: [String: Any] = ["tokens": activeTokens]
+    guard let jsonData = try? JSONSerialization.data(withJSONObject: payload, options: []) else { return }
+    let tmpFile = stateDir.appendingPathComponent("p2p_session_token.json.tmp.\(UUID().uuidString)")
+    if FileManager.default.createFile(atPath: tmpFile.path, contents: jsonData, attributes: [.posixPermissions: 0o600]) {
+        _ = chmod(tmpFile.path, 0o600)
+        if Darwin.rename(tmpFile.path, tokenFile.path) != 0 {
+            try? FileManager.default.removeItem(at: tmpFile)
+        }
+    }
+}
+
+func clearP2pSessionTokens(stateDir: URL = STATE_DIR) {
+    p2pSessionTokenLock.lock()
+    defer { p2pSessionTokenLock.unlock() }
+    try? FileManager.default.removeItem(at: stateDir.appendingPathComponent("p2p_session_token.json"))
+}
+
+func revokeP2pSessionToken(_ token: String, stateDir: URL = STATE_DIR) {
+    let clean = token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !clean.isEmpty else { return }
+    p2pSessionTokenLock.lock()
+    defer { p2pSessionTokenLock.unlock() }
+    let tokenFile = stateDir.appendingPathComponent("p2p_session_token.json")
+    guard let existingData = try? Data(contentsOf: tokenFile),
+          let existingObj = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any],
+          let rawList = existingObj["tokens"] as? [[String: Any]] else {
+        return
+    }
+    let now = Date().timeIntervalSince1970
+    let remaining = rawList.filter { item in
+        guard let t = (item["token"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              let exp = item["expires_at"] as? Double else { return false }
+        return exp > now && t != clean
+    }
+    if remaining.isEmpty {
+        try? FileManager.default.removeItem(at: tokenFile)
+        return
+    }
+    guard let jsonData = try? JSONSerialization.data(withJSONObject: ["tokens": remaining], options: []) else { return }
+    let tmpFile = stateDir.appendingPathComponent("p2p_session_token.json.tmp.\(UUID().uuidString)")
+    if FileManager.default.createFile(atPath: tmpFile.path, contents: jsonData, attributes: [.posixPermissions: 0o600]) {
+        _ = chmod(tmpFile.path, 0o600)
+        if Darwin.rename(tmpFile.path, tokenFile.path) != 0 {
+            try? FileManager.default.removeItem(at: tmpFile)
+        }
+    }
+}
 
 func ensureLocalMacTlsCertFiles() {
     let certPath = STATE_DIR.appendingPathComponent("cert.pem")
@@ -32,23 +130,89 @@ func getLocalMacTlsCertFingerprint() -> String {
     guard let pemStr = try? String(contentsOf: certPath, encoding: .utf8) else { return "" }
     let lines = pemStr.components(separatedBy: .newlines)
     let b64 = lines.filter { !$0.hasPrefix("-----") && !$0.isEmpty }.joined()
-    guard let der = Data(base64Encoded: b64) else { return "" }
+    guard let der = Data(base64Encoded: b64, options: .ignoreUnknownCharacters), !der.isEmpty else { return "" }
     let digest = SHA256.hash(data: der)
     return digest.map { String(format: "%02x", $0) }.joined()
 }
 
-func readBleStreamLine(_ inp: InputStream, maxLen: Int = 4096) -> String? {
-    var lineBytes = Data()
-    var b: UInt8 = 0
-    while lineBytes.count < maxLen {
-        let r = inp.read(&b, maxLength: 1)
-        if r <= 0 {
-            return lineBytes.isEmpty ? nil : String(data: lineBytes, encoding: .utf8)
+func readBleStreamLine(
+    _ inp: InputStream,
+    maxLen: Int = 4096,
+    timeout: TimeInterval = 25.0,
+    checkCancel: Bool = false,
+    onTimeout: (() -> Void)? = nil
+) -> String? {
+    func readSync(shouldStop: @escaping () -> Bool) -> String? {
+        var lineBytes = Data()
+        var b: UInt8 = 0
+        while lineBytes.count < maxLen {
+            if shouldStop() { return nil }
+            let r = inp.read(&b, maxLength: 1)
+            if r > 0 {
+                if b == UInt8(ascii: "\n") { break }
+                if b != UInt8(ascii: "\r") { lineBytes.append(b) }
+            } else if r == 0 {
+                let status = inp.streamStatus
+                if status == .error || status == .closed {
+                    return nil
+                }
+                if status == .atEnd {
+                    return lineBytes.isEmpty ? nil : String(data: lineBytes, encoding: .utf8)
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            } else {
+                return nil
+            }
         }
-        if b == UInt8(ascii: "\n") { break }
-        if b != UInt8(ascii: "\r") { lineBytes.append(b) }
+        return String(data: lineBytes, encoding: .utf8)
     }
-    return String(data: lineBytes, encoding: .utf8)
+
+    if timeout <= 0 && !checkCancel {
+        return readSync { false }
+    }
+
+    let lock = NSLock()
+    var aborted = false
+    var result: String? = nil
+    let sem = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        let line = readSync {
+            lock.lock()
+            let stop = aborted
+            lock.unlock()
+            return stop
+        }
+        lock.lock()
+        if !aborted { result = line }
+        lock.unlock()
+        sem.signal()
+    }
+
+    let deadline = timeout > 0 ? Date().addingTimeInterval(timeout) : Date.distantFuture
+    while true {
+        if checkCancel && isTransferCancelled() {
+            lock.lock()
+            aborted = true
+            lock.unlock()
+            onTimeout?()
+            return nil
+        }
+        let remaining = deadline.timeIntervalSinceNow
+        if remaining <= 0 {
+            lock.lock()
+            aborted = true
+            lock.unlock()
+            onTimeout?()
+            return nil
+        }
+        let step = min(0.2, remaining)
+        if sem.wait(timeout: .now() + step) == .success {
+            lock.lock()
+            let res = result
+            lock.unlock()
+            return res
+        }
+    }
 }
 
 func deriveSessionKey(sharedSecret: SharedSecret) -> SymmetricKey {
@@ -60,39 +224,41 @@ func deriveSessionKey(sharedSecret: SharedSecret) -> SymmetricKey {
     return SymmetricKey(data: keyBytes)
 }
 
-func encryptAesGcm(plain: Data, using key: SymmetricKey) -> Data? {
-    guard let box = try? AES.GCM.seal(plain, using: key) else { return nil }
-    return box.combined
+func deriveBleFrameKey(sharedSecret: SharedSecret) -> SymmetricKey {
+    let raw = sharedSecret.withUnsafeBytes { Data($0) }
+    var hasher = SHA256()
+    hasher.update(data: raw)
+    hasher.update(data: Data("GlideDrop-v2-BleFrameKey".utf8))
+    let keyBytes = hasher.finalize()
+    return SymmetricKey(data: keyBytes)
+}
+
+func deriveSessionToken(sharedSecret: SharedSecret) -> String {
+    let raw = sharedSecret.withUnsafeBytes { Data($0) }
+    var hasher = SHA256()
+    hasher.update(data: raw)
+    hasher.update(data: Data("GlideDrop-v2-BearerToken".utf8))
+    let digest = hasher.finalize()
+    return digest.map { String(format: "%02x", $0) }.joined()
 }
 
 func decryptAesGcm(packet: Data, using key: SymmetricKey) -> Data? {
-    guard packet.count > 28,
+    guard packet.count >= 28,
           let box = try? AES.GCM.SealedBox(combined: packet),
           let opened = try? AES.GCM.open(box, using: key) else { return nil }
     return opened
 }
 
-func encryptBlePayload(_ plain: Data, key: SymmetricKey? = nil) -> Data {
-    let k = key ?? BLE_E2EE_KEY
-    guard let sealed = try? AES.GCM.seal(plain, using: k),
+func encryptBlePayload(_ plain: Data, key: SymmetricKey) -> Data {
+    guard let sealed = try? AES.GCM.seal(plain, using: key),
           let combined = sealed.combined else {
         fatalError("[BLE-Security] BLE encryption failed - refusing to transmit unencrypted payload")
     }
     return combined
 }
 
-func decryptBlePayload(_ packet: Data, key: SymmetricKey? = nil) -> Data? {
-    guard packet.count > 28 else { return nil }
-    let k = key ?? BLE_E2EE_KEY
-    if let box = try? AES.GCM.SealedBox(combined: packet),
-       let opened = try? AES.GCM.open(box, using: k) {
-        return opened
-    }
-    if key != nil, let box = try? AES.GCM.SealedBox(combined: packet),
-       let opened = try? AES.GCM.open(box, using: BLE_E2EE_KEY) {
-        return opened
-    }
-    return nil
+func decryptBlePayload(_ packet: Data, key: SymmetricKey) -> Data? {
+    return decryptAesGcm(packet: packet, using: key)
 }
 
 func readUInt32BE(_ data: Data, offset: Int) -> Int {
@@ -355,15 +521,9 @@ func recordActivePeerOnDisk(
     let incomingIsFallback = name.hasPrefix("Android Peer (") || name == "Android Peer"
     for (_, existing) in dict {
         let exName = (existing["name"] as? String) ?? ""
-        let exPsm = (existing["psm"] as? NSNumber)?.intValue ?? 0
-        let exLastSeen = (existing["lastSeen"] as? NSNumber)?.doubleValue ?? 0
         let exIsFallback = exName.hasPrefix("Android Peer (") || exName == "Android Peer"
         if !exIsFallback && incomingIsFallback {
             // Ignore unnamed zombie BLE advertisements when a named peer is already live
-            return
-        }
-        if psm > 0 && exPsm > 0 && psm < exPsm && (now - exLastSeen) < 4.5 {
-            // Ignore older leaked BLE advertising sets with lower PSMs while the newest PSM is active
             return
         }
     }
@@ -516,6 +676,34 @@ func clearCancelFlag() {
     try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("cancel_transfer.flag"))
 }
 
+let TX_LOCK_TTL_SECONDS: TimeInterval = 180.0
+let MAX_ENCRYPTED_BLE_ARCHIVE_BYTES = 30_000_000
+let BLE_RAW_PRECHECK_MAX_BYTES: Int64 = 120_000_000
+let MAX_BLE_META_BYTES = 1_048_576
+
+func writeTxInProgressLock(timestamp: TimeInterval = Date().timeIntervalSince1970) {
+    let txLock = STATE_DIR.appendingPathComponent("tx_in_progress.lock")
+    try? String(timestamp).write(to: txLock, atomically: true, encoding: .utf8)
+}
+
+func hasActiveTxInProgressLock(now: TimeInterval = Date().timeIntervalSince1970) -> Bool {
+    let txLock = STATE_DIR.appendingPathComponent("tx_in_progress.lock")
+    guard FileManager.default.fileExists(atPath: txLock.path) else { return false }
+    var isFresh = false
+    if let raw = try? String(contentsOf: txLock, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+       let ts = Double(raw) {
+        isFresh = (now - ts) < TX_LOCK_TTL_SECONDS
+    } else if let attrs = try? FileManager.default.attributesOfItem(atPath: txLock.path),
+              let mtime = attrs[.modificationDate] as? Date {
+        isFresh = (now - mtime.timeIntervalSince1970) < TX_LOCK_TTL_SECONDS
+    }
+    if !isFresh {
+        try? FileManager.default.removeItem(at: txLock)
+        return false
+    }
+    return true
+}
+
 let PREV_WIFI_FILE = STATE_DIR.appendingPathComponent("previous_wifi_ssid.txt")
 let WARP_PAUSED_FILE = STATE_DIR.appendingPathComponent("warp_was_active.flag")
 let LAN_FALLBACK_FILE = STATE_DIR.appendingPathComponent("lan_fallback_active.flag")
@@ -633,16 +821,27 @@ func getWifiInterfaceName() -> String {
     return "en0"
 }
 
-func currentWifiSsid() -> String {
+func parseAirportNetworkSsid(_ output: String) -> String {
+    guard output.contains("Current Wi-Fi Network: ") else { return "" }
+    let name = output.components(separatedBy: "Current Wi-Fi Network: ").last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if name.isEmpty || name.contains("not associated") {
+        return ""
+    }
+    return name
+}
+
+func currentRawWifiSsid() -> String {
     let iface = getWifiInterfaceName()
     let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-getairportnetwork", iface])
-    if out.contains("Current Wi-Fi Network: ") {
-        let name = out.components(separatedBy: "Current Wi-Fi Network: ").last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !name.isEmpty && !name.hasPrefix("DIRECT-") && !name.contains("not associated") {
-            return name
-        }
+    return parseAirportNetworkSsid(out)
+}
+
+func currentWifiSsid() -> String {
+    let name = currentRawWifiSsid()
+    if name.hasPrefix("DIRECT-") {
+        return ""
     }
-    return ""
+    return name
 }
 
 func saveCurrentWifiSsid() {
@@ -976,6 +1175,7 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     disableMacInternetProxy()
     try? FileManager.default.removeItem(at: LAN_FALLBACK_FILE)
     try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
+    clearP2pSessionTokens()
 
     let iface = getWifiInterfaceName()
     // 1. ALWAYS unconditionally remove any ephemeral P2P network from preferred list so macOS never stays stuck or reconnects to it
@@ -1014,7 +1214,7 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     }
 
     // 2. Check if iface is already back on normal Wi-Fi or was never on P2P
-    let curSsid = currentWifiSsid()
+    let curSsid = currentRawWifiSsid()
     let onP2p = curSsid.hasPrefix("DIRECT-") || !currentWifiP2pIp().isEmpty
     let savedSsid = (try? String(contentsOf: PREV_WIFI_FILE, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     if !onP2p && (wifiHasNormalIpv4() || savedSsid.isEmpty) {
@@ -1068,63 +1268,161 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     fflush(stdout)
 }
 
+func hasPendingWifiRestoreState(
+    wifiP2pIp: String,
+    wifiSsid: String,
+    hasPrevProxy: Bool,
+    hasPrevWifi: Bool,
+    hasWarpPaused: Bool
+) -> Bool {
+    return !wifiP2pIp.isEmpty ||
+        wifiSsid.hasPrefix("DIRECT-") ||
+        hasPrevProxy ||
+        hasPrevWifi ||
+        hasWarpPaused
+}
+
+func needsMacInternetWifiRestore() -> Bool {
+    if FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) ||
+        FileManager.default.fileExists(atPath: PREV_WIFI_FILE.path) ||
+        FileManager.default.fileExists(atPath: WARP_PAUSED_FILE.path) ||
+        !currentWifiP2pIp().isEmpty {
+        return true
+    }
+    return hasPendingWifiRestoreState(
+        wifiP2pIp: "",
+        wifiSsid: currentRawWifiSsid(),
+        hasPrevProxy: false,
+        hasPrevWifi: false,
+        hasWarpPaused: false
+    )
+}
+
 func readExact(
     _ stream: InputStream,
     count: Int,
     trackProgress: Bool = false,
     fileLabel: String = "Incoming File",
-    fileCount: Int = 1
+    fileCount: Int = 1,
+    timeout: TimeInterval? = nil,
+    checkCancel: Bool = false,
+    onWaitTick: (() -> Void)? = nil,
+    onTimeout: (() -> Void)? = nil
 ) -> Data? {
-    var data = Data(count: count)
-    var offset = 0
-    let startTime = Date()
-    var lastEmit = Date.distantPast
-    while offset < count {
-        if trackProgress && isTransferCancelled() {
-            writeProgressJson(active: false)
-            return nil
-        }
-        let readCount = data.withUnsafeMutableBytes { ptr -> Int in
-            guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return -1 }
-            return stream.read(base.advanced(by: offset), maxLength: min(32768, count - offset))
-        }
-        if readCount > 0 {
-            offset += readCount
-            if trackProgress {
-                let now = Date()
-                if now.timeIntervalSince(lastEmit) >= 0.1 || offset == count {
-                    lastEmit = now
-                    let elapsed = max(0.1, now.timeIntervalSince(startTime))
-                    let speed = Int64(Double(offset) / elapsed)
-                    let rem = Int64(max(0, count - offset))
-                    let eta = speed > 0 ? (rem / speed) : 0
-                    let pct = min(99, (offset * 100) / max(1, count))
-                    writeProgressJson(
-                        active: true,
-                        direction: "Receiving",
-                        fileName: fileLabel,
-                        fileCount: fileCount,
-                        doneBytes: Int64(offset),
-                        totalBytes: Int64(count),
-                        speedBps: speed,
-                        etaSeconds: eta,
-                        percent: pct
-                    )
-                }
-            }
-        } else if readCount == 0 {
-            Thread.sleep(forTimeInterval: 0.01)
-            if stream.streamStatus == .atEnd || stream.streamStatus == .error || stream.streamStatus == .closed {
+    guard count >= 0 else { return nil }
+    if count == 0 { return Data() }
+
+    func readSync(shouldStop: @escaping () -> Bool) -> Data? {
+        var data = Data(count: count)
+        var offset = 0
+        let startTime = Date()
+        var lastEmit = Date.distantPast
+        while offset < count {
+            if shouldStop() {
                 if trackProgress { writeProgressJson(active: false) }
                 return nil
             }
-        } else {
+            if (trackProgress || checkCancel) && isTransferCancelled() {
+                if trackProgress { writeProgressJson(active: false) }
+                return nil
+            }
+            let readCount = data.withUnsafeMutableBytes { ptr -> Int in
+                guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return -1 }
+                return stream.read(base.advanced(by: offset), maxLength: min(32768, count - offset))
+            }
+            if readCount > 0 {
+                offset += readCount
+                if trackProgress {
+                    let now = Date()
+                    if now.timeIntervalSince(lastEmit) >= 0.1 || offset == count {
+                        lastEmit = now
+                        let elapsed = max(0.1, now.timeIntervalSince(startTime))
+                        let speed = Int64(Double(offset) / elapsed)
+                        let rem = Int64(max(0, count - offset))
+                        let eta = speed > 0 ? (rem / speed) : 0
+                        let pct = min(99, (offset * 100) / max(1, count))
+                        writeProgressJson(
+                            active: true,
+                            direction: "Receiving",
+                            fileName: fileLabel,
+                            fileCount: fileCount,
+                            doneBytes: Int64(offset),
+                            totalBytes: Int64(count),
+                            speedBps: speed,
+                            etaSeconds: eta,
+                            percent: pct
+                        )
+                    }
+                }
+            } else if readCount == 0 {
+                let status = stream.streamStatus
+                if status == .atEnd || status == .error || status == .closed {
+                    if trackProgress { writeProgressJson(active: false) }
+                    return nil
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            } else {
+                if trackProgress { writeProgressJson(active: false) }
+                return nil
+            }
+        }
+        if trackProgress { writeProgressJson(active: false) }
+        return data
+    }
+
+    guard let timeout = timeout, timeout > 0 else {
+        return readSync { false }
+    }
+
+    let lock = NSLock()
+    var aborted = false
+    var result: Data? = nil
+    let sem = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        let d = readSync {
+            lock.lock()
+            let stop = aborted
+            lock.unlock()
+            return stop
+        }
+        lock.lock()
+        if !aborted { result = d }
+        lock.unlock()
+        sem.signal()
+    }
+
+    let deadline = Date().addingTimeInterval(timeout)
+    var lastTick = Date()
+    while true {
+        if (trackProgress || checkCancel) && isTransferCancelled() {
+            lock.lock()
+            aborted = true
+            lock.unlock()
             if trackProgress { writeProgressJson(active: false) }
+            onTimeout?()
             return nil
         }
+        let remaining = deadline.timeIntervalSinceNow
+        if remaining <= 0 {
+            lock.lock()
+            aborted = true
+            lock.unlock()
+            if trackProgress { writeProgressJson(active: false) }
+            onTimeout?()
+            return nil
+        }
+        let step = min(0.2, remaining)
+        if sem.wait(timeout: .now() + step) == .success {
+            lock.lock()
+            let d = result
+            lock.unlock()
+            return d
+        }
+        if let tickCb = onWaitTick, Date().timeIntervalSince(lastTick) >= 2.0 {
+            lastTick = Date()
+            tickCb()
+        }
     }
-    if trackProgress { writeProgressJson(active: false) }
-    return data
 }
 
 func writeAll(
@@ -1132,7 +1430,9 @@ func writeAll(
     data: Data,
     trackProgress: Bool = false,
     fileLabel: String = "Sending File",
-    fileCount: Int = 1
+    fileCount: Int = 1,
+    peerName: String = "",
+    clearProgressOnSuccess: Bool = false
 ) -> Bool {
     var offset = 0
     let total = data.count
@@ -1140,6 +1440,7 @@ func writeAll(
     var lastLoggedPct = -10
     let startTime = Date()
     var lastEmit = Date.distantPast
+    var lastLockTouch = Date()
     while offset < total {
         if trackProgress && isTransferCancelled() {
             writeProgressJson(active: false)
@@ -1169,6 +1470,10 @@ func writeAll(
             }
             if trackProgress {
                 let now = Date()
+                if now.timeIntervalSince(lastLockTouch) >= 15.0 {
+                    lastLockTouch = now
+                    writeTxInProgressLock(timestamp: now.timeIntervalSince1970)
+                }
                 if now.timeIntervalSince(lastEmit) >= 0.1 || offset == total {
                     lastEmit = now
                     let elapsed = max(0.1, now.timeIntervalSince(startTime))
@@ -1184,7 +1489,8 @@ func writeAll(
                         totalBytes: Int64(total),
                         speedBps: speed,
                         etaSeconds: eta,
-                        percent: min(99, pct)
+                        percent: min(99, pct),
+                        peerName: peerName
                     )
                 }
             }
@@ -1195,7 +1501,9 @@ func writeAll(
             return false
         }
     }
-    if trackProgress { writeProgressJson(active: false) }
+    if trackProgress && clearProgressOnSuccess {
+        writeProgressJson(active: false)
+    }
     return true
 }
 
@@ -1228,18 +1536,22 @@ func currentWifiP2pIp() -> String {
     return ""
 }
 
-func currentEn0P2pIp() -> String { currentWifiP2pIp() }
-
-func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerName: String? = nil) {
+func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerName: String? = nil, sessionToken: String? = nil) {
+    func revokeCurrentSessionToken() {
+        if let tok = sessionToken {
+            revokeP2pSessionToken(tok)
+        }
+    }
     guard ssid.hasPrefix("DIRECT-"), !pass.isEmpty else {
         print("[BLE-Daemon] Rejected invalid WP2P request: SSID '\(ssid)' does not start with DIRECT-")
+        revokeCurrentSessionToken()
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
     }
 
     wp2pJoinLock.lock()
     if wp2pJoinActive {
-        let existingIp = currentEn0P2pIp()
+        let existingIp = currentWifiP2pIp()
         wp2pJoinLock.unlock()
         if !existingIp.isEmpty {
             print("[BLE-Daemon] Reusing in-flight 5GHz P2P session at \(existingIp)")
@@ -1250,13 +1562,14 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         // Wait briefly for in-flight join to finish obtaining DHCP
         let waitJoin = Date().addingTimeInterval(8.0)
         while Date() < waitJoin {
-            let ip = currentEn0P2pIp()
+            let ip = currentWifiP2pIp()
             if !ip.isEmpty {
                 _ = writeAll(out, data: Data("OK \(ip)\n".utf8))
                 return
             }
             Thread.sleep(forTimeInterval: 0.25)
         }
+        revokeCurrentSessionToken()
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
     }
@@ -1279,6 +1592,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     let autoAccept = settings.autoAccept
     if !autoAccept && !waitForMacUserAccept(senderName: incomingPeerName, fileNames: ["5 GHz Wi-Fi Direct Connection (\(ssid))"], totalBytes: 0, forcePrompt: false) {
         print("[BLE-Daemon] User declined incoming WP2P connection request from \(incomingPeerName)")
+        revokeCurrentSessionToken()
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
     }
@@ -1330,20 +1644,31 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     if macP2pIp.isEmpty {
         _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
 
-        let deadline = Date().addingTimeInterval(12.0)
-        var retriedJoin = false
+        let deadline = Date().addingTimeInterval(25.0)
+        var lastProgressTouch = Date()
         while Date() < deadline {
+            if isTransferCancelled() { break }
             macP2pIp = currentWifiP2pIp()
             if !macP2pIp.isEmpty { break }
-            if !retriedJoin && deadline.timeIntervalSinceNow < 6.0 {
-                retriedJoin = true
-                _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
+            if Date().timeIntervalSince(lastProgressTouch) >= 2.0 {
+                lastProgressTouch = Date()
+                writeProgressJson(
+                    active: true,
+                    direction: "Receiving",
+                    fileName: "Incoming transfer",
+                    fileCount: 1,
+                    percent: 0,
+                    phase: "Joining 5 GHz Wi-Fi Direct (\(ssid))…",
+                    peerName: incomingPeerName,
+                    isConnecting: true
+                )
             }
             Thread.sleep(forTimeInterval: 0.2)
         }
+        macP2pIp = currentWifiP2pIp()
     }
 
-    if macP2pIp.isEmpty {
+    if isTransferCancelled() || macP2pIp.isEmpty {
         writeProgressJson(active: false)
         restoreMacInternetWifi(ssid: ssid)
         _ = writeAll(out, data: Data("ERR\n".utf8))
@@ -1373,6 +1698,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
 
     // Phase 1: Wait up to 30s for the peer to initiate the HTTPS transfer
     let startDeadline = Date().addingTimeInterval(30.0)
+    var lastPhase1ProgressTouch = Date()
     var transferDetected = false
     while Date() < startDeadline {
         if isTransferCancelled() {
@@ -1399,6 +1725,19 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
             transferDetected = true
             break
         }
+        if Date().timeIntervalSince(lastPhase1ProgressTouch) >= 2.0 {
+            lastPhase1ProgressTouch = Date()
+            writeProgressJson(
+                active: true,
+                direction: "Receiving",
+                fileName: "Incoming transfer",
+                fileCount: 1,
+                percent: 0,
+                phase: "Waiting for sender handshake (\(macP2pIp))…",
+                peerName: incomingPeerName,
+                isConnecting: true
+            )
+        }
         Thread.sleep(forTimeInterval: 0.25)
     }
 
@@ -1415,6 +1754,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     var lastActivity = Date()
     var lastKeepAlivePing = Date.distantPast
     var lastWarpCheck = Date()
+    var uploadCompleted = false
 
     while true {
         if isTransferCancelled() {
@@ -1437,6 +1777,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
 
             if FileManager.default.fileExists(atPath: uploadDoneFile.path) {
                 try? FileManager.default.removeItem(at: uploadDoneFile)
+                uploadCompleted = true
                 print("[BLE-Daemon] Upload completed successfully — restoring Wi-Fi immediately")
                 fflush(stdout)
                 Thread.sleep(forTimeInterval: 1.0)
@@ -1473,47 +1814,95 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         Thread.sleep(forTimeInterval: 0.5)
     }
 
+    if !uploadCompleted {
+        writeProgressJson(active: false)
+    }
     restoreMacInternetWifi(ssid: ssid)
 }
 
-func buildDvzipCpio(files: [URL]) throws -> (Data, [[String: Any]]) {
-    guard !files.isEmpty else { return (Data(), []) }
-    var fileDicts: [[String: Any]] = []
-    var ino = 1
+enum DvzipBuildError: Error, LocalizedError {
+    case exceedsMaxOutputBytes(limit: Int)
+    case unreadableInputFile(URL)
+    case gzipFailed(status: Int32)
 
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
-    proc.arguments = ["-1", "-c"]
-    let inPipe = Pipe()
-    let outPipe = Pipe()
-    proc.standardInput = inPipe
-    proc.standardOutput = outPipe
-    try proc.run()
-
-    func makeOdcHdr(path: String, mode: Int, size: Int64) -> Data {
-        let nameBytes = Array(path.utf8) + [0]
-        let header: String
-        if size > 0x1FFFFFFFF {
-            header = String(
-                format: "070764%016llx%08x%08x%08x%08x%016llx%016llx%08x%08x",
-                ino, mode, 501, 20, 1, Int64(Date().timeIntervalSince1970), size, nameBytes.count, 0
-            )
-        } else {
-            header = String(
-                format: "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o",
-                0, ino, mode, 501, 20, 1, 0, Int(Date().timeIntervalSince1970), nameBytes.count, size
-            )
+    var errorDescription: String? {
+        switch self {
+        case .exceedsMaxOutputBytes(let limit):
+            return "Compressed archive exceeded \(limit) byte limit"
+        case .unreadableInputFile(let url):
+            return "Could not read file: \(url.lastPathComponent)"
+        case .gzipFailed(let status):
+            return "gzip exited with status \(status)"
         }
-        ino += 1
-        var d = Data(header.utf8)
-        d.append(contentsOf: nameBytes)
-        return d
+    }
+}
+
+enum BleFallbackCapError: Error, LocalizedError {
+    case exceedsRawPrecheckLimit(totalRawBytes: Int64, limit: Int)
+    case exceedsCompressedOrEncryptedLimit(totalRawBytes: Int64, encryptedBytes: Int, limit: Int)
+    case metadataExceedsLimit(metaBytes: Int, limit: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .exceedsRawPrecheckLimit(let totalRawBytes, _):
+            return "5 GHz Wi-Fi Direct failed and payload (\(formatByteSize(totalRawBytes))) exceeds the 30 MB Bluetooth LE fallback limit."
+        case .exceedsCompressedOrEncryptedLimit(let totalRawBytes, _, _):
+            return "5 GHz Wi-Fi Direct failed and payload (\(formatByteSize(totalRawBytes))) exceeds the 30 MB Bluetooth LE fallback limit."
+        case .metadataExceedsLimit(let metaBytes, let limit):
+            return "Bluetooth LE metadata (\(metaBytes) B) exceeds \(limit) B limit."
+        }
+    }
+}
+
+func makeOdcCpioHeader(path: String, ino: Int, mode: Int, size: Int64, mtime: Int64) -> Data {
+    let nameBytes = Array(path.utf8) + [0]
+    let safeSize = max(Int64(0), size)
+    let safeMtime = max(Int64(0), mtime)
+    let header: String
+    if safeSize > 0x1FFFFFFFF {
+        header = String(
+            format: "070764%016llx%08x%08x%08x%08x%016llx%016llx%08x%08x",
+            UInt64(ino), UInt32(mode), UInt32(501), UInt32(20), UInt32(1),
+            UInt64(safeMtime), UInt64(safeSize), UInt32(nameBytes.count), UInt32(0)
+        )
+    } else {
+        header = String(
+            format: "070707%06o%06o%06o%06o%06o%06o%06o%011llo%06o%011llo",
+            UInt32(0), UInt32(ino & 0x3FFFF), UInt32(mode), UInt32(501), UInt32(20), UInt32(1),
+            UInt32(0), UInt64(safeMtime), UInt32(nameBytes.count), UInt64(safeSize)
+        )
+    }
+    var d = Data(header.utf8)
+    d.append(contentsOf: nameBytes)
+    return d
+}
+
+func buildDvzipCpio(files: [URL], maxOutputBytes: Int? = nil) throws -> (Data, [[String: Any]]) {
+    guard !files.isEmpty else { return (Data(), []) }
+
+    struct PreparedFile {
+        let url: URL
+        let name: String
+        let size: Int64
+        let mtime: Int64
     }
 
+    var prepared: [PreparedFile] = []
+    var fileDicts: [[String: Any]] = []
     for url in files {
         let name = url.lastPathComponent
         if name.hasPrefix("._") { continue }
-        let sz = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+              !isDir.boolValue,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              FileManager.default.isReadableFile(atPath: url.path) else {
+            throw DvzipBuildError.unreadableInputFile(url)
+        }
+        let sz = max(Int64(0), (attrs[.size] as? NSNumber)?.int64Value ?? 0)
+        let mtimeDate = (attrs[.modificationDate] as? Date) ?? Date()
+        let mtimeSec = max(Int64(0), Int64(mtimeDate.timeIntervalSince1970))
+        prepared.append(PreparedFile(url: url, name: name, size: sz, mtime: mtimeSec))
         fileDicts.append([
             "FileName": name,
             "FileType": "public.data",
@@ -1523,30 +1912,207 @@ func buildDvzipCpio(files: [URL]) throws -> (Data, [[String: Any]]) {
             "ConvertMediaFormats": false
         ])
     }
+    guard !prepared.isEmpty else { return (Data(), []) }
 
-    DispatchQueue.global(qos: .userInitiated).async {
-        let wh = inPipe.fileHandleForWriting
-        wh.write(makeOdcHdr(path: ".", mode: 0o040755, size: 0))
-        for url in files {
-            let name = url.lastPathComponent
-            if name.hasPrefix("._") { continue }
-            guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
-            let sz = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
-            wh.write(makeOdcHdr(path: "./\(name)", mode: 0o100644, size: sz))
-            while true {
-                let chunk = handle.readData(ofLength: 65536)
-                if chunk.isEmpty { break }
-                wh.write(chunk)
-            }
-            try? handle.close()
-        }
-        wh.write(makeOdcHdr(path: "TRAILER!!!", mode: 0, size: 0))
-        try? wh.close()
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+    proc.arguments = ["-1", "-c"]
+    let inPipe = Pipe()
+    let outPipe = Pipe()
+    proc.standardInput = inPipe
+    proc.standardOutput = outPipe
+    proc.standardError = FileHandle.nullDevice
+    try proc.run()
+
+    let stateLock = NSLock()
+    var abortedForLimit = false
+    var writerError: Error? = nil
+
+    func isAborted() -> Bool {
+        stateLock.lock()
+        let v = abortedForLimit
+        stateLock.unlock()
+        return v
     }
 
-    let gzData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let writerGroup = DispatchGroup()
+    writerGroup.enter()
+    DispatchQueue.global(qos: .userInitiated).async {
+        defer { writerGroup.leave() }
+        let wh = inPipe.fileHandleForWriting
+        defer { try? wh.close() }
+        var ino = 1
+
+        func nextOdcHdr(path: String, mode: Int, size: Int64, mtime: Int64) -> Data {
+            let d = makeOdcCpioHeader(path: path, ino: ino, mode: mode, size: size, mtime: mtime)
+            ino += 1
+            return d
+        }
+
+        do {
+            let nowSec = Int64(Date().timeIntervalSince1970)
+            try wh.write(contentsOf: nextOdcHdr(path: ".", mode: 0o040755, size: 0, mtime: nowSec))
+            for entry in prepared {
+                if isAborted() { return }
+                let handle = try FileHandle(forReadingFrom: entry.url)
+                defer { try? handle.close() }
+                try wh.write(contentsOf: nextOdcHdr(path: "./\(entry.name)", mode: 0o100644, size: entry.size, mtime: entry.mtime))
+                var remaining = entry.size
+                while remaining > 0 {
+                    if isAborted() { return }
+                    let toRead = Int(min(Int64(65536), remaining))
+                    let chunk = (try handle.read(upToCount: toRead)) ?? Data()
+                    if chunk.isEmpty {
+                        throw DvzipBuildError.unreadableInputFile(entry.url)
+                    }
+                    try wh.write(contentsOf: chunk)
+                    remaining -= Int64(chunk.count)
+                }
+            }
+            try wh.write(contentsOf: nextOdcHdr(path: "TRAILER!!!", mode: 0, size: 0, mtime: 0))
+        } catch {
+            if !isAborted() {
+                stateLock.lock()
+                if writerError == nil { writerError = error }
+                stateLock.unlock()
+            }
+        }
+    }
+
+    var gzData = Data()
+    let rh = outPipe.fileHandleForReading
+    while true {
+        let chunk = (try? rh.read(upToCount: 65536)) ?? Data()
+        if chunk.isEmpty { break }
+        if let maxBytes = maxOutputBytes, gzData.count + chunk.count > maxBytes {
+            stateLock.lock()
+            abortedForLimit = true
+            stateLock.unlock()
+            proc.terminate()
+            try? rh.close()
+            writerGroup.wait()
+            proc.waitUntilExit()
+            throw DvzipBuildError.exceedsMaxOutputBytes(limit: maxBytes)
+        }
+        gzData.append(chunk)
+    }
+    try? rh.close()
+    writerGroup.wait()
     proc.waitUntilExit()
+
+    stateLock.lock()
+    let capturedWriterErr = writerError
+    stateLock.unlock()
+    if let err = capturedWriterErr {
+        throw err
+    }
+    if proc.terminationStatus != 0 {
+        throw DvzipBuildError.gzipFailed(status: proc.terminationStatus)
+    }
     return (gzData, fileDicts)
+}
+
+func prepareBleFallbackPayload(
+    files: [URL],
+    urls: [String],
+    totalRawBytes: Int64,
+    senderName: String,
+    maxEncryptedArchiveBytes: Int = MAX_ENCRYPTED_BLE_ARCHIVE_BYTES,
+    rawPrecheckMaxBytes: Int64 = BLE_RAW_PRECHECK_MAX_BYTES
+) throws -> (metaData: Data, gzData: Data) {
+    if !files.isEmpty && totalRawBytes > rawPrecheckMaxBytes {
+        throw BleFallbackCapError.exceedsRawPrecheckLimit(
+            totalRawBytes: totalRawBytes,
+            limit: maxEncryptedArchiveBytes
+        )
+    }
+    let maxCompressedBytes = max(0, maxEncryptedArchiveBytes - 28)
+    let gzData: Data
+    let fileDicts: [[String: Any]]
+    do {
+        (gzData, fileDicts) = try buildDvzipCpio(files: files, maxOutputBytes: maxCompressedBytes)
+    } catch DvzipBuildError.exceedsMaxOutputBytes(let limit) {
+        throw BleFallbackCapError.exceedsCompressedOrEncryptedLimit(
+            totalRawBytes: totalRawBytes,
+            encryptedBytes: limit + 28,
+            limit: maxEncryptedArchiveBytes
+        )
+    }
+
+    let metaDict: [String: Any] = [
+        "SenderComputerName": senderName,
+        "SenderModelName": "MacBookPro18,2",
+        "BundleID": urls.isEmpty ? "com.apple.finder" : "com.apple.Safari",
+        "Items": urls as [Any],
+        "Files": fileDicts
+    ]
+    let metaData = try PropertyListSerialization.data(fromPropertyList: metaDict, format: .binary, options: 0)
+    if metaData.count + 28 > MAX_BLE_META_BYTES {
+        throw BleFallbackCapError.metadataExceedsLimit(metaBytes: metaData.count + 28, limit: MAX_BLE_META_BYTES)
+    }
+    if !gzData.isEmpty && gzData.count + 28 > maxEncryptedArchiveBytes {
+        throw BleFallbackCapError.exceedsCompressedOrEncryptedLimit(
+            totalRawBytes: totalRawBytes,
+            encryptedBytes: gzData.count + 28,
+            limit: maxEncryptedArchiveBytes
+        )
+    }
+    return (metaData, gzData)
+}
+
+func buildEncryptedBleFallbackFrame(
+    metaData: Data,
+    gzData: Data,
+    totalRawBytes: Int64 = 0,
+    sessionKey: SymmetricKey,
+    maxEncryptedArchiveBytes: Int = MAX_ENCRYPTED_BLE_ARCHIVE_BYTES
+) throws -> Data {
+    let encMeta = encryptBlePayload(metaData, key: sessionKey)
+    if encMeta.count > MAX_BLE_META_BYTES {
+        throw BleFallbackCapError.metadataExceedsLimit(metaBytes: encMeta.count, limit: MAX_BLE_META_BYTES)
+    }
+    let encArch = gzData.isEmpty ? Data() : encryptBlePayload(gzData, key: sessionKey)
+    if encArch.count > maxEncryptedArchiveBytes {
+        throw BleFallbackCapError.exceedsCompressedOrEncryptedLimit(
+            totalRawBytes: totalRawBytes,
+            encryptedBytes: encArch.count,
+            limit: maxEncryptedArchiveBytes
+        )
+    }
+    var frame = Data("ADRE".utf8)
+    var mLen = UInt32(encMeta.count).bigEndian
+    var aLen = UInt32(encArch.count).bigEndian
+    frame.append(Data(bytes: &mLen, count: 4))
+    frame.append(Data(bytes: &aLen, count: 4))
+    frame.append(encMeta)
+    frame.append(encArch)
+    return frame
+}
+
+func buildEncryptedBleFallbackFrame(
+    files: [URL],
+    urls: [String],
+    totalRawBytes: Int64,
+    senderName: String,
+    sessionKey: SymmetricKey,
+    maxEncryptedArchiveBytes: Int = MAX_ENCRYPTED_BLE_ARCHIVE_BYTES,
+    rawPrecheckMaxBytes: Int64 = BLE_RAW_PRECHECK_MAX_BYTES
+) throws -> Data {
+    let prepared = try prepareBleFallbackPayload(
+        files: files,
+        urls: urls,
+        totalRawBytes: totalRawBytes,
+        senderName: senderName,
+        maxEncryptedArchiveBytes: maxEncryptedArchiveBytes,
+        rawPrecheckMaxBytes: rawPrecheckMaxBytes
+    )
+    return try buildEncryptedBleFallbackFrame(
+        metaData: prepared.metaData,
+        gzData: prepared.gzData,
+        totalRawBytes: totalRawBytes,
+        sessionKey: sessionKey,
+        maxEncryptedArchiveBytes: maxEncryptedArchiveBytes
+    )
 }
 
 func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
@@ -1763,6 +2329,7 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
     var activeChannels: [CBL2CAPChannel] = []
     var publishedPsm: CBL2CAPPSM = 0
     var discoveredPeerPeripheral: CBPeripheral?
+    var activePingPeripheral: CBPeripheral?
     var discoveredPeerPsm: CBL2CAPPSM = 0
     var discoveredPeerRssi: Int = -50
     var lastDiscoveredTime: TimeInterval = 0
@@ -1885,7 +2452,6 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
             }
         }
         guard peerPsm > 0 else { return }
-        if discoveredPeerPsm > 0 && peerPsm < discoveredPeerPsm && peerPsm != 128 { return }
         let fallbackLocalName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         // Preserve full name if already learned via L2CAP or previous named packet
@@ -1920,7 +2486,9 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
     func cancelActivePing() {
         isPingingPeer = false
         pingChannel = nil
-        if let p = discoveredPeerPeripheral {
+        let target = activePingPeripheral ?? discoveredPeerPeripheral
+        activePingPeripheral = nil
+        if let p = target {
             cm.cancelPeripheralConnection(p)
         }
     }
@@ -1937,10 +2505,26 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
             return
         }
         let now = Date().timeIntervalSince1970
-        let txLock = STATE_DIR.appendingPathComponent("tx_in_progress.lock")
         let txProgress = STATE_DIR.appendingPathComponent("transfer_progress.json")
-        if FileManager.default.fileExists(atPath: txLock.path) ||
-           FileManager.default.fileExists(atPath: txProgress.path) ||
+        let hasActiveTxProgress: Bool = {
+            guard FileManager.default.fileExists(atPath: txProgress.path) else { return false }
+            if let d = try? Data(contentsOf: txProgress),
+               let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+               (obj["active"] as? Bool) == true {
+                let updatedAt = (obj["updatedAt"] as? Double) ?? now
+                if (now - updatedAt) < TX_LOCK_TTL_SECONDS {
+                    return true
+                }
+            } else if let attrs = try? FileManager.default.attributesOfItem(atPath: txProgress.path),
+                      let mtime = attrs[.modificationDate] as? Date,
+                      (now - mtime.timeIntervalSince1970) < TX_LOCK_TTL_SECONDS {
+                return true
+            }
+            try? FileManager.default.removeItem(at: txProgress)
+            return false
+        }()
+        if hasActiveTxInProgressLock(now: now) ||
+           hasActiveTxProgress ||
            hasActiveTcpReceiverConnection() {
             if cm.state == .poweredOn && cm.isScanning {
                 cm.stopScan()
@@ -1948,6 +2532,7 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
             if isPingingPeer {
                 isPingingPeer = false
                 pingChannel = nil
+                activePingPeripheral = nil
             }
             return
         }
@@ -1971,6 +2556,7 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
             return
         }
         isPingingPeer = true
+        activePingPeripheral = p
         pingStartedAt = now
         lastPingTime = now
         p.delegate = self
@@ -1984,23 +2570,31 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard discoveredPeerPsm > 0 else {
             isPingingPeer = false
+            activePingPeripheral = nil
             return
         }
         peripheral.openL2CAPChannel(discoveredPeerPsm)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        isPingingPeer = false
+        if activePingPeripheral == nil || activePingPeripheral === peripheral {
+            isPingingPeer = false
+            activePingPeripheral = nil
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        isPingingPeer = false
+        if activePingPeripheral == nil || activePingPeripheral === peripheral {
+            isPingingPeer = false
+            activePingPeripheral = nil
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
         guard let ch = channel, error == nil else {
             discoveredPeerPsm = 0
             isPingingPeer = false
+            activePingPeripheral = nil
             return
         }
         pingChannel = ch
@@ -2015,9 +2609,10 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                 DispatchQueue.main.async {
                     self?.pingChannel = nil
                     self?.isPingingPeer = false
-                    if let s = self, let p = s.discoveredPeerPeripheral {
-                        s.cm.cancelPeripheralConnection(p)
+                    if self?.activePingPeripheral === peripheral {
+                        self?.activePingPeripheral = nil
                     }
+                    self?.cm.cancelPeripheralConnection(peripheral)
                 }
                 return
             }
@@ -2029,9 +2624,10 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                 DispatchQueue.main.async {
                     self?.pingChannel = nil
                     self?.isPingingPeer = false
-                    if let s = self, let p = s.discoveredPeerPeripheral {
-                        s.cm.cancelPeripheralConnection(p)
+                    if self?.activePingPeripheral === peripheral {
+                        self?.activePingPeripheral = nil
                     }
+                    self?.cm.cancelPeripheralConnection(peripheral)
                 }
             }
 
@@ -2048,136 +2644,186 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                 return
             }
 
-            func readLine() -> String? {
-                var lineBytes = Data()
-                var b: UInt8 = 0
-                while lineBytes.count < 512 {
-                    let r = inp.read(&b, maxLength: 1)
-                    if r <= 0 { return lineBytes.isEmpty ? nil : String(data: lineBytes, encoding: .utf8) }
-                    if b == UInt8(ascii: "\n") { break }
-                    if b != UInt8(ascii: "\r") { lineBytes.append(b) }
-                }
-                return String(data: lineBytes, encoding: .utf8)
-            }
-
-            guard let replyLine = readLine() else {
-                DispatchQueue.main.async { self?.discoveredPeerPsm = 0 }
-                return
-            }
-
-            if replyLine.hasPrefix("PONG\t") {
-                let parts = replyLine.dropFirst(5).split(separator: "\t").map(String.init)
-                let remoteName = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !remoteName.isEmpty {
-                    recordActivePeerOnDisk(
-                        id: targetPeerId,
-                        name: remoteName,
-                        transport: "5GHz P2P • BLE PSM \(currentPsm)",
-                        address: targetPeerId,
-                        psm: currentPsm,
-                        rssi: currentRssi
-                    )
-                }
-                return
-            }
-
-            let targetPeerName = loadActivePeersFromDisk(maxAge: 30.0).first(where: { $0.id == targetPeerId })?.name ?? "Android Peer"
-
-            if replyLine.hasPrefix("W2P2\t") {
-                let rawParts = replyLine.dropFirst(5).split(separator: "\t").map(String.init)
-                let parts = rawParts.filter { !$0.isEmpty }
-                var androidPubB64 = ""
-                var androidTlsFingerprint = ""
-                if parts.count >= 3 && (parts[0] == "2" || parts[0] == "1") {
-                    androidPubB64 = parts[1]
-                    androidTlsFingerprint = parts[2]
-                } else if parts.count == 2 && (parts[0] == "2" || parts[0] == "1") {
-                    androidPubB64 = parts[1]
-                } else if parts.count >= 2 {
-                    androidPubB64 = parts[0]
-                    androidTlsFingerprint = parts[1]
-                } else if parts.count == 1 {
-                    androidPubB64 = parts[0]
-                }
-                if !androidPubB64.isEmpty,
-                   let androidPubDer = Data(base64Encoded: androidPubB64),
-                   let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer) {
-                    if !androidTlsFingerprint.isEmpty {
-                        try? androidTlsFingerprint.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
+            var bleSessionKey: SymmetricKey? = nil
+            while let replyLine = readBleStreamLine(inp, maxLen: 4096, timeout: 15.0) {
+                if replyLine.hasPrefix("PONG\t") {
+                    let parts = replyLine.dropFirst(5).split(separator: "\t").map(String.init)
+                    let remoteName = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !remoteName.isEmpty {
+                        recordActivePeerOnDisk(
+                            id: targetPeerId,
+                            name: remoteName,
+                            transport: "5GHz P2P • BLE PSM \(currentPsm)",
+                            address: targetPeerId,
+                            psm: currentPsm,
+                            rssi: currentRssi
+                        )
                     }
-                    let macPriv = P256.KeyAgreement.PrivateKey()
-                    if let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) {
-                        let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
-                        let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
-                        let macTlsFingerprint = getLocalMacTlsCertFingerprint()
-                        let reply = "OK\t\(macPubB64)\t\(macTlsFingerprint)\n"
-                        if writeAll(out, data: Data(reply.utf8)) {
-                            if let joinLine = readBleStreamLine(inp), joinLine.hasPrefix("JOIN\t") {
-                                let encB64 = String(joinLine.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
-                                if let encData = Data(base64Encoded: encB64),
-                                   let decData = decryptAesGcm(packet: encData, using: sessionKey),
-                                   let decStr = String(data: decData, encoding: .utf8) {
-                                    let credParts = decStr.split(separator: "\t").map(String.init)
-                                    if credParts.count >= 2 {
-                                        handleIncomingWp2pJoin(ssid: credParts[0], pass: credParts[1], out: out, peerName: targetPeerName)
-                                        return
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if replyLine.hasPrefix("WP2P\t") {
-                let parts = replyLine.dropFirst(5).split(separator: "\t").map(String.init)
-                if parts.count >= 2 {
-                    handleIncomingWp2pJoin(ssid: parts[0], pass: parts[1], out: out, peerName: targetPeerName)
                     return
                 }
-            }
 
-            if replyLine == "ADRP" || replyLine == "ADRE" {
-                DispatchQueue.main.async { self?.pingStartedAt = Date().timeIntervalSince1970 + 90.0 }
-                guard let lenHdr = readExact(inp, count: 8) else { return }
-                let metaLen = readUInt32BE(lenHdr, offset: 0)
-                let archLen = readUInt32BE(lenHdr, offset: 4)
-                guard metaLen > 0 && metaLen <= 10_000_000 && archLen >= 0 && archLen <= 100_000_000_000 else { return }
+                let targetPeerName = loadActivePeersFromDisk(maxAge: 30.0).first(where: { $0.id == targetPeerId })?.name ?? "Android Peer"
 
-                let isEncrypted = (replyLine == "ADRE")
-                guard let rawMeta = readExact(inp, count: metaLen),
-                      let metaData = isEncrypted ? decryptBlePayload(rawMeta) : rawMeta else { return }
-                let metaDict = (try? PropertyListSerialization.propertyList(from: metaData, options: [], format: nil)) as? [String: Any] ?? [:]
-                let sender = (metaDict["SenderComputerName"] as? String) ?? "Android Peer"
-                let filesArr = (metaDict["Files"] as? [[String: Any]]) ?? []
-                let itemsArr = (metaDict["Items"] as? [Any])?.compactMap { $0 as? String } ?? []
-                let fileNames = filesArr.compactMap { $0["FileName"] as? String }
-                let displayNames = fileNames.isEmpty ? itemsArr : fileNames
-                let prelimLabel = displayNames.first ?? "Incoming BLE File"
-                let totalAskBytes = filesArr.reduce(Int64(0)) { $0 + Int64(($1["FileSize"] as? Int) ?? 0) }
-                let effectiveBytes = totalAskBytes > 0 ? totalAskBytes : Int64(archLen)
+                if replyLine.hasPrefix("W2P2\t") {
+                    DispatchQueue.main.async { self?.pingStartedAt = Date().timeIntervalSince1970 + 120.0 }
+                    let rawParts = replyLine.dropFirst(5).split(separator: "\t").map(String.init)
+                    let parts = rawParts.filter { !$0.isEmpty }
+                    var androidPubB64 = ""
+                    var androidTlsFingerprint = ""
+                    if parts.count >= 3 && (parts[0] == "2" || parts[0] == "1") {
+                        androidPubB64 = parts[1]
+                        androidTlsFingerprint = parts[2]
+                    } else if parts.count == 2 && (parts[0] == "2" || parts[0] == "1") {
+                        androidPubB64 = parts[1]
+                    } else if parts.count >= 2 {
+                        androidPubB64 = parts[0]
+                        androidTlsFingerprint = parts[1]
+                    } else if parts.count == 1 {
+                        androidPubB64 = parts[0]
+                    }
+                    let macTlsFingerprint = getLocalMacTlsCertFingerprint()
+                    guard isValidSha256Fingerprint(androidTlsFingerprint),
+                          isValidSha256Fingerprint(macTlsFingerprint),
+                          !androidPubB64.isEmpty,
+                          let androidPubDer = Data(base64Encoded: androidPubB64),
+                          let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer) else {
+                        print("[BLE-Daemon] Rejected W2P2 heartbeat handshake: missing/invalid peer public key or TLS fingerprint")
+                        fflush(stdout)
+                        _ = writeAll(out, data: Data("NO\n".utf8))
+                        return
+                    }
+                    let normalizedPin = normalizeSha256Fingerprint(androidTlsFingerprint)
+                    try? normalizedPin.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
+                    let macPriv = P256.KeyAgreement.PrivateKey()
+                    guard let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) else {
+                        _ = writeAll(out, data: Data("NO\n".utf8))
+                        return
+                    }
+                    let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
+                    let sessionToken = deriveSessionToken(sharedSecret: sharedSecret)
+                    registerP2pSessionToken(sessionToken)
+                    let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
+                    let reply = "OK\t\(macPubB64)\t\(macTlsFingerprint)\n"
+                    guard writeAll(out, data: Data(reply.utf8)),
+                          let joinLine = readBleStreamLine(inp), joinLine.hasPrefix("JOIN\t") else {
+                        revokeP2pSessionToken(sessionToken)
+                        _ = writeAll(out, data: Data("NO\n".utf8))
+                        return
+                    }
+                    let encB64 = String(joinLine.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard let encData = Data(base64Encoded: encB64),
+                          let decData = decryptAesGcm(packet: encData, using: sessionKey),
+                          let decStr = String(data: decData, encoding: .utf8) else {
+                        revokeP2pSessionToken(sessionToken)
+                        _ = writeAll(out, data: Data("NO\n".utf8))
+                        return
+                    }
+                    let credParts = decStr.split(separator: "\t").map(String.init)
+                    guard credParts.count >= 2 else {
+                        revokeP2pSessionToken(sessionToken)
+                        _ = writeAll(out, data: Data("NO\n".utf8))
+                        return
+                    }
+                    handleIncomingWp2pJoin(ssid: credParts[0], pass: credParts[1], out: out, peerName: targetPeerName, sessionToken: sessionToken)
+                    return
+                }
 
-                if !waitForMacUserAccept(senderName: sender, fileNames: displayNames, totalBytes: effectiveBytes) {
+                if replyLine.hasPrefix("WP2P") {
+                    print("[BLE-Daemon] Rejected unpinned legacy WP2P downgrade attempt over BLE heartbeat")
+                    fflush(stdout)
+                    _ = writeAll(out, data: Data("NO\n".utf8))
+                    return
+                }
+
+                if replyLine.hasPrefix("BLEK\t") {
+                    guard bleSessionKey == nil else {
+                        _ = writeAll(out, data: Data("NO\n".utf8))
+                        return
+                    }
+                    let androidPubB64 = String(replyLine.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !androidPubB64.isEmpty,
+                          let androidPubDer = Data(base64Encoded: androidPubB64),
+                          let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer) else {
+                        _ = writeAll(out, data: Data("NO\n".utf8))
+                        return
+                    }
+                    let macPriv = P256.KeyAgreement.PrivateKey()
+                    guard let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) else {
+                        _ = writeAll(out, data: Data("NO\n".utf8))
+                        return
+                    }
+                    bleSessionKey = deriveBleFrameKey(sharedSecret: sharedSecret)
+                    let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
+                    guard writeAll(out, data: Data("OK\t\(macPubB64)\n".utf8)) else { return }
+                    continue
+                }
+
+                if replyLine == "ADRP" {
+                    print("[BLE-Daemon] Rejected plaintext ADRP BLE frame — ephemeral E2EE required")
+                    fflush(stdout)
                     _ = writeAll(out, data: Data("NO\r\n".utf8))
                     return
                 }
 
-                let archData: Data
-                if archLen > 0 {
-                    guard let rawArch = readExact(
-                        inp,
-                        count: archLen,
-                        trackProgress: true,
-                        fileLabel: prelimLabel,
-                        fileCount: max(1, displayNames.count)
-                    ),
-                    let decodedArch = isEncrypted ? decryptBlePayload(rawArch) : rawArch else { return }
-                    archData = decodedArch
-                } else {
-                    archData = Data()
+                if replyLine == "ADRE" {
+                    guard let activeBleKey = bleSessionKey else {
+                        print("[BLE-Daemon] Rejected ADRE frame without prior BLEK ephemeral ECDH key exchange")
+                        fflush(stdout)
+                        _ = writeAll(out, data: Data("NO\r\n".utf8))
+                        return
+                    }
+                    DispatchQueue.main.async { self?.pingStartedAt = Date().timeIntervalSince1970 + 90.0 }
+                    guard let lenHdr = readExact(inp, count: 8) else { return }
+                    let metaLen = readUInt32BE(lenHdr, offset: 0)
+                    let archLen = readUInt32BE(lenHdr, offset: 4)
+                    guard metaLen > 0 && metaLen <= MAX_BLE_META_BYTES && archLen >= 0 && archLen <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES else {
+                        print("[BLE-Daemon] Rejected out-of-bounds ADRE frame: metaLen=\(metaLen), archLen=\(archLen)")
+                        return
+                    }
+
+                    guard let rawMeta = readExact(inp, count: metaLen),
+                          let metaData = decryptBlePayload(rawMeta, key: activeBleKey) else {
+                        print("[BLE-Daemon] Failed to decrypt ADRE metadata with ephemeral ECDH BLE key")
+                        _ = writeAll(out, data: Data("NO\r\n".utf8))
+                        return
+                    }
+                    let metaDict = (try? PropertyListSerialization.propertyList(from: metaData, options: [], format: nil)) as? [String: Any] ?? [:]
+                    let sender = (metaDict["SenderComputerName"] as? String) ?? "Android Peer"
+                    let filesArr = (metaDict["Files"] as? [[String: Any]]) ?? []
+                    let itemsArr = (metaDict["Items"] as? [Any])?.compactMap { $0 as? String } ?? []
+                    let fileNames = filesArr.compactMap { $0["FileName"] as? String }
+                    let displayNames = fileNames.isEmpty ? itemsArr : fileNames
+                    let prelimLabel = displayNames.first ?? "Incoming BLE File"
+                    let totalAskBytes = filesArr.reduce(Int64(0)) { $0 + Int64(($1["FileSize"] as? Int) ?? 0) }
+                    let effectiveBytes = totalAskBytes > 0 ? totalAskBytes : Int64(archLen)
+
+                    if !waitForMacUserAccept(senderName: sender, fileNames: displayNames, totalBytes: effectiveBytes) {
+                        _ = writeAll(out, data: Data("NO\r\n".utf8))
+                        return
+                    }
+
+                    let archData: Data
+                    if archLen > 0 {
+                        guard let rawArch = readExact(
+                            inp,
+                            count: archLen,
+                            trackProgress: true,
+                            fileLabel: prelimLabel,
+                            fileCount: max(1, displayNames.count)
+                        ),
+                        let decodedArch = decryptBlePayload(rawArch, key: activeBleKey) else {
+                            _ = writeAll(out, data: Data("NO\r\n".utf8))
+                            return
+                        }
+                        archData = decodedArch
+                    } else {
+                        archData = Data()
+                    }
+                    _ = writeAll(out, data: Data("OK\r\n".utf8))
+                    extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict)
+                    return
                 }
-                _ = writeAll(out, data: Data("OK\r\n".utf8))
-                extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict)
+                return
             }
         }
     }
@@ -2254,164 +2900,220 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                     self?.activeChannels.removeAll { $0 === ch }
                 }
             }
-            guard let hdr = readExact(inp, count: 12) else { return }
-            let magic = String(data: hdr.subdata(in: 0..<4), encoding: .ascii) ?? ""
-            let metaLen = readUInt32BE(hdr, offset: 4)
-            let archLen = readUInt32BE(hdr, offset: 8)
-            guard metaLen > 0 && metaLen <= 10_000_000 && archLen >= 0 && archLen <= 100_000_000_000 else {
-                print("[BLE-Daemon] Rejected out-of-bounds frame: metaLen=\(metaLen), archLen=\(archLen)")
-                return
-            }
+            var bleSessionKey: SymmetricKey? = nil
+            while true {
+                guard let hdr = readExact(inp, count: 12) else { return }
+                let magic = String(data: hdr.subdata(in: 0..<4), encoding: .ascii) ?? ""
+                let metaLen = readUInt32BE(hdr, offset: 4)
+                let archLen = readUInt32BE(hdr, offset: 8)
+                guard metaLen > 0 && metaLen <= 10_000_000 && archLen >= 0 && archLen <= 100_000_000_000 else {
+                    print("[BLE-Daemon] Rejected out-of-bounds frame: metaLen=\(metaLen), archLen=\(archLen)")
+                    return
+                }
 
-            if magic == "PING" {
-                guard let pingData = readExact(inp, count: metaLen),
-                      let pingStr = String(data: pingData, encoding: .utf8) else { return }
-                let parts = pingStr.split(separator: "\t").map(String.init)
-                let peerName = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Android Peer"
-                let peerPsm = parts.count >= 2 ? (Int(parts[1]) ?? 0) : 0
-                let peerRssi = parts.count >= 3 ? (Int(parts[2]) ?? -55) : -55
+                if magic == "PING" {
+                    guard let pingData = readExact(inp, count: metaLen),
+                          let pingStr = String(data: pingData, encoding: .utf8) else { return }
+                    let parts = pingStr.split(separator: "\t").map(String.init)
+                    let peerName = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Android Peer"
+                    let peerPsm = parts.count >= 2 ? (Int(parts[1]) ?? 0) : 0
+                    let peerRssi = parts.count >= 3 ? (Int(parts[2]) ?? -55) : -55
+                    let existingPeer = loadActivePeersFromDisk(maxAge: 30.0).first
+                    let bestId = existingPeer?.id ?? ch.peer.identifier.uuidString
+                    let bestAddr = existingPeer?.address ?? ch.peer.identifier.uuidString
+                    let bestPsm = peerPsm > 0 ? peerPsm : (existingPeer?.psm ?? 0)
+                    recordActivePeerOnDisk(
+                        id: bestId,
+                        name: peerName.isEmpty ? "Android Peer" : peerName,
+                        transport: bestPsm > 0 ? "5GHz P2P • BLE PSM \(bestPsm)" : "5GHz P2P • BLE",
+                        address: bestAddr,
+                        psm: bestPsm,
+                        rssi: existingPeer?.rssi ?? peerRssi
+                    )
+                    let macName = loadMacSettings().deviceName
+                    let myPsm = self?.publishedPsm ?? 192
+                    _ = writeAll(out, data: Data("PONG\t\(macName)\t\(myPsm)\n".utf8))
+                    return
+                }
+
+                if magic == "W2P2" {
+                    guard let reqData = readExact(inp, count: metaLen),
+                          let reqStr = String(data: reqData, encoding: .utf8) else { return }
+                    let rawParts = reqStr.split(separator: "\t").map(String.init)
+                    let parts = rawParts.filter { !$0.isEmpty }
+                    var androidPubB64 = ""
+                    var androidTlsFingerprint = ""
+                    if parts.count >= 3 && (parts[0] == "2" || parts[0] == "1") {
+                        androidPubB64 = parts[1]
+                        androidTlsFingerprint = parts[2]
+                    } else if parts.count == 2 && (parts[0] == "2" || parts[0] == "1") {
+                        androidPubB64 = parts[1]
+                    } else if parts.count >= 2 {
+                        androidPubB64 = parts[0]
+                        androidTlsFingerprint = parts[1]
+                    } else if parts.count == 1 {
+                        androidPubB64 = parts[0]
+                    }
+                    let macTlsFingerprint = getLocalMacTlsCertFingerprint()
+                    guard isValidSha256Fingerprint(androidTlsFingerprint),
+                          isValidSha256Fingerprint(macTlsFingerprint),
+                          !androidPubB64.isEmpty,
+                          let androidPubDer = Data(base64Encoded: androidPubB64),
+                          let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer) else {
+                        print("[BLE-Daemon] Rejected W2P2 handshake: missing/invalid peer public key or TLS fingerprint")
+                        fflush(stdout)
+                        _ = writeAll(out, data: Data("ERR\n".utf8))
+                        return
+                    }
+                    let normalizedPin = normalizeSha256Fingerprint(androidTlsFingerprint)
+                    try? normalizedPin.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
+
+                    let macPriv = P256.KeyAgreement.PrivateKey()
+                    guard let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) else {
+                        _ = writeAll(out, data: Data("ERR\n".utf8))
+                        return
+                    }
+                    let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
+                    let sessionToken = deriveSessionToken(sharedSecret: sharedSecret)
+                    registerP2pSessionToken(sessionToken)
+                    let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
+                    let reply = "OK\t\(macPubB64)\t\(macTlsFingerprint)\n"
+                    guard writeAll(out, data: Data(reply.utf8)) else {
+                        revokeP2pSessionToken(sessionToken)
+                        return
+                    }
+
+                    guard let joinLine = readBleStreamLine(inp), joinLine.hasPrefix("JOIN\t") else {
+                        revokeP2pSessionToken(sessionToken)
+                        _ = writeAll(out, data: Data("ERR\n".utf8))
+                        return
+                    }
+                    let encB64 = String(joinLine.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard let encData = Data(base64Encoded: encB64),
+                          let decData = decryptAesGcm(packet: encData, using: sessionKey),
+                          let decStr = String(data: decData, encoding: .utf8) else {
+                        print("[BLE-Daemon] Failed to decrypt encrypted W2P2 credentials with ECDH session key")
+                        revokeP2pSessionToken(sessionToken)
+                        _ = writeAll(out, data: Data("ERR\n".utf8))
+                        return
+                    }
+                    let credParts = decStr.split(separator: "\t").map(String.init)
+                    guard credParts.count >= 2 else {
+                        revokeP2pSessionToken(sessionToken)
+                        _ = writeAll(out, data: Data("ERR\n".utf8))
+                        return
+                    }
+                    let activePeer = loadActivePeersFromDisk(maxAge: 30.0).first
+                    let pName = activePeer?.name ?? "Android Peer"
+                    handleIncomingWp2pJoin(ssid: credParts[0], pass: credParts[1], out: out, peerName: pName, sessionToken: sessionToken)
+                    return
+                }
+
+                if magic == "WP2P" {
+                    print("[BLE-Daemon] Rejected unpinned legacy WP2P downgrade attempt")
+                    fflush(stdout)
+                    _ = writeAll(out, data: Data("ERR\n".utf8))
+                    return
+                }
+
+                if magic == "BLEK" {
+                    guard bleSessionKey == nil, metaLen > 0, metaLen <= 4096, archLen == 0,
+                          let pubData = readExact(inp, count: metaLen),
+                          let androidPubB64 = String(data: pubData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !androidPubB64.isEmpty,
+                          let androidPubDer = Data(base64Encoded: androidPubB64),
+                          let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer) else {
+                        _ = writeAll(out, data: Data("ERR\n".utf8))
+                        return
+                    }
+                    let macPriv = P256.KeyAgreement.PrivateKey()
+                    guard let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) else {
+                        _ = writeAll(out, data: Data("ERR\n".utf8))
+                        return
+                    }
+                    bleSessionKey = deriveBleFrameKey(sharedSecret: sharedSecret)
+                    let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
+                    guard writeAll(out, data: Data("OK\t\(macPubB64)\n".utf8)) else { return }
+                    continue
+                }
+
+                if magic == "ADRP" {
+                    print("[BLE-Daemon] Rejected plaintext ADRP BLE frame — ephemeral E2EE required")
+                    fflush(stdout)
+                    _ = writeAll(out, data: Data("NO\r\n".utf8))
+                    return
+                }
+
+                guard magic == "ADRE" else { return }
+                guard let activeBleKey = bleSessionKey else {
+                    print("[BLE-Daemon] Rejected ADRE frame without prior BLEK ephemeral ECDH key exchange")
+                    fflush(stdout)
+                    _ = writeAll(out, data: Data("NO\r\n".utf8))
+                    return
+                }
+                guard metaLen <= MAX_BLE_META_BYTES && archLen <= MAX_ENCRYPTED_BLE_ARCHIVE_BYTES else {
+                    print("[BLE-Daemon] Rejected out-of-bounds ADRE frame: metaLen=\(metaLen), archLen=\(archLen)")
+                    _ = writeAll(out, data: Data("NO\r\n".utf8))
+                    return
+                }
+                print("[BLE-Daemon] Receiving ADRE frame (meta=\(metaLen) B, archive=\(archLen) B)...")
+                fflush(stdout)
+
+                guard let rawMeta = readExact(inp, count: metaLen),
+                      let metaData = decryptBlePayload(rawMeta, key: activeBleKey) else {
+                    print("[BLE-Daemon] Failed to decrypt ADRE metadata with ephemeral ECDH BLE key")
+                    _ = writeAll(out, data: Data("NO\r\n".utf8))
+                    return
+                }
+                let metaDict = (try? PropertyListSerialization.propertyList(from: metaData, options: [], format: nil)) as? [String: Any] ?? [:]
+                let sender = (metaDict["SenderComputerName"] as? String) ?? "Android Peer"
+                let filesArr = (metaDict["Files"] as? [[String: Any]]) ?? []
+                let itemsArr = (metaDict["Items"] as? [Any])?.compactMap { $0 as? String } ?? []
+                let fileNames = filesArr.compactMap { $0["FileName"] as? String }
+                let displayNames = fileNames.isEmpty ? itemsArr : fileNames
+                let prelimLabel = displayNames.first ?? "Incoming BLE File"
+                let totalAskBytes = filesArr.reduce(Int64(0)) { $0 + Int64(($1["FileSize"] as? Int) ?? 0) }
+                let effectiveBytes = totalAskBytes > 0 ? totalAskBytes : Int64(archLen)
+
+                // Update active peer record with the full sender name learned from the metadata
                 let existingPeer = loadActivePeersFromDisk(maxAge: 30.0).first
-                let bestId = existingPeer?.id ?? ch.peer.identifier.uuidString
-                let bestAddr = existingPeer?.address ?? ch.peer.identifier.uuidString
-                let bestPsm = max(peerPsm, existingPeer?.psm ?? 0)
+                let peerId = ch.peer.identifier.uuidString
                 recordActivePeerOnDisk(
-                    id: bestId,
-                    name: peerName.isEmpty ? "Android Peer" : peerName,
-                    transport: bestPsm > 0 ? "5GHz P2P • BLE PSM \(bestPsm)" : "5GHz P2P • BLE",
-                    address: bestAddr,
-                    psm: bestPsm,
-                    rssi: existingPeer?.rssi ?? peerRssi
+                    id: peerId,
+                    name: sender,
+                    transport: (existingPeer?.psm ?? 0) > 0 ? "5GHz P2P • BLE PSM \(existingPeer!.psm)" : "5GHz P2P • BLE",
+                    address: peerId,
+                    psm: existingPeer?.psm ?? 0,
+                    rssi: existingPeer?.rssi ?? -52
                 )
-                let macName = loadMacSettings().deviceName
-                let myPsm = self?.publishedPsm ?? 192
-                _ = writeAll(out, data: Data("PONG\t\(macName)\t\(myPsm)\n".utf8))
+
+                if !waitForMacUserAccept(senderName: sender, fileNames: displayNames, totalBytes: effectiveBytes) {
+                    _ = writeAll(out, data: Data("NO\r\n".utf8))
+                    return
+                }
+
+                let archData: Data
+                if archLen > 0 {
+                    guard let rawArch = readExact(
+                        inp,
+                        count: archLen,
+                        trackProgress: true,
+                        fileLabel: prelimLabel,
+                        fileCount: max(1, displayNames.count)
+                    ),
+                    let decodedArch = decryptBlePayload(rawArch, key: activeBleKey) else {
+                        _ = writeAll(out, data: Data("NO\r\n".utf8))
+                        return
+                    }
+                    archData = decodedArch
+                } else {
+                    archData = Data()
+                }
+
+                _ = writeAll(out, data: Data("OK\r\n".utf8))
+                extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict)
                 return
             }
-
-            if magic == "W2P2" {
-                guard let reqData = readExact(inp, count: metaLen),
-                      let reqStr = String(data: reqData, encoding: .utf8) else { return }
-                let rawParts = reqStr.split(separator: "\t").map(String.init)
-                let parts = rawParts.filter { !$0.isEmpty }
-                var androidPubB64 = ""
-                var androidTlsFingerprint = ""
-                if parts.count >= 3 && (parts[0] == "2" || parts[0] == "1") {
-                    androidPubB64 = parts[1]
-                    androidTlsFingerprint = parts[2]
-                } else if parts.count == 2 && (parts[0] == "2" || parts[0] == "1") {
-                    androidPubB64 = parts[1]
-                } else if parts.count >= 2 {
-                    androidPubB64 = parts[0]
-                    androidTlsFingerprint = parts[1]
-                } else if parts.count == 1 {
-                    androidPubB64 = parts[0]
-                }
-                guard !androidPubB64.isEmpty,
-                      let androidPubDer = Data(base64Encoded: androidPubB64),
-                      let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer) else {
-                    _ = writeAll(out, data: Data("ERR\n".utf8))
-                    return
-                }
-                if !androidTlsFingerprint.isEmpty {
-                    try? androidTlsFingerprint.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
-                }
-
-                let macPriv = P256.KeyAgreement.PrivateKey()
-                guard let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) else {
-                    _ = writeAll(out, data: Data("ERR\n".utf8))
-                    return
-                }
-                let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
-                let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
-                let macTlsFingerprint = getLocalMacTlsCertFingerprint()
-                let reply = "OK\t\(macPubB64)\t\(macTlsFingerprint)\n"
-                guard writeAll(out, data: Data(reply.utf8)) else { return }
-
-                guard let joinLine = readBleStreamLine(inp), joinLine.hasPrefix("JOIN\t") else {
-                    _ = writeAll(out, data: Data("ERR\n".utf8))
-                    return
-                }
-                let encB64 = String(joinLine.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard let encData = Data(base64Encoded: encB64),
-                      let decData = decryptAesGcm(packet: encData, using: sessionKey),
-                      let decStr = String(data: decData, encoding: .utf8) else {
-                    print("[BLE-Daemon] Failed to decrypt encrypted WP2P credentials with ECDH session key")
-                    _ = writeAll(out, data: Data("ERR\n".utf8))
-                    return
-                }
-                let credParts = decStr.split(separator: "\t").map(String.init)
-                guard credParts.count >= 2 else {
-                    _ = writeAll(out, data: Data("ERR\n".utf8))
-                    return
-                }
-                let activePeer = loadActivePeersFromDisk(maxAge: 30.0).first
-                let pName = activePeer?.name ?? "Android Peer"
-                handleIncomingWp2pJoin(ssid: credParts[0], pass: credParts[1], out: out, peerName: pName)
-                return
-            }
-
-            if magic == "WP2P" {
-                guard let credData = readExact(inp, count: metaLen),
-                      let credStr = String(data: credData, encoding: .utf8) else { return }
-                let parts = credStr.split(separator: "\t").map(String.init)
-                guard parts.count >= 2 else { return }
-                let activePeer = loadActivePeersFromDisk(maxAge: 30.0).first
-                let pName = activePeer?.name ?? "Android Peer"
-                handleIncomingWp2pJoin(ssid: parts[0], pass: parts[1], out: out, peerName: pName)
-                return
-            }
-
-            guard magic == "ADRP" || magic == "ADRE" else { return }
-            print("[BLE-Daemon] Receiving \(magic) frame (meta=\(metaLen) B, archive=\(archLen) B)...")
-            fflush(stdout)
-
-            let isEncrypted = (magic == "ADRE")
-            guard let rawMeta = readExact(inp, count: metaLen),
-                  let metaData = isEncrypted ? decryptBlePayload(rawMeta) : rawMeta else { return }
-            let metaDict = (try? PropertyListSerialization.propertyList(from: metaData, options: [], format: nil)) as? [String: Any] ?? [:]
-            let sender = (metaDict["SenderComputerName"] as? String) ?? "Android Peer"
-            let filesArr = (metaDict["Files"] as? [[String: Any]]) ?? []
-            let itemsArr = (metaDict["Items"] as? [Any])?.compactMap { $0 as? String } ?? []
-            let fileNames = filesArr.compactMap { $0["FileName"] as? String }
-            let displayNames = fileNames.isEmpty ? itemsArr : fileNames
-            let prelimLabel = displayNames.first ?? "Incoming BLE File"
-            let totalAskBytes = filesArr.reduce(Int64(0)) { $0 + Int64(($1["FileSize"] as? Int) ?? 0) }
-            let effectiveBytes = totalAskBytes > 0 ? totalAskBytes : Int64(archLen)
-
-            // Update active peer record with the full sender name learned from the metadata
-            let existingPeer = loadActivePeersFromDisk(maxAge: 30.0).first
-            let peerId = ch.peer.identifier.uuidString
-            recordActivePeerOnDisk(
-                id: peerId,
-                name: sender,
-                transport: (existingPeer?.psm ?? 0) > 0 ? "5GHz P2P • BLE PSM \(existingPeer!.psm)" : "5GHz P2P • BLE",
-                address: peerId,
-                psm: existingPeer?.psm ?? 0,
-                rssi: existingPeer?.rssi ?? -52
-            )
-
-            if !waitForMacUserAccept(senderName: sender, fileNames: displayNames, totalBytes: effectiveBytes) {
-                _ = writeAll(out, data: Data("NO\r\n".utf8))
-                return
-            }
-
-            let archData: Data
-            if archLen > 0 {
-                guard let rawArch = readExact(
-                    inp,
-                    count: archLen,
-                    trackProgress: true,
-                    fileLabel: prelimLabel,
-                    fileCount: max(1, displayNames.count)
-                ),
-                let decodedArch = isEncrypted ? decryptBlePayload(rawArch) : rawArch else { return }
-                archData = decodedArch
-            } else {
-                archData = Data()
-            }
-
-            _ = writeAll(out, data: Data("OK\r\n".utf8))
-            extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict)
         }
     }
 }
@@ -2419,19 +3121,182 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
 // ============================================================================
 // Sender Mode: Mac -> Android Direct BLE L2CAP Sender (Central)
 // ============================================================================
+enum BleConnectSwitchAction: Equatable {
+    case keepExisting
+    case switchTo(peerId: UUID, psm: UInt16)
+}
+
+enum BleConnectDropAction: Equatable {
+    case ignoreStaleCallback
+    case cancelTransfer
+    case restartDiscovery
+    case fail(String)
+}
+
+enum BleOpenFailAction: Equatable {
+    case ignoreStaleCallback
+    case refreshGatt
+    case restartDiscovery
+    case fail(String)
+}
+
+struct BleSenderConnectState {
+    var targetPeerId: UUID? = nil
+    var targetPsm: CBL2CAPPSM = 0
+    var startedOpen = false
+    var transferStarted = false
+    var gattRefreshInProgress = false
+    var needsGattRefreshOnOpenFail = false
+    var isTerminalFailure = false
+    var connectRetryCount = 0
+    var l2capRetryCount = 0
+    var connectAttemptToken = 0
+    var connectStartedAt: Date? = nil
+    let maxConnectRetries: Int = 3
+    let maxL2capRetries: Int = 2
+
+    func isActivePeer(_ peerId: UUID) -> Bool {
+        return !transferStarted && !isTerminalFailure && targetPeerId == peerId
+    }
+
+    mutating func beginConnect(peerId: UUID, now: Date = Date()) -> Int {
+        targetPeerId = peerId
+        connectAttemptToken += 1
+        connectStartedAt = now
+        return connectAttemptToken
+    }
+
+    mutating func evaluateDiscoverSwitch(
+        discoveredPeerId: UUID,
+        psm: UInt16,
+        existingConnected: Bool,
+        now: Date = Date()
+    ) -> BleConnectSwitchAction {
+        guard !transferStarted && !isTerminalFailure else { return .keepExisting }
+        if !startedOpen && !gattRefreshInProgress && (targetPeerId == nil || targetPeerId == discoveredPeerId) {
+            targetPsm = CBL2CAPPSM(psm)
+        }
+        if let existingId = targetPeerId,
+           existingId != discoveredPeerId,
+           !existingConnected,
+           !startedOpen,
+           let started = connectStartedAt,
+           now.timeIntervalSince(started) > 2.5 {
+            targetPeerId = nil
+            connectAttemptToken += 1
+            targetPsm = CBL2CAPPSM(psm)
+            return .switchTo(peerId: existingId, psm: psm)
+        }
+        return .keepExisting
+    }
+
+    mutating func onConnectTimeout(peerId: UUID, token: Int, isConnected: Bool, cancelled: Bool) -> BleConnectDropAction {
+        guard !transferStarted && !isTerminalFailure else { return .ignoreStaleCallback }
+        guard connectAttemptToken == token, targetPeerId == peerId, !isConnected else {
+            return .ignoreStaleCallback
+        }
+        targetPeerId = nil
+        connectAttemptToken += 1
+        startedOpen = false
+        gattRefreshInProgress = false
+        connectStartedAt = nil
+        if cancelled {
+            return .cancelTransfer
+        }
+        connectRetryCount += 1
+        if connectRetryCount <= maxConnectRetries {
+            return .restartDiscovery
+        }
+        return .fail("[BLE-Send] Timed out connecting to nearby device over Bluetooth LE")
+    }
+
+    mutating func onDidConnect(peerId: UUID) -> Bool {
+        guard isActivePeer(peerId) else { return false }
+        connectAttemptToken += 1
+        connectStartedAt = nil
+        return true
+    }
+
+    mutating func onDidDrop(peerId: UUID, cancelled: Bool, failureMessage: String) -> BleConnectDropAction {
+        guard !transferStarted && !isTerminalFailure else { return .ignoreStaleCallback }
+        guard targetPeerId == peerId else { return .ignoreStaleCallback }
+        targetPeerId = nil
+        connectAttemptToken += 1
+        startedOpen = false
+        gattRefreshInProgress = false
+        connectStartedAt = nil
+        if cancelled {
+            return .cancelTransfer
+        }
+        connectRetryCount += 1
+        if connectRetryCount <= maxConnectRetries {
+            return .restartDiscovery
+        }
+        return .fail(failureMessage)
+    }
+
+    mutating func onDidModifyServices(peerId: UUID, affectsP2p: Bool) -> Bool {
+        guard isActivePeer(peerId), affectsP2p else { return false }
+        if startedOpen {
+            needsGattRefreshOnOpenFail = true
+            return false
+        }
+        if gattRefreshInProgress {
+            return false
+        }
+        targetPsm = 0
+        gattRefreshInProgress = true
+        return true
+    }
+
+    mutating func onDidOpenFailure(peerId: UUID, isConnected: Bool, cancelled: Bool, errorDesc: String) -> BleOpenFailAction {
+        guard isActivePeer(peerId) else { return .ignoreStaleCallback }
+        startedOpen = false
+        if cancelled {
+            return .fail("[BLE-Send] Transfer cancelled by user")
+        }
+        l2capRetryCount += 1
+        if l2capRetryCount <= maxL2capRetries {
+            if isConnected && (needsGattRefreshOnOpenFail || l2capRetryCount == 1) {
+                needsGattRefreshOnOpenFail = false
+                targetPsm = 0
+                gattRefreshInProgress = true
+                return .refreshGatt
+            }
+            if connectRetryCount < maxConnectRetries {
+                targetPeerId = nil
+                connectAttemptToken += 1
+                gattRefreshInProgress = false
+                needsGattRefreshOnOpenFail = false
+                connectRetryCount += 1
+                return .restartDiscovery
+            }
+        }
+        return .fail("[BLE-Send] L2CAP open failed: \(errorDesc)")
+    }
+
+    mutating func prepareRestartDiscovery() {
+        targetPeerId = nil
+        targetPsm = 0
+        startedOpen = false
+        gattRefreshInProgress = false
+        needsGattRefreshOnOpenFail = false
+        connectStartedAt = nil
+    }
+}
+
 final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var cm: CBCentralManager!
     var targetPeripheral: CBPeripheral?
     var activeChannel: CBL2CAPChannel?
-    var targetPsm: CBL2CAPPSM = 0
     let files: [URL]
     let urls: [String]
-    let totalRawBytes: Int
-    let frameData: Data
+    let totalRawBytes: Int64
+    let preparedBlePayload: (metaData: Data, gzData: Data)?
     let displayLabel: String
     let itemCount: Int
     var peerLabel: String
-    var startedOpen = false
+    var connectState = BleSenderConnectState()
 
     private func reportSenderConnecting(_ phase: String) {
         writeProgressJson(
@@ -2440,7 +3305,7 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
             fileName: displayLabel,
             fileCount: itemCount,
             doneBytes: 0,
-            totalBytes: Int64(max(1, totalRawBytes)),
+            totalBytes: max(Int64(1), totalRawBytes),
             speedBps: 0,
             etaSeconds: 0,
             percent: 0,
@@ -2450,39 +3315,92 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
         )
     }
 
+    private func cleanupAndFail(message: String) -> Never {
+        connectState.isTerminalFailure = true
+        writeProgressJson(active: false)
+        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+        if needsMacInternetWifiRestore() {
+            restoreMacInternetWifi()
+        }
+        print(message)
+        fflush(stdout)
+        exit(1)
+    }
+
+    private func beginPeripheralConnect(_ central: CBCentralManager, peripheral: CBPeripheral, phase: String) {
+        targetPeripheral = peripheral
+        peripheral.delegate = self
+        let token = connectState.beginConnect(peerId: peripheral.identifier)
+        reportSenderConnecting(phase)
+        central.connect(peripheral, options: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
+            guard let self = self else { return }
+            let action = self.connectState.onConnectTimeout(
+                peerId: peripheral.identifier,
+                token: token,
+                isConnected: peripheral.state == .connected,
+                cancelled: isTransferCancelled()
+            )
+            switch action {
+            case .ignoreStaleCallback:
+                return
+            case .cancelTransfer:
+                self.targetPeripheral = nil
+                central.cancelPeripheralConnection(peripheral)
+                clearCancelFlag()
+                self.cleanupAndFail(message: "[BLE-Send] Transfer cancelled by user")
+            case .restartDiscovery:
+                print("[BLE-Send] Connection attempt to \(peripheral.identifier) timed out; restarting discovery...")
+                fflush(stdout)
+                self.targetPeripheral = nil
+                central.cancelPeripheralConnection(peripheral)
+                self.restartDiscoveryAfterFailure(central)
+            case .fail(let msg):
+                self.targetPeripheral = nil
+                central.cancelPeripheralConnection(peripheral)
+                self.cleanupAndFail(message: msg)
+            }
+        }
+    }
+
+    private func restartDiscoveryAfterFailure(_ central: CBCentralManager) {
+        guard !connectState.transferStarted && !connectState.isTerminalFailure else { return }
+        targetPeripheral = nil
+        connectState.prepareRestartDiscovery()
+        guard central.state == .poweredOn else {
+            cleanupAndFail(message: "[BLE-Send] Bluetooth LE became unavailable during transfer")
+        }
+        reportSenderConnecting("Re-scanning for nearby device via Bluetooth LE…")
+        central.stopScan()
+        central.scanForPeripherals(
+            withServices: nil,
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+        )
+    }
+
     init(files: [URL], urls: [String] = []) throws {
         clearCancelFlag()
-        try? Data("1".utf8).write(to: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+        writeTxInProgressLock()
         self.files = files
         self.urls = urls
-        self.totalRawBytes = files.reduce(0) { $0 + ((try? FileManager.default.attributesOfItem(atPath: $1.path)[.size] as? Int) ?? 0) }
+        self.totalRawBytes = files.reduce(Int64(0)) { acc, url in
+            let sz = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
+            return acc + max(Int64(0), sz)
+        }
         self.itemCount = max(1, files.count + urls.count)
         let firstLabel = files.first?.lastPathComponent ?? (urls.first ?? "Transfer")
         self.displayLabel = self.itemCount > 1 ? "\(firstLabel) + \(self.itemCount - 1) more" : firstLabel
+        let settings = loadMacSettings()
         self.peerLabel = loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Nearby Device"
         if self.totalRawBytes >= 65_536 && !files.isEmpty {
-            self.frameData = Data()
+            self.preparedBlePayload = nil
         } else {
-            let (gzData, fileDicts) = try buildDvzipCpio(files: files)
-            let settings = loadMacSettings()
-            let metaDict: [String: Any] = [
-                "SenderComputerName": settings.deviceName,
-                "SenderModelName": "MacBookPro18,2",
-                "BundleID": urls.isEmpty ? "com.apple.finder" : "com.apple.Safari",
-                "Items": urls as [Any],
-                "Files": fileDicts
-            ]
-            let metaData = try PropertyListSerialization.data(fromPropertyList: metaDict, format: .binary, options: 0)
-            let encMeta = encryptBlePayload(metaData)
-            let encArch = gzData.isEmpty ? Data() : encryptBlePayload(gzData)
-            var frame = Data("ADRE".utf8)
-            var mLen = UInt32(encMeta.count).bigEndian
-            var aLen = UInt32(encArch.count).bigEndian
-            frame.append(Data(bytes: &mLen, count: 4))
-            frame.append(Data(bytes: &aLen, count: 4))
-            frame.append(encMeta)
-            frame.append(encArch)
-            self.frameData = frame
+            self.preparedBlePayload = try prepareBleFallbackPayload(
+                files: files,
+                urls: urls,
+                totalRawBytes: self.totalRawBytes,
+                senderName: settings.deviceName
+            )
         }
         super.init()
         reportSenderConnecting("Scanning for nearby device via Bluetooth LE…")
@@ -2490,22 +3408,20 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        if central.state == .poweredOn {
+        switch central.state {
+        case .poweredOn:
             let knownPeers = loadActivePeersFromDisk(maxAge: 30.0)
             if let first = knownPeers.first {
                 peerLabel = first.name
                 if first.psm > 0 {
-                    targetPsm = CBL2CAPPSM(first.psm)
+                    connectState.targetPsm = CBL2CAPPSM(first.psm)
                 }
                 if let uuid = UUID(uuidString: first.address) {
                     let retrieved = central.retrievePeripherals(withIdentifiers: [uuid])
                     if let p = retrieved.first {
-                        targetPeripheral = p
-                        p.delegate = self
-                        reportSenderConnecting("Connecting to \(first.name) via Bluetooth LE…")
-                        print("[BLE-Send] Connecting directly to active peer \(first.name) (\(uuid), PSM \(targetPsm))...")
+                        print("[BLE-Send] Connecting directly to active peer \(first.name) (\(uuid), PSM \(connectState.targetPsm))...")
                         fflush(stdout)
-                        central.connect(p, options: nil)
+                        beginPeripheralConnect(central, peripheral: p, phase: "Connecting to \(first.name) via Bluetooth LE…")
                     }
                 }
             }
@@ -2515,6 +3431,10 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 withServices: nil,
                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
             )
+        case .poweredOff, .unauthorized, .unsupported:
+            cleanupAndFail(message: "[BLE-Send] Bluetooth is unavailable (state=\(central.state.rawValue))")
+        default:
+            break
         }
     }
 
@@ -2524,6 +3444,7 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
+        guard !connectState.transferStarted && !connectState.isTerminalFailure else { return }
         let uuids = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
         let svcData = (advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]) ?? [:]
         guard uuids.contains(P2P_SERVICE_UUID) || svcData[P2P_DATA_UUID] != nil else { return }
@@ -2531,78 +3452,256 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
         guard let d = svcData[P2P_DATA_UUID], d.count >= 2 else { return }
         let psm = UInt16(d[d.startIndex]) | (UInt16(d[d.startIndex + 1]) << 8)
         guard psm > 0 else { return }
-        // Ignore older leaked advertisements if we already know a newer PSM
-        if targetPsm > 0 && psm < targetPsm && d.count <= 2 { return }
-        targetPsm = CBL2CAPPSM(psm)
+        if d.count > 2 {
+            let nameSlice = d.subdata(in: (d.startIndex + 2)..<d.endIndex)
+            if let decoded = String(data: nameSlice, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !decoded.isEmpty,
+               peerLabel == "Nearby Device" {
+                peerLabel = decoded
+            }
+        }
+
+        let switchAction = connectState.evaluateDiscoverSwitch(
+            discoveredPeerId: peripheral.identifier,
+            psm: psm,
+            existingConnected: targetPeripheral?.state == .connected
+        )
+        if case .switchTo(let staleId, _) = switchAction,
+           let existing = targetPeripheral,
+           existing.identifier == staleId {
+            print("[BLE-Send] Switching from stale peer \(existing.identifier) to live peer \(peripheral.identifier) (PSM \(psm))...")
+            fflush(stdout)
+            targetPeripheral = nil
+            central.cancelPeripheralConnection(existing)
+        }
 
         if targetPeripheral == nil {
-            targetPeripheral = peripheral
-            peripheral.delegate = self
-            reportSenderConnecting("Connecting to \(peerLabel) via Bluetooth LE…")
-            print("[BLE-Send] Found nearby peer (\(peripheral.identifier), RSSI \(RSSI), PSM \(targetPsm)), connecting...")
+            connectState.targetPsm = CBL2CAPPSM(psm)
+            print("[BLE-Send] Found nearby peer (\(peripheral.identifier), RSSI \(RSSI), PSM \(connectState.targetPsm)), connecting...")
             fflush(stdout)
             central.stopScan()
-            central.connect(peripheral, options: nil)
+            beginPeripheralConnect(central, peripheral: peripheral, phase: "Connecting to \(peerLabel) via Bluetooth LE…")
         }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        if targetPsm > 0 && !startedOpen {
-            startedOpen = true
+        guard connectState.onDidConnect(peerId: peripheral.identifier) else { return }
+        if connectState.targetPsm > 0 && !connectState.startedOpen && !connectState.gattRefreshInProgress {
+            connectState.startedOpen = true
             reportSenderConnecting("Opening Bluetooth L2CAP channel…")
-            print("[BLE-Send] Connected! Opening L2CAP channel PSM \(targetPsm)...")
+            print("[BLE-Send] Connected! Opening L2CAP channel PSM \(connectState.targetPsm)...")
             fflush(stdout)
-            peripheral.openL2CAPChannel(targetPsm)
-        } else {
+            peripheral.openL2CAPChannel(connectState.targetPsm)
+        } else if !connectState.gattRefreshInProgress {
+            connectState.gattRefreshInProgress = true
             reportSenderConnecting("Discovering Bluetooth L2CAP service…")
             peripheral.discoverServices([P2P_SERVICE_UUID])
         }
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let svcs = peripheral.services else { return }
-        for s in svcs where s.uuid == P2P_SERVICE_UUID {
-            peripheral.discoverCharacteristics([P2P_PSM_CHAR_UUID], for: s)
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        let action = connectState.onDidDrop(
+            peerId: peripheral.identifier,
+            cancelled: isTransferCancelled(),
+            failureMessage: "[BLE-Send] Failed to connect to nearby device over Bluetooth LE"
+        )
+        switch action {
+        case .ignoreStaleCallback:
+            return
+        case .cancelTransfer:
+            targetPeripheral = nil
+            clearCancelFlag()
+            cleanupAndFail(message: "[BLE-Send] Transfer cancelled by user")
+        case .restartDiscovery:
+            print("[BLE-Send] Failed to connect to \(peripheral.identifier): \(String(describing: error))")
+            fflush(stdout)
+            targetPeripheral = nil
+            restartDiscoveryAfterFailure(central)
+        case .fail(let msg):
+            targetPeripheral = nil
+            cleanupAndFail(message: msg)
         }
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        let action = connectState.onDidDrop(
+            peerId: peripheral.identifier,
+            cancelled: isTransferCancelled(),
+            failureMessage: "[BLE-Send] Bluetooth LE connection dropped before transfer started"
+        )
+        switch action {
+        case .ignoreStaleCallback:
+            return
+        case .cancelTransfer:
+            targetPeripheral = nil
+            clearCancelFlag()
+            cleanupAndFail(message: "[BLE-Send] Transfer cancelled by user")
+        case .restartDiscovery:
+            print("[BLE-Send] Disconnected from \(peripheral.identifier) before L2CAP opened: \(String(describing: error))")
+            fflush(stdout)
+            targetPeripheral = nil
+            restartDiscoveryAfterFailure(central)
+        case .fail(let msg):
+            targetPeripheral = nil
+            cleanupAndFail(message: msg)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        let affectsP2p = invalidatedServices.isEmpty || invalidatedServices.contains(where: { $0.uuid == P2P_SERVICE_UUID })
+        guard connectState.onDidModifyServices(peerId: peripheral.identifier, affectsP2p: affectsP2p) else { return }
+        print("[BLE-Send] Remote GATT services modified; re-discovering P2P PSM...")
+        fflush(stdout)
+        peripheral.discoverServices([P2P_SERVICE_UUID])
+    }
+
+    private func handleGattDiscoveryFailure(_ peripheral: CBPeripheral, logLine: String, terminalMsg: String) {
+        print(logLine)
+        fflush(stdout)
+        let action = connectState.onDidDrop(
+            peerId: peripheral.identifier,
+            cancelled: isTransferCancelled(),
+            failureMessage: terminalMsg
+        )
+        switch action {
+        case .ignoreStaleCallback:
+            return
+        case .cancelTransfer:
+            targetPeripheral = nil
+            cm.cancelPeripheralConnection(peripheral)
+            clearCancelFlag()
+            cleanupAndFail(message: "[BLE-Send] Transfer cancelled by user")
+        case .restartDiscovery:
+            targetPeripheral = nil
+            cm.cancelPeripheralConnection(peripheral)
+            restartDiscoveryAfterFailure(cm)
+        case .fail(let msg):
+            targetPeripheral = nil
+            cm.cancelPeripheralConnection(peripheral)
+            cleanupAndFail(message: msg)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard connectState.isActivePeer(peripheral.identifier) else { return }
+        guard error == nil, let svcs = peripheral.services, let p2pSvc = svcs.first(where: { $0.uuid == P2P_SERVICE_UUID }) else {
+            handleGattDiscoveryFailure(
+                peripheral,
+                logLine: "[BLE-Send] Service discovery failed: \(String(describing: error))",
+                terminalMsg: "[BLE-Send] Peer does not expose GlideDrop GATT service"
+            )
+            return
+        }
+        peripheral.discoverCharacteristics([P2P_PSM_CHAR_UUID], for: p2pSvc)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard let chars = service.characteristics else { return }
-        for c in chars where c.uuid == P2P_PSM_CHAR_UUID {
-            peripheral.readValue(for: c)
+        guard connectState.isActivePeer(peripheral.identifier) else { return }
+        guard error == nil, let chars = service.characteristics, let psmChar = chars.first(where: { $0.uuid == P2P_PSM_CHAR_UUID }) else {
+            handleGattDiscoveryFailure(
+                peripheral,
+                logLine: "[BLE-Send] Characteristic discovery failed: \(String(describing: error))",
+                terminalMsg: "[BLE-Send] Peer GATT PSM characteristic unavailable"
+            )
+            return
         }
+        peripheral.readValue(for: psmChar)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        if let d = characteristic.value, d.count >= 2, !startedOpen {
+        guard connectState.isActivePeer(peripheral.identifier) else { return }
+        guard error == nil, let d = characteristic.value, d.count >= 2 else {
+            if !connectState.startedOpen {
+                handleGattDiscoveryFailure(
+                    peripheral,
+                    logLine: "[BLE-Send] Failed to read GATT PSM value: \(String(describing: error))",
+                    terminalMsg: "[BLE-Send] Failed to read Bluetooth L2CAP PSM from peer"
+                )
+            }
+            return
+        }
+        if !connectState.startedOpen {
             let psm = UInt16(d[d.startIndex]) | (UInt16(d[d.startIndex + 1]) << 8)
             if psm > 0 {
-                startedOpen = true
-                targetPsm = CBL2CAPPSM(psm)
+                connectState.gattRefreshInProgress = false
+                connectState.needsGattRefreshOnOpenFail = false
+                connectState.startedOpen = true
+                connectState.targetPsm = CBL2CAPPSM(psm)
                 reportSenderConnecting("Opening Bluetooth L2CAP channel…")
-                print("[BLE-Send] Read GATT PSM \(targetPsm), opening L2CAP channel...")
+                print("[BLE-Send] Read GATT PSM \(connectState.targetPsm), opening L2CAP channel...")
                 fflush(stdout)
-                peripheral.openL2CAPChannel(targetPsm)
+                peripheral.openL2CAPChannel(connectState.targetPsm)
+            } else {
+                handleGattDiscoveryFailure(
+                    peripheral,
+                    logLine: "[BLE-Send] Peer returned invalid L2CAP PSM (0)",
+                    terminalMsg: "[BLE-Send] Peer returned invalid L2CAP PSM (0)"
+                )
             }
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
+        guard connectState.isActivePeer(peripheral.identifier) else { return }
         guard let ch = channel, error == nil else {
-            writeProgressJson(active: false)
-            print("[BLE-Send] L2CAP open failed: \(String(describing: error))")
-            exit(1)
+            print("[BLE-Send] L2CAP open failed on PSM \(connectState.targetPsm): \(String(describing: error))")
+            fflush(stdout)
+            let action = connectState.onDidOpenFailure(
+                peerId: peripheral.identifier,
+                isConnected: peripheral.state == .connected,
+                cancelled: isTransferCancelled(),
+                errorDesc: error?.localizedDescription ?? "Unknown error"
+            )
+            switch action {
+            case .ignoreStaleCallback:
+                return
+            case .refreshGatt:
+                reportSenderConnecting("Refreshing Bluetooth L2CAP PSM…")
+                print("[BLE-Send] Re-discovering GATT services for fresh PSM...")
+                fflush(stdout)
+                peripheral.discoverServices([P2P_SERVICE_UUID])
+                return
+            case .restartDiscovery:
+                targetPeripheral = nil
+                cm.cancelPeripheralConnection(peripheral)
+                restartDiscoveryAfterFailure(cm)
+                return
+            case .fail(let msg):
+                if isTransferCancelled() { clearCancelFlag() }
+                targetPeripheral = nil
+                cm.cancelPeripheralConnection(peripheral)
+                cleanupAndFail(message: msg)
+            }
         }
+        connectState.transferStarted = true
         activeChannel = ch
+        cm.stopScan()
 
         DispatchQueue.global(qos: .userInitiated).async {
             guard let inp = ch.inputStream, let out = ch.outputStream else {
-                writeProgressJson(active: false)
-                print("[BLE-Send] Failed to acquire L2CAP channel streams")
-                exit(1)
+                self.cleanupAndFail(message: "[BLE-Send] Failed to acquire L2CAP channel streams")
             }
             inp.open()
             out.open()
+
+            func failL2capSession(message: String, clearCancel: Bool = false) -> Never {
+                DispatchQueue.main.async {
+                    self.connectState.isTerminalFailure = true
+                    self.cm?.cancelPeripheralConnection(peripheral)
+                }
+                if clearCancel { clearCancelFlag() }
+                writeProgressJson(active: false)
+                inp.close()
+                out.close()
+                try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                if needsMacInternetWifiRestore() {
+                    restoreMacInternetWifi()
+                }
+                print(message)
+                fflush(stdout)
+                exit(1)
+            }
 
             // 5GHz Wi-Fi Direct P2P Negotiation for large files
             if self.totalRawBytes >= 65_536 && !self.files.isEmpty {
@@ -2610,15 +3709,26 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 print("[BLE-Send] Negotiating 5GHz Wi-Fi Direct P2P over BLE L2CAP (ECDH P-256)...")
                 fflush(stdout)
 
+                let macCertFingerprint = getLocalMacTlsCertFingerprint()
+                guard isValidSha256Fingerprint(macCertFingerprint) else {
+                    failL2capSession(message: "[BLE-Send] Local TLS certificate fingerprint unavailable — refusing unpinned P2P handshake")
+                }
+
                 let macPriv = P256.KeyAgreement.PrivateKey()
                 let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
-                let macCertFingerprint = getLocalMacTlsCertFingerprint()
                 var p2pCreds: (ssid: String, pass: String, host: String, port: String, peerPin: String)? = nil
+                var w2p2TimedOut = false
+                var w2p2ReplyLine: String? = nil
 
-                // Attempt v2 ECDH negotiation first
+                // Strict v2 ECDH P-256 negotiation with mandatory peer TLS pinning (no unpinned WP2P downgrade)
                 try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
-                if writeAll(out, data: Data("W2P2\t\(macPubB64)\t\(macCertFingerprint)\n".utf8)) {
-                    if let reply = readBleStreamLine(inp), reply.hasPrefix("OK\t") {
+                let w2p2WriteOk = writeAll(out, data: Data("W2P2\t\(macPubB64)\t\(macCertFingerprint)\n".utf8))
+                if w2p2WriteOk {
+                    w2p2ReplyLine = readBleStreamLine(inp, timeout: 25.0, checkCancel: true, onTimeout: {
+                        w2p2TimedOut = true
+                        DispatchQueue.main.async { self.cm?.cancelPeripheralConnection(peripheral) }
+                    })
+                    if let reply = w2p2ReplyLine, reply.hasPrefix("OK\t") {
                         let parts = reply.dropFirst(3).split(separator: "\t").map(String.init)
                         if parts.count >= 2,
                            let androidPubDer = Data(base64Encoded: parts[0]),
@@ -2629,145 +3739,188 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                             if let decData = decryptAesGcm(packet: encCreds, using: sessionKey),
                                let decStr = String(data: decData, encoding: .utf8) {
                                 let credParts = decStr.split(separator: "\t").map(String.init)
-                                if credParts.count >= 4 {
-                                    let pin = credParts.count >= 5 ? credParts[4] : ""
-                                    p2pCreds = (credParts[0], credParts[1], credParts[2], credParts[3], pin)
+                                if credParts.count >= 5 && isValidSha256Fingerprint(credParts[4]) {
+                                    p2pCreds = (
+                                        credParts[0],
+                                        credParts[1],
+                                        credParts[2],
+                                        credParts[3],
+                                        normalizeSha256Fingerprint(credParts[4])
+                                    )
                                 }
                             }
                         }
                     }
                 }
 
-                // Fallback to legacy v1 negotiation if v2 was declined or unsupported
-                if p2pCreds == nil {
-                    if writeAll(out, data: Data("WP2P\n".utf8)) {
-                        if let reply = readBleStreamLine(inp, maxLen: 512), reply.hasPrefix("OK\t") {
-                            let parts = reply.dropFirst(3).split(separator: "\t").map(String.init)
-                            if parts.count >= 4 {
-                                p2pCreds = (parts[0], parts[1], parts[2], parts[3], "")
-                            }
+                if isTransferCancelled() {
+                    failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true)
+                }
+                if !w2p2WriteOk || w2p2ReplyLine == nil {
+                    let reason = w2p2TimedOut
+                        ? "[BLE-Send] Timed out negotiating 5 GHz Wi-Fi Direct over Bluetooth LE"
+                        : "[BLE-Send] Bluetooth LE connection closed during 5 GHz Wi-Fi Direct handshake"
+                    failL2capSession(message: reason)
+                }
+
+                guard let creds = p2pCreds else {
+                    failL2capSession(message: "[BLE-Send] Peer rejected secure W2P2 ECDH/TLS pinning handshake — refusing unpinned downgrade")
+                }
+
+                let ssid = creds.ssid, pass = creds.pass, host = creds.host, port = creds.port, peerPin = creds.peerPin
+                try? peerPin.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
+                _ = pauseCloudflareWarpIfNeeded()
+                saveCurrentWifiSsid()
+                self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
+                print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(port))...")
+                fflush(stdout)
+
+                let wifiIface = getWifiInterfaceName()
+                if currentWifiP2pIp().isEmpty {
+                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
+
+                    // Wait up to 25s for macOS DHCP on Wi-Fi interface to assign 192.168.49.x before launching HTTPS transfer
+                    let deadline = Date().addingTimeInterval(25.0)
+                    var lastProgressTouch = Date()
+                    while Date() < deadline {
+                        if isTransferCancelled() { break }
+                        if !currentWifiP2pIp().isEmpty { break }
+                        if Date().timeIntervalSince(lastProgressTouch) >= 2.0 {
+                            lastProgressTouch = Date()
+                            self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
                         }
+                        Thread.sleep(forTimeInterval: 0.2)
                     }
                 }
 
-                if let creds = p2pCreds {
-                    let ssid = creds.ssid, pass = creds.pass, host = creds.host, port = creds.port, peerPin = creds.peerPin
-                    if !peerPin.isEmpty {
-                        try? peerPin.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
+                if isTransferCancelled() {
+                    failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true)
+                }
+
+                let hasP2pIp = !currentWifiP2pIp().isEmpty
+                if !host.starts(with: "192.168.49.") || hasP2pIp {
+                    writeTxInProgressLock()
+                    self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
+                    enableMacInternetProxy(host: host, port: 1080)
+                    let txProc = Process()
+                    txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                    txProc.environment = ProcessInfo.processInfo.environment
+                    txProc.environment?["SKIP_BLE_RESTART"] = "1"
+                    txProc.arguments = ["send", "--peer", "\(host):\(port)", "--pin", peerPin] + self.files.map { $0.path } + self.urls
+                    activeChildTxLock.lock()
+                    activeChildTxProcess = txProc
+                    activeChildTxLock.unlock()
+                    try? txProc.run()
+                    txProc.waitUntilExit()
+                    activeChildTxLock.lock()
+                    activeChildTxProcess = nil
+                    activeChildTxLock.unlock()
+                    restoreMacInternetWifi(ssid: ssid)
+
+                    if isTransferCancelled() || txProc.terminationStatus == 44 {
+                        failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true)
                     }
-                    _ = pauseCloudflareWarpIfNeeded()
-                    saveCurrentWifiSsid()
-                    self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
-                    print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(port))...")
+
+                    if txProc.terminationStatus == 0 {
+                        writeProgressJson(active: false)
+                        inp.close()
+                        out.close()
+                        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                        print("[BLE-Send] Delivered via 5GHz Wi-Fi Direct P2P!")
+                        exit(0)
+                    }
+                    if txProc.terminationStatus == 43 {
+                        failL2capSession(message: "[BLE-Send] Transfer declined by receiver")
+                    }
+                    if txProc.terminationStatus == 46 {
+                        failL2capSession(message: "[BLE-Send] Peer TLS certificate fingerprint pinning mismatch — aborting transfer")
+                    }
+                } else {
+                    print("[BLE-Send] Failed to obtain 5GHz P2P IP on \(wifiIface); falling back to Direct BLE L2CAP")
                     fflush(stdout)
-
-                    let wifiIface = getWifiInterfaceName()
-                    func hasWifiP2pIp() -> Bool {
-                        return !currentWifiP2pIp().isEmpty
-                    }
-
-                    if !hasWifiP2pIp() {
-                        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
-
-                        // Wait up to 10s for macOS DHCP on Wi-Fi interface to assign 192.168.49.x before launching HTTPS transfer
-                        let deadline = Date().addingTimeInterval(10.0)
-                        var retriedJoin = false
-                        while Date() < deadline {
-                            if hasWifiP2pIp() { break }
-                            if !retriedJoin && deadline.timeIntervalSinceNow < 5.5 {
-                                retriedJoin = true
-                                _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
-                            }
-                            Thread.sleep(forTimeInterval: 0.2)
-                        }
-                    }
-
-                    if !host.starts(with: "192.168.49.") || hasWifiP2pIp() {
-                        self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
-                        enableMacInternetProxy(host: host, port: 1080)
-                        let txProc = Process()
-                        txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
-                        txProc.environment = ProcessInfo.processInfo.environment
-                        txProc.environment?["SKIP_BLE_RESTART"] = "1"
-                        var sendArgs = ["send", "--peer", "\(host):\(port)"]
-                        if !peerPin.isEmpty {
-                            sendArgs += ["--pin", peerPin]
-                        }
-                        txProc.arguments = sendArgs + self.files.map { $0.path } + self.urls
-                        activeChildTxLock.lock()
-                        activeChildTxProcess = txProc
-                        activeChildTxLock.unlock()
-                        try? txProc.run()
-                        txProc.waitUntilExit()
-                        activeChildTxLock.lock()
-                        activeChildTxProcess = nil
-                        activeChildTxLock.unlock()
-                        restoreMacInternetWifi(ssid: ssid)
-
-                        if isTransferCancelled() || txProc.terminationStatus == 44 {
-                            clearCancelFlag()
-                            writeProgressJson(active: false)
-                            inp.close()
-                            out.close()
-                            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-                            print("[BLE-Send] Transfer cancelled by user")
-                            exit(1)
-                        }
-
-                        if txProc.terminationStatus == 0 {
-                            writeProgressJson(active: false)
-                            inp.close()
-                            out.close()
-                            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-                            print("[BLE-Send] Delivered via 5GHz Wi-Fi Direct P2P!")
-                            exit(0)
-                        }
-                        if txProc.terminationStatus == 43 {
-                            writeProgressJson(active: false)
-                            inp.close()
-                            out.close()
-                            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-                            print("[BLE-Send] Transfer declined by receiver")
-                            exit(1)
-                        }
-                    } else {
-                        print("[BLE-Send] Failed to obtain 5GHz P2P IP on \(wifiIface); falling back to Direct BLE L2CAP")
-                        fflush(stdout)
-                        restoreMacInternetWifi(ssid: ssid)
-                    }
+                    restoreMacInternetWifi(ssid: ssid)
                 }
             }
 
-            var payloadFrame = self.frameData
-            if payloadFrame.isEmpty && !self.files.isEmpty {
+            if isTransferCancelled() {
+                failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true)
+            }
+
+            let preparedPayload: (metaData: Data, gzData: Data)
+            if let existingPrep = self.preparedBlePayload {
+                preparedPayload = existingPrep
+            } else {
+                if !self.files.isEmpty && self.totalRawBytes > BLE_RAW_PRECHECK_MAX_BYTES {
+                    failL2capSession(
+                        message: "[BLE-Send] 5 GHz Wi-Fi Direct failed and payload (\(formatByteSize(self.totalRawBytes))) exceeds the 30 MB Bluetooth LE fallback limit."
+                    )
+                }
+
                 self.reportSenderConnecting("Preparing fallback Bluetooth LE archive…")
-                guard let (gzData, fileDicts) = try? buildDvzipCpio(files: self.files) else {
-                    writeProgressJson(active: false)
-                    exit(1)
+                do {
+                    preparedPayload = try prepareBleFallbackPayload(
+                        files: self.files,
+                        urls: self.urls,
+                        totalRawBytes: self.totalRawBytes,
+                        senderName: loadMacSettings().deviceName
+                    )
+                } catch let capErr as BleFallbackCapError {
+                    failL2capSession(message: "[BLE-Send] \(capErr.localizedDescription)")
+                } catch {
+                    failL2capSession(message: "[BLE-Send] Failed to prepare fallback Bluetooth LE archive: \(error.localizedDescription)")
                 }
-                let metaDict: [String: Any] = [
-                    "SenderComputerName": loadMacSettings().deviceName,
-                    "SenderModelName": "MacBookPro18,2",
-                    "BundleID": self.urls.isEmpty ? "com.apple.finder" : "com.apple.Safari",
-                    "Items": self.urls as [Any],
-                    "Files": fileDicts
-                ]
-                guard let metaData = try? PropertyListSerialization.data(fromPropertyList: metaDict, format: .binary, options: 0) else {
-                    writeProgressJson(active: false)
-                    exit(1)
-                }
-                let encMeta = encryptBlePayload(metaData)
-                let encArch = gzData.isEmpty ? Data() : encryptBlePayload(gzData)
-                var frame = Data("ADRE".utf8)
-                var mLen = UInt32(encMeta.count).bigEndian
-                var aLen = UInt32(encArch.count).bigEndian
-                frame.append(Data(bytes: &mLen, count: 4))
-                frame.append(Data(bytes: &aLen, count: 4))
-                frame.append(encMeta)
-                frame.append(encArch)
-                payloadFrame = frame
             }
 
+            // Ephemeral ECDH P-256 key agreement for BLE ADRE frame (no static key)
+            let bleMacPriv = P256.KeyAgreement.PrivateKey()
+            let bleMacPubB64 = bleMacPriv.publicKey.derRepresentation.base64EncodedString()
+            let blePubBytes = Data(bleMacPubB64.utf8)
+            var blekFrame = Data("BLEK".utf8)
+            var blekMetaLen = UInt32(blePubBytes.count).bigEndian
+            var blekArchLen = UInt32(0).bigEndian
+            blekFrame.append(Data(bytes: &blekMetaLen, count: 4))
+            blekFrame.append(Data(bytes: &blekArchLen, count: 4))
+            blekFrame.append(blePubBytes)
+            if !writeAll(out, data: blekFrame) {
+                failL2capSession(message: "[BLE-Send] Failed to send ephemeral BLEK key exchange frame")
+            }
+            var blekTimedOut = false
+            let blekReplyLine = readBleStreamLine(inp, maxLen: 1024, timeout: 15.0, checkCancel: true, onTimeout: {
+                blekTimedOut = true
+                DispatchQueue.main.async { self.cm?.cancelPeripheralConnection(peripheral) }
+            })
+            if isTransferCancelled() {
+                failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true)
+            }
+            guard let bleReply = blekReplyLine, bleReply.hasPrefix("OK\t") else {
+                let reason = blekTimedOut
+                    ? "[BLE-Send] Timed out waiting for BLE ECDH key agreement"
+                    : "[BLE-Send] Peer rejected BLE ECDH key agreement"
+                failL2capSession(message: reason)
+            }
+            let peerBlePubB64 = String(bleReply.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let peerBlePubDer = Data(base64Encoded: peerBlePubB64),
+                  let peerBlePub = try? P256.KeyAgreement.PublicKey(derRepresentation: peerBlePubDer),
+                  let bleSharedSecret = try? bleMacPriv.sharedSecretFromKeyAgreement(with: peerBlePub) else {
+                failL2capSession(message: "[BLE-Send] Invalid peer ECDH public key during BLE key agreement")
+            }
+            let ephemeralBleKey = deriveBleFrameKey(sharedSecret: bleSharedSecret)
+
+            let payloadFrame: Data
+            do {
+                payloadFrame = try buildEncryptedBleFallbackFrame(
+                    metaData: preparedPayload.metaData,
+                    gzData: preparedPayload.gzData,
+                    totalRawBytes: self.totalRawBytes,
+                    sessionKey: ephemeralBleKey
+                )
+            } catch let capErr as BleFallbackCapError {
+                failL2capSession(message: "[BLE-Send] \(capErr.localizedDescription)")
+            } catch {
+                failL2capSession(message: "[BLE-Send] Failed to encrypt fallback Bluetooth LE archive: \(error.localizedDescription)")
+            }
+
+            writeTxInProgressLock()
             let label = self.files.first?.lastPathComponent ?? (self.urls.first ?? "BLE Transfer")
             print("[BLE-Send] Streaming \(payloadFrame.count) bytes over Direct Bluetooth LE L2CAP...")
             fflush(stdout)
@@ -2776,10 +3929,46 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 data: payloadFrame,
                 trackProgress: true,
                 fileLabel: label,
-                fileCount: max(1, self.files.count)
+                fileCount: self.itemCount,
+                peerName: self.peerLabel,
+                clearProgressOnSuccess: false
             )
-            let ackData = readExact(inp, count: 2)
-            let ackStr = ackData.flatMap { String(data: $0, encoding: .ascii) } ?? ""
+            var ackData: Data? = nil
+            var ackStr = ""
+            var ackTimedOut = false
+            if ok {
+                let emitWaitingAckProgress = {
+                    writeProgressJson(
+                        active: true,
+                        direction: "Sending",
+                        fileName: label,
+                        fileCount: self.itemCount,
+                        doneBytes: Int64(payloadFrame.count),
+                        totalBytes: Int64(payloadFrame.count),
+                        speedBps: 0,
+                        etaSeconds: 0,
+                        percent: 99,
+                        phase: "Waiting for receiver confirmation…",
+                        peerName: self.peerLabel,
+                        isConnecting: false
+                    )
+                }
+                emitWaitingAckProgress()
+                ackData = readExact(
+                    inp,
+                    count: 2,
+                    timeout: 60.0,
+                    checkCancel: true,
+                    onWaitTick: emitWaitingAckProgress,
+                    onTimeout: {
+                        ackTimedOut = true
+                        DispatchQueue.main.async {
+                            self.cm?.cancelPeripheralConnection(peripheral)
+                        }
+                    }
+                )
+                ackStr = ackData.flatMap { String(data: $0, encoding: .ascii) } ?? ""
+            }
             writeProgressJson(active: false)
             inp.close()
             out.close()
@@ -2787,7 +3976,7 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
             if ok && ackStr == "OK" {
                 let resolvedPeer = loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? self.peerLabel
                 for f in self.files {
-                    let sz = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? Int64) ?? 0
+                    let sz = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? NSNumber)?.int64Value ?? 0
                     appendReceivedLog(kind: "FILE", value: f.path, sizeBytes: sz, direction: "sent", peerName: resolvedPeer)
                 }
                 for u in self.urls {
@@ -2799,7 +3988,24 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 try? sound.run()
                 print("[BLE-Send] Delivered to \(resolvedPeer) via Direct Bluetooth LE L2CAP!")
                 exit(0)
+            } else if ok && ackStr == "NO" {
+                if needsMacInternetWifiRestore() { restoreMacInternetWifi() }
+                print("[BLE-Send] Transfer declined by receiver")
+                exit(1)
+            } else if isTransferCancelled() {
+                clearCancelFlag()
+                if needsMacInternetWifiRestore() { restoreMacInternetWifi() }
+                print("[BLE-Send] Transfer cancelled by user")
+                exit(1)
+            } else if ok && ackData == nil {
+                if needsMacInternetWifiRestore() { restoreMacInternetWifi() }
+                let msg = ackTimedOut
+                    ? "[BLE-Send] Timed out waiting for receiver confirmation"
+                    : "[BLE-Send] Receiver disconnected before confirming transfer"
+                print(msg)
+                exit(1)
             } else {
+                if needsMacInternetWifiRestore() { restoreMacInternetWifi() }
                 print("[BLE-Send] Transfer incomplete (ok=\(ok), ack=\(String(describing: ackData)))")
                 exit(1)
             }
@@ -3177,6 +4383,109 @@ struct MacPendingAsk: Equatable {
     let totalBytes: Int64
 }
 
+enum MacAiPillTone: Equatable {
+    case standby
+    case activeEmerald
+    case readyIndigo
+    case warningAmber
+}
+
+struct MacAiPillState: Equatable {
+    let title: String
+    let iconName: String
+    let tone: MacAiPillTone
+}
+
+func resolveClaudeProcessorAvailable(
+    scriptPath: String = SCRIPT_PATH,
+    stateDir: URL = STATE_DIR,
+    repoRoot: URL = REPO_ROOT,
+    bundleResourceURL: URL? = Bundle.main.resourceURL
+) -> Bool {
+    let fm = FileManager.default
+    let scriptDir = URL(fileURLWithPath: scriptPath).resolvingSymlinksInPath().deletingLastPathComponent()
+    let candidates: [String] = [
+        bundleResourceURL?.appendingPathComponent("claude_processor.py").path,
+        scriptDir.appendingPathComponent("claude_processor.py").path,
+        scriptDir.deletingLastPathComponent().appendingPathComponent("macos/claude_processor.py").path,
+        stateDir.appendingPathComponent("claude_processor.py").path,
+        repoRoot.appendingPathComponent("macos/claude_processor.py").path,
+    ].compactMap { $0 }
+    return candidates.contains { fm.fileExists(atPath: $0) }
+}
+
+func resolveAiPillStates(
+    enabled: Bool,
+    processorAvailable: Bool,
+    swiftAvailable: Bool
+) -> (privacy: MacAiPillState, vision: MacAiPillState) {
+    guard enabled else {
+        return (
+            privacy: MacAiPillState(
+                title: "Privacy Guard: Standby",
+                iconName: "shield",
+                tone: .standby
+            ),
+            vision: MacAiPillState(
+                title: "Local Vision Engine: Standby",
+                iconName: "cpu",
+                tone: .standby
+            )
+        )
+    }
+    let privacy = processorAvailable
+        ? MacAiPillState(title: "Privacy Guard: Active", iconName: "checkmark.shield.fill", tone: .activeEmerald)
+        : MacAiPillState(title: "Privacy Guard: Unavailable", iconName: "exclamationmark.shield.fill", tone: .warningAmber)
+    let vision = (processorAvailable && swiftAvailable)
+        ? MacAiPillState(title: "Local Vision Engine: Ready", iconName: "cpu", tone: .readyIndigo)
+        : MacAiPillState(title: "Local Vision Engine: Unavailable", iconName: "cpu", tone: .warningAmber)
+    return (privacy, vision)
+}
+
+func defaultClaudeConfigDir() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop")
+}
+
+func readAiSubsystemEnabled(
+    env: [String: String] = ProcessInfo.processInfo.environment,
+    configDir: URL = defaultClaudeConfigDir()
+) -> Bool {
+    if let envVal = env["CLAUDE_AI_ENABLED"]?.lowercased(),
+       envVal == "1" || envVal == "true" || envVal == "yes" || envVal == "on" {
+        return true
+    }
+    let cfgPath = configDir.appendingPathComponent("claude_config.json")
+    if let data = try? Data(contentsOf: cfgPath),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let cfgEnabled = obj["enabled"] as? Bool {
+        return cfgEnabled
+    }
+    return false
+}
+
+func writeAiSubsystemEnabled(_ enabled: Bool, configDir: URL = defaultClaudeConfigDir()) {
+    try? FileManager.default.createDirectory(
+        at: configDir,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    let cfgPath = configDir.appendingPathComponent("claude_config.json")
+    var dict: [String: Any] = [:]
+    if let data = try? Data(contentsOf: cfgPath),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        dict = obj
+    }
+    dict["enabled"] = enabled
+    guard let out = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) else { return }
+    let tmpPath = configDir.appendingPathComponent("claude_config.json.tmp.\(UUID().uuidString)")
+    if FileManager.default.createFile(atPath: tmpPath.path, contents: out, attributes: [.posixPermissions: 0o600]) {
+        _ = chmod(tmpPath.path, 0o600)
+        if Darwin.rename(tmpPath.path, cfgPath.path) != 0 {
+            try? FileManager.default.removeItem(at: tmpPath)
+        }
+    }
+}
+
 final class MacGlideDropViewModel: ObservableObject {
     @Published var selectedTab: Int = 0 // 0 = Send, 1 = Receive, 2 = History, 3 = Settings
     @Published var stagedItems: [MacStagedItem] = []
@@ -3204,6 +4513,8 @@ final class MacGlideDropViewModel: ObservableObject {
     @Published var isDropTargeted: Bool = false
     @Published var showLogs: Bool = false
     @Published var aiSubsystemEnabled: Bool = false
+    @Published var aiProcessorAvailable: Bool = false
+    @Published var localVisionReady: Bool = false
     @Published var historyEntries: [MacHistoryEntry] = []
     @Published var logs: [String] = []
     @Published var bluetoothAuthorized: Bool = true
@@ -3211,37 +4522,25 @@ final class MacGlideDropViewModel: ObservableObject {
     @Published var wifiPoweredOn: Bool = true
 
     func refreshAiStatus() {
-        let envVal = ProcessInfo.processInfo.environment["CLAUDE_AI_ENABLED"]?.lowercased()
-        if envVal == "1" || envVal == "true" || envVal == "yes" || envVal == "on" {
-            aiSubsystemEnabled = true
-            return
-        }
-        let cfgPath = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".glidedrop")
-            .appendingPathComponent("claude_config.json")
-        if let data = try? Data(contentsOf: cfgPath),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let enabled = obj["enabled"] as? Bool {
+        let enabled = readAiSubsystemEnabled()
+        let procAvail = resolveClaudeProcessorAvailable()
+        let visionAvail = FileManager.default.isExecutableFile(atPath: "/usr/bin/swift")
+        if aiSubsystemEnabled != enabled {
             aiSubsystemEnabled = enabled
-        } else {
-            aiSubsystemEnabled = false
+        }
+        if aiProcessorAvailable != procAvail {
+            aiProcessorAvailable = procAvail
+        }
+        if localVisionReady != visionAvail {
+            localVisionReady = visionAvail
         }
     }
 
     func toggleAiSubsystem(_ enabled: Bool) {
         aiSubsystemEnabled = enabled
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let cfgPath = dir.appendingPathComponent("claude_config.json")
-        var dict: [String: Any] = [:]
-        if let data = try? Data(contentsOf: cfgPath),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            dict = obj
-        }
-        dict["enabled"] = enabled
-        if let out = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
-            try? out.write(to: cfgPath)
-        }
+        aiProcessorAvailable = resolveClaudeProcessorAvailable()
+        localVisionReady = FileManager.default.isExecutableFile(atPath: "/usr/bin/swift")
+        writeAiSubsystemEnabled(enabled)
     }
 
     var onThemeChanged: ((MacThemePalette) -> Void)?
@@ -3428,6 +4727,7 @@ final class MacGlideDropViewModel: ObservableObject {
     }
 
     func refreshSlow() {
+        refreshAiStatus()
         let s = loadMacSettings()
         receiverRunning = s.visible && isPidAlive("daemon.pid")
         mdnsRunning = isPidAlive("mdns.pid")
@@ -3790,7 +5090,7 @@ final class MacGlideDropViewModel: ObservableObject {
             isConnecting: true
         )
         transferStatus = "Connecting to \(targetName)…"
-        try? Data("1".utf8).write(to: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+        writeTxInProgressLock()
         BleGlideDropDaemon.shared?.cancelActivePing()
 
         DispatchQueue.global(qos: .userInitiated).async {
@@ -3805,15 +5105,28 @@ final class MacGlideDropViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self.activeSendProcess = p
             }
-            try? p.run()
-            p.waitUntilExit()
+            let outData: Data
+            if (try? p.run()) != nil {
+                try? pipe.fileHandleForWriting.close()
+                outData = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+            } else {
+                try? pipe.fileHandleForWriting.close()
+                outData = Data()
+            }
+            try? pipe.fileHandleForReading.close()
             try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
             writeProgressJson(active: false)
-            restoreMacInternetWifi()
+            if needsMacInternetWifiRestore() {
+                restoreMacInternetWifi()
+            }
             let wasCancelled = isTransferCancelled()
             clearCancelFlag()
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let lastLine = out.split(separator: "\n").last.map(String.init) ?? ""
+            let out = String(data: outData, encoding: .utf8) ?? ""
+            let lastLine = out
+                .split(separator: "\n")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .last(where: { !$0.isEmpty }) ?? ""
             let ok = p.terminationStatus == 0 && !wasCancelled
             DispatchQueue.main.async {
                 self.activeSendProcess = nil
@@ -5147,30 +6460,14 @@ struct MacGlideDropMainView: View {
                     .labelsHidden()
                 }
 
+                let aiPills = resolveAiPillStates(
+                    enabled: vm.aiSubsystemEnabled,
+                    processorAvailable: vm.aiProcessorAvailable,
+                    swiftAvailable: vm.localVisionReady
+                )
                 HStack(spacing: 8) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.shield.fill")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(p.emerald)
-                        Text("Privacy Guard: Active")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(p.emerald)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Capsule().fill(p.emeraldSubtle))
-
-                    HStack(spacing: 4) {
-                        Image(systemName: "cpu")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(p.indigo)
-                        Text("Local Vision Engine: Ready")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(p.indigo)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Capsule().fill(p.indigoSubtle))
+                    aiStatusPill(aiPills.privacy)
+                    aiStatusPill(aiPills.vision)
                 }
             }
             .padding(16)
@@ -5280,6 +6577,45 @@ struct MacGlideDropMainView: View {
                     .overlay(RoundedRectangle(cornerRadius: 20).stroke(p.border, lineWidth: 1))
             )
         }
+    }
+
+    private func aiStatusPill(_ pill: MacAiPillState) -> some View {
+        let fgColor: Color
+        let bgColor: Color
+        let borderColor: Color
+        switch pill.tone {
+        case .standby:
+            fgColor = p.textSecondary
+            bgColor = p.bgSubtle
+            borderColor = p.border
+        case .activeEmerald:
+            fgColor = p.emerald
+            bgColor = p.emeraldSubtle
+            borderColor = Color.clear
+        case .readyIndigo:
+            fgColor = p.indigo
+            bgColor = p.indigoSubtle
+            borderColor = Color.clear
+        case .warningAmber:
+            fgColor = p.amber
+            bgColor = p.amberSubtle
+            borderColor = Color.clear
+        }
+        return HStack(spacing: 4) {
+            Image(systemName: pill.iconName)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(fgColor)
+            Text(pill.title)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(fgColor)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            Capsule()
+                .fill(bgColor)
+                .overlay(Capsule().stroke(borderColor, lineWidth: 1))
+        )
     }
 
     private func themeOptionButton(mode: String, title: String, icon: String) -> some View {
@@ -5673,7 +7009,10 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
             "lan_fallback_active.flag",
             "pending_ask.json",
             "prev_proxy_settings.json",
-            "proxy_state.lock"
+            "proxy_state.lock",
+            "p2p_session_token.json",
+            "pinned_peer_tls_fingerprint.txt",
+            "wp2p_authorized_session.json"
         ] {
             try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent(cleanupFile))
         }
@@ -5805,8 +7144,6 @@ final class AwdlLoopbackBridge {
     }
 }
 
-signal(SIGPIPE, SIG_IGN)
-
 private var sigIntSource: DispatchSourceSignal?
 private var sigTermSource: DispatchSourceSignal?
 
@@ -5842,101 +7179,129 @@ func installSafeSignalHandlers() {
     sigTermSource = sTerm
 }
 
-atexit {
-    if proxyEnabledInCurrentProcess {
-        disableMacInternetProxy()
+func runGlideDropMain() throws {
+    signal(SIGPIPE, SIG_IGN)
+    atexit {
+        if proxyEnabledInCurrentProcess {
+            disableMacInternetProxy()
+        }
     }
-}
 
-let args = CommandLine.arguments
-if args.count >= 2 && args[1] == "restore-wifi" {
-    restoreMacInternetWifi()
-    exit(0)
-} else if args.count >= 2 && args[1] == "send" {
-    installSafeSignalHandlers()
-    let rawArgs = Array(args.dropFirst(2))
-    let urls = rawArgs.filter { $0.hasPrefix("http://") || $0.hasPrefix("https://") }
-    let fileUrls = rawArgs
-        .filter { !$0.hasPrefix("http://") && !$0.hasPrefix("https://") }
-        .map { URL(fileURLWithPath: $0) }
-        .filter { FileManager.default.fileExists(atPath: $0.path) }
-    guard !fileUrls.isEmpty || !urls.isEmpty else {
-        print("Usage: glidedrop-daemon send <file_or_url1> [file_or_url2 ...]")
-        exit(1)
-    }
-    let sender = try BleGlideDropSender(files: fileUrls, urls: urls)
-    withExtendedLifetime(sender) {
-        DispatchQueue.global().asyncAfter(deadline: .now() + 300.0) {
+    let args = CommandLine.arguments
+    if args.count >= 2 && args[1] == "restore-wifi" {
+        restoreMacInternetWifi()
+        exit(0)
+    } else if args.count >= 2 && args[1] == "send" {
+        installSafeSignalHandlers()
+        let rawArgs = Array(args.dropFirst(2))
+        let urls = rawArgs.filter { $0.hasPrefix("http://") || $0.hasPrefix("https://") }
+        let fileUrls = rawArgs
+            .filter { !$0.hasPrefix("http://") && !$0.hasPrefix("https://") }
+            .map { URL(fileURLWithPath: $0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !fileUrls.isEmpty || !urls.isEmpty else {
             writeProgressJson(active: false)
-            print("[BLE-Send] Timed out waiting for BLE L2CAP transfer")
+            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+            print("Usage: glidedrop-daemon send <file_or_url1> [file_or_url2 ...]")
             exit(1)
         }
-        RunLoop.main.run()
-    }
-} else {
-    let isBackgroundDaemon = args.count >= 2 && args[1] == "daemon"
-    let blePidFile = STATE_DIR.appendingPathComponent("ble-daemon.pid")
-    if let pidStr = try? String(contentsOf: blePidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-       let existingPid = Int32(pidStr),
-       existingPid != getpid(),
-       kill(existingPid, 0) == 0 {
-        if !isBackgroundDaemon {
-            DistributedNotificationCenter.default().postNotificationName(
-                SHOW_UI_NOTIFICATION,
-                object: nil,
-                userInfo: nil,
-                deliverImmediately: true
-            )
+        let sender: BleGlideDropSender
+        do {
+            sender = try BleGlideDropSender(files: fileUrls, urls: urls)
+        } catch {
+            writeProgressJson(active: false)
+            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+            print("[BLE-Send] \(error.localizedDescription)")
+            exit(1)
         }
-        exit(0)
-    }
+        withExtendedLifetime(sender) {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 300.0) {
+                writeProgressJson(active: false)
+                try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                if needsMacInternetWifiRestore() {
+                    restoreMacInternetWifi()
+                }
+                print("[BLE-Send] Timed out waiting for BLE L2CAP transfer")
+                exit(1)
+            }
+            RunLoop.main.run()
+        }
+    } else {
+        let isBackgroundDaemon = args.count >= 2 && args[1] == "daemon"
+        let blePidFile = STATE_DIR.appendingPathComponent("ble-daemon.pid")
+        if let pidStr = try? String(contentsOf: blePidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           let existingPid = Int32(pidStr),
+           existingPid != getpid(),
+           kill(existingPid, 0) == 0 {
+            if !isBackgroundDaemon {
+                DistributedNotificationCenter.default().postNotificationName(
+                    SHOW_UI_NOTIFICATION,
+                    object: nil,
+                    userInfo: nil,
+                    deliverImmediately: true
+                )
+            }
+            exit(0)
+        }
 
-    try? String(getpid()).write(to: blePidFile, atomically: true, encoding: .utf8)
-    installSafeSignalHandlers()
+        try? String(getpid()).write(to: blePidFile, atomically: true, encoding: .utf8)
+        installSafeSignalHandlers()
 
-    // Crash recovery: only in primary daemon after confirming no existing instance is active
-    if FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
-        print("[BLE-Daemon] Lingering prev_proxy_settings.json detected on startup. Performing proxy crash recovery...")
-        fflush(stdout)
-    }
-    disableMacInternetProxy()
+        // Crash recovery: only in primary daemon after confirming no existing instance is active
+        if FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
+            print("[BLE-Daemon] Lingering prev_proxy_settings.json detected on startup. Performing proxy crash recovery...")
+            fflush(stdout)
+        }
+        disableMacInternetProxy()
 
-    if !isBackgroundDaemon {
-        let daemonPidFile = STATE_DIR.appendingPathComponent("daemon.pid")
-        let httpsAlive: Bool = {
-            guard let s = try? String(contentsOf: daemonPidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-                  let p = Int32(s) else { return false }
-            return kill(p, 0) == 0
-        }()
-        let s = loadMacSettings()
-        if s.visible && !httpsAlive {
-            DispatchQueue.global(qos: .userInitiated).async {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
-                p.environment = ProcessInfo.processInfo.environment
-                p.environment?["SKIP_BLE_RESTART"] = "1"
-                p.arguments = ["restart-receiver"]
-                try? p.run()
-                p.waitUntilExit()
+        if !isBackgroundDaemon {
+            let daemonPidFile = STATE_DIR.appendingPathComponent("daemon.pid")
+            let httpsAlive: Bool = {
+                guard let s = try? String(contentsOf: daemonPidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                      let p = Int32(s) else { return false }
+                return kill(p, 0) == 0
+            }()
+            let s = loadMacSettings()
+            if s.visible && !httpsAlive {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                    p.environment = ProcessInfo.processInfo.environment
+                    p.environment?["SKIP_BLE_RESTART"] = "1"
+                    p.arguments = ["restart-receiver"]
+                    try? p.run()
+                    p.waitUntilExit()
+                }
             }
         }
-    }
 
-    let app = NSApplication.shared
-    app.setActivationPolicy(isBackgroundDaemon ? .accessory : .regular)
-    if let icns = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-       let iconImg = NSImage(contentsOf: icns) {
-        app.applicationIconImage = iconImg
-    } else if let iconImg = NSImage(contentsOfFile: REPO_ROOT.appendingPathComponent("GlideDrop.app/Contents/Resources/AppIcon.icns").path) {
-        app.applicationIconImage = iconImg
-    } else if let iconImg = NSImage(contentsOfFile: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop/AppIcon.icns").path) {
-        app.applicationIconImage = iconImg
-    }
-    let daemon = BleGlideDropDaemon()
-    let bar = StatusBarController(openWindowOnLaunch: !isBackgroundDaemon)
-    app.delegate = bar
-    let awdlBridge = try? AwdlLoopbackBridge(listenPort: 8774, targetPort: 8773)
-    withExtendedLifetime((daemon, bar, awdlBridge)) {
-        app.run()
+        let app = NSApplication.shared
+        app.setActivationPolicy(isBackgroundDaemon ? .accessory : .regular)
+        if let icns = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let iconImg = NSImage(contentsOf: icns) {
+            app.applicationIconImage = iconImg
+        } else if let iconImg = NSImage(contentsOfFile: REPO_ROOT.appendingPathComponent("GlideDrop.app/Contents/Resources/AppIcon.icns").path) {
+            app.applicationIconImage = iconImg
+        } else if let iconImg = NSImage(contentsOfFile: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop/AppIcon.icns").path) {
+            app.applicationIconImage = iconImg
+        }
+        let daemon = BleGlideDropDaemon()
+        let bar = StatusBarController(openWindowOnLaunch: !isBackgroundDaemon)
+        app.delegate = bar
+        let awdlBridge = try? AwdlLoopbackBridge(listenPort: 8774, targetPort: 8773)
+        withExtendedLifetime((daemon, bar, awdlBridge)) {
+            app.run()
+        }
     }
 }
+
+#if !GLIDEDROP_TESTING
+private let _glideDropEntryPoint: Void = {
+    do {
+        try runGlideDropMain()
+    } catch {
+        fputs("[GlideDrop] Fatal error: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+}()
+#endif

@@ -41,19 +41,29 @@ import java.util.concurrent.atomic.AtomicReference
  * Security & Reliability features:
  * - Listens on wildcard 0.0.0.0:1080 to avoid EADDRNOTAVAIL during async P2P IP allocation.
  * - Client IP Whitelist: strictly accepts connections only from 192.168.49.0/24, 127.0.0.1, ::1.
- * - SSRF Protection: blocks loopback to sensitive local ports (8771, 1080) across all loopback variants
- *   and validates post-DNS resolution IP addresses against loopback and P2P subnets.
+ * - SSRF Protection: blocks loopback, wildcard, link-local/cloud metadata, RFC 1918 private LAN,
+ *   IPv6 ULA/site-local, and multicast targets across all destination ports (1-65535), both
+ *   pre-DNS (including obfuscated numeric/hex/octal IPv4 and IPv6 literals) and post-DNS.
  * - Dual-Protocol parser multiplexing SOCKS5 (0x05) and HTTP (CONNECT, GET, POST, HEAD, etc.).
- * - Constant-memory sliding-window HTTP header parser (bounded at 8 KB).
+ * - Constant-memory sliding-window HTTP header parser (bounded at 8 KB), strips hop-by-hop and
+ *   proxy credential headers, blocks Upgrade protocol-switch requests, and enforces Connection: close.
  * - Bounded concurrency (max 128 clients).
  * - Upstream routing: binds outbound sockets and resolves DNS via ConnectivityManager active internet network.
  * - Bidirectional streaming with half-close handling (shutdownOutput) and immediate error teardown.
  */
-class EmbeddedProxyServer(
+class EmbeddedProxyServer internal constructor(
     private val context: Context? = null,
     val port: Int = DEFAULT_PROXY_PORT,
-    private val logger: ((String) -> Unit)? = null
+    private val logger: ((String) -> Unit)? = null,
+    private val outboundAddressResolver: ((Network?, String) -> Array<InetAddress>)? = null,
+    private val outboundSocketConnectHook: ((Socket, InetAddress, Int, Int) -> Unit)? = null
 ) : Closeable {
+
+    constructor(
+        context: Context? = null,
+        port: Int = DEFAULT_PROXY_PORT,
+        logger: ((String) -> Unit)? = null
+    ) : this(context, port, logger, null, null)
 
     companion object {
         const val DEFAULT_PROXY_PORT = 1080
@@ -111,29 +121,320 @@ class EmbeddedProxyServer(
             return false
         }
 
-        fun isTargetSafe(host: String, port: Int): Boolean {
-            if (port !in 1..65535) return false
-            val cleanHost = host.trim().lowercase(java.util.Locale.US)
-                .removeSurrounding("[", "]")
-                .trimEnd('.')
-            if (cleanHost.isEmpty()) return false
+        private val STRIPPED_HOP_BY_HOP_HEADERS = setOf(
+            "connection",
+            "proxy-connection",
+            "proxy-authorization",
+            "proxy-authenticate",
+            "keep-alive",
+            "te",
+            "trailer",
+            "upgrade",
+            "http2-settings"
+        )
 
-            // Prevent SSRF loop back to local GlideDrop or proxy daemon
-            if (port == 8771 || port == DEFAULT_PROXY_PORT) {
-                if (cleanHost == "localhost" ||
-                    cleanHost == "0.0.0.0" ||
-                    cleanHost == "0" ||
-                    cleanHost == "::" ||
-                    cleanHost == "::1" ||
-                    cleanHost.startsWith("127.") ||
-                    cleanHost.startsWith("::ffff:127.") ||
-                    cleanHost.startsWith("192.168.49.") ||
-                    cleanHost.startsWith("::ffff:192.168.49.")
-                ) {
-                    return false
+        internal fun parseIpv4Literal(host: String): ByteArray? {
+            if (host.isEmpty() || host.contains(':')) return null
+            val parts = host.split('.')
+            if (parts.size !in 1..4 || parts.any { it.isEmpty() }) return null
+
+            fun parsePart(part: String): Long? {
+                val lower = part.lowercase(java.util.Locale.US)
+                return when {
+                    lower.startsWith("0x") -> {
+                        val digits = lower.substring(2)
+                        if (digits.isEmpty() || !digits.all { it in '0'..'9' || it in 'a'..'f' }) null
+                        else digits.toLongOrNull(16)
+                    }
+                    lower.length > 1 && lower.startsWith("0") -> {
+                        if (!lower.all { it in '0'..'7' }) null
+                        else lower.toLongOrNull(8)
+                    }
+                    else -> {
+                        if (!lower.all { it in '0'..'9' }) null
+                        else lower.toLongOrNull(10)
+                    }
                 }
             }
+
+            val nums = LongArray(parts.size)
+            for (i in parts.indices) {
+                val v = parsePart(parts[i]) ?: return null
+                if (v < 0) return null
+                nums[i] = v
+            }
+            for (i in 0 until nums.size - 1) {
+                if (nums[i] > 255L) return null
+            }
+            val last = nums.last()
+            val maxLast = when (nums.size) {
+                1 -> 0xFFFFFFFFL
+                2 -> 0xFFFFFFL
+                3 -> 0xFFFFL
+                else -> 0xFFL
+            }
+            if (last > maxLast) return null
+
+            val ip32: Long = when (nums.size) {
+                1 -> last
+                2 -> (nums[0] shl 24) or last
+                3 -> (nums[0] shl 24) or (nums[1] shl 16) or last
+                else -> (nums[0] shl 24) or (nums[1] shl 16) or (nums[2] shl 8) or last
+            }
+            return byteArrayOf(
+                ((ip32 ushr 24) and 0xFF).toByte(),
+                ((ip32 ushr 16) and 0xFF).toByte(),
+                ((ip32 ushr 8) and 0xFF).toByte(),
+                (ip32 and 0xFF).toByte()
+            )
+        }
+
+        internal fun parseIpv6Literal(host: String): ByteArray? {
+            if (!host.contains(':')) return null
+            if (!host.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.' }) {
+                return null
+            }
+
+            val dblIdx = host.indexOf("::")
+            if (dblIdx >= 0 && host.indexOf("::", dblIdx + 2) >= 0) return null
+
+            val leftPart: String
+            val rightPart: String
+            if (dblIdx >= 0) {
+                leftPart = host.substring(0, dblIdx)
+                rightPart = host.substring(dblIdx + 2)
+            } else {
+                leftPart = host
+                rightPart = ""
+            }
+
+            val leftTokens = if (leftPart.isEmpty()) emptyList() else leftPart.split(':')
+            val rightTokens = if (rightPart.isEmpty()) emptyList() else rightPart.split(':')
+            if (leftTokens.any { it.isEmpty() } || rightTokens.any { it.isEmpty() }) return null
+
+            var tailIpv4: ByteArray? = null
+            val rightHextets: List<String>
+            val leftHextets: List<String>
+
+            if (rightTokens.isNotEmpty() && rightTokens.last().contains('.')) {
+                val lastTok = rightTokens.last()
+                tailIpv4 = parseDottedDecimalIpv4(lastTok) ?: return null
+                rightHextets = rightTokens.dropLast(1)
+                leftHextets = leftTokens
+            } else if (dblIdx < 0 && leftTokens.isNotEmpty() && leftTokens.last().contains('.')) {
+                val lastTok = leftTokens.last()
+                tailIpv4 = parseDottedDecimalIpv4(lastTok) ?: return null
+                leftHextets = leftTokens.dropLast(1)
+                rightHextets = emptyList()
+            } else {
+                leftHextets = leftTokens
+                rightHextets = rightTokens
+            }
+
+            if (leftHextets.any { it.contains('.') } || rightHextets.any { it.contains('.') }) return null
+
+            val targetHextets = if (tailIpv4 != null) 6 else 8
+            val explicitCount = leftHextets.size + rightHextets.size
+            if (dblIdx < 0 && explicitCount != targetHextets) return null
+            if (dblIdx >= 0 && explicitCount >= targetHextets) return null
+
+            val zeroFill = targetHextets - explicitCount
+            val hextets = IntArray(targetHextets)
+            var idx = 0
+
+            fun parseHextet(tok: String): Int? {
+                if (tok.isEmpty() || tok.length > 4) return null
+                val v = tok.toIntOrNull(16) ?: return null
+                return if (v in 0..0xFFFF) v else null
+            }
+
+            for (tok in leftHextets) {
+                hextets[idx++] = parseHextet(tok) ?: return null
+            }
+            for (z in 0 until zeroFill) {
+                hextets[idx++] = 0
+            }
+            for (tok in rightHextets) {
+                hextets[idx++] = parseHextet(tok) ?: return null
+            }
+
+            val out = ByteArray(16)
+            for (i in 0 until targetHextets) {
+                out[i * 2] = ((hextets[i] ushr 8) and 0xFF).toByte()
+                out[i * 2 + 1] = (hextets[i] and 0xFF).toByte()
+            }
+            if (tailIpv4 != null) {
+                System.arraycopy(tailIpv4, 0, out, 12, 4)
+            }
+            return out
+        }
+
+        private fun parseDottedDecimalIpv4(s: String): ByteArray? {
+            val parts = s.split('.')
+            if (parts.size != 4) return null
+            val out = ByteArray(4)
+            for (i in 0 until 4) {
+                val tok = parts[i]
+                if (tok.isEmpty() || tok.length > 3 || !tok.all { it in '0'..'9' }) return null
+                val v = tok.toIntOrNull() ?: return null
+                if (v !in 0..255) return null
+                out[i] = v.toByte()
+            }
+            return out
+        }
+
+        internal fun isBlockedIpv4Bytes(b: ByteArray): Boolean {
+            if (b.size != 4) return true
+            val b0 = b[0].toInt() and 0xFF
+            val b1 = b[1].toInt() and 0xFF
+            if (b0 == 0) return true                              // 0.0.0.0/8 (wildcard / "this" network)
+            if (b0 == 10) return true                             // 10.0.0.0/8 (RFC 1918)
+            if (b0 == 127) return true                            // 127.0.0.0/8 (loopback)
+            if (b0 == 169 && b1 == 254) return true               // 169.254.0.0/16 (link-local / cloud metadata)
+            if (b0 == 172 && b1 in 16..31) return true            // 172.16.0.0/12 (RFC 1918)
+            if (b0 == 192 && b1 == 168) return true               // 192.168.0.0/16 (RFC 1918, incl. 192.168.49.0/24)
+            if (b0 >= 224) return true                            // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved/broadcast
+            return false
+        }
+
+        internal fun isBlockedIpv6Bytes(b: ByteArray): Boolean {
+            if (b.size != 16) return true
+            // :: (unspecified / wildcard)
+            if (b.all { it == 0.toByte() }) return true
+            // ::1 (loopback)
+            if ((0 until 15).all { b[it] == 0.toByte() } && b[15] == 1.toByte()) return true
+
+            val b0 = b[0].toInt() and 0xFF
+            val b1 = b[1].toInt() and 0xFF
+            if (b0 == 0xFE && (b1 and 0xC0) == 0x80) return true  // fe80::/10 (link-local)
+            if (b0 == 0xFE && (b1 and 0xC0) == 0xC0) return true  // fec0::/10 (site-local)
+            if ((b0 and 0xFE) == 0xFC) return true                // fc00::/7 (ULA: fc00::/8 & fd00::/8)
+            if (b0 == 0xFF) return true                           // ff00::/8 (multicast)
+
+            // IPv4-mapped (::ffff:0:0/96) and IPv4-compatible (::/96)
+            val prefixZeros0to9 = (0 until 10).all { b[it] == 0.toByte() }
+            if (prefixZeros0to9 && (
+                    (b[10] == 0xFF.toByte() && b[11] == 0xFF.toByte()) ||
+                    (b[10] == 0.toByte() && b[11] == 0.toByte())
+                )
+            ) {
+                return isBlockedIpv4Bytes(b.copyOfRange(12, 16))
+            }
+
+            // NAT64 well-known prefix (64:ff9b::/96) & local-use prefix (64:ff9b:1::/48)
+            if (b[0] == 0x00.toByte() && b[1] == 0x64.toByte() &&
+                b[2] == 0xFF.toByte() && b[3] == 0x9B.toByte()
+            ) {
+                if ((4 until 12).all { b[it] == 0.toByte() }) {
+                    return isBlockedIpv4Bytes(b.copyOfRange(12, 16))
+                }
+                if (b[4] == 0x00.toByte() && b[5] == 0x01.toByte()) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        fun isBlockedInetAddress(addr: InetAddress?): Boolean {
+            if (addr == null) return true
+            if (addr.isAnyLocalAddress ||
+                addr.isLoopbackAddress ||
+                addr.isLinkLocalAddress ||
+                addr.isSiteLocalAddress ||
+                addr.isMulticastAddress
+            ) {
+                return true
+            }
+            if (isP2pSubnetAddress(addr)) return true
+            val raw = addr.address ?: return true
+            return when (raw.size) {
+                4 -> isBlockedIpv4Bytes(raw)
+                16 -> isBlockedIpv6Bytes(raw)
+                else -> true
+            }
+        }
+
+        fun isTargetSafe(host: String, port: Int): Boolean {
+            if (port !in 1..65535) return false
+            val trimmed = host.trim()
+            if (trimmed.isEmpty()) return false
+            if (trimmed.any { it.isWhitespace() || it.code < 0x20 || it == '/' || it == '\\' || it == '@' || it == '?' || it == '#' }) {
+                return false
+            }
+
+            val unwrapped = if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                trimmed.substring(1, trimmed.length - 1)
+            } else {
+                trimmed
+            }
+            if (unwrapped.contains('[') || unwrapped.contains(']')) return false
+            // Zone-scoped IPv6 targets (e.g. fe80::1%eth0, ::1%lo0) are always local interface addresses
+            if (unwrapped.contains('%')) return false
+
+            val cleanHost = unwrapped.lowercase(java.util.Locale.US).trimEnd('.')
+            if (cleanHost.isEmpty()) return false
+
+            // Block local, loopback, mDNS, and internal/cloud metadata hostnames across all ports
+            if (cleanHost == "localhost" ||
+                cleanHost.endsWith(".localhost") ||
+                cleanHost == "localhost.localdomain" ||
+                cleanHost.endsWith(".localdomain") ||
+                cleanHost == "ip6-localhost" ||
+                cleanHost == "ip6-loopback" ||
+                cleanHost == "local" ||
+                cleanHost.endsWith(".local") ||
+                cleanHost == "internal" ||
+                cleanHost.endsWith(".internal") ||
+                cleanHost == "metadata" ||
+                cleanHost == "instance-data"
+            ) {
+                return false
+            }
+
+            // Block restricted IPv4 literals (including decimal/hex/octal/shortened forms) across all ports
+            parseIpv4Literal(cleanHost)?.let { ipv4Bytes ->
+                return !isBlockedIpv4Bytes(ipv4Bytes)
+            }
+
+            // Block restricted IPv6 literals across all ports
+            if (cleanHost.contains(':')) {
+                val ipv6Bytes = parseIpv6Literal(cleanHost) ?: return false
+                return !isBlockedIpv6Bytes(ipv6Bytes)
+            }
+
             return true
+        }
+
+        internal fun hasInvalidHttpHeaderSyntax(rawHeaderBlock: String): Boolean {
+            for (i in rawHeaderBlock.indices) {
+                val ch = rawHeaderBlock[i]
+                if (ch == '\r') {
+                    if (i + 1 >= rawHeaderBlock.length || rawHeaderBlock[i + 1] != '\n') {
+                        return true
+                    }
+                } else if (ch != '\n' && ch != '\t' && ch.code < 0x20) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        internal fun hasUpgradeHeader(rawHeaderBlock: String): Boolean {
+            val allLines = rawHeaderBlock.split(Regex("\\r\\n|\\n|\\r"))
+            for (i in 1 until allLines.size) {
+                val line = allLines[i]
+                if (line.isEmpty()) continue
+                val colonIdx = line.indexOf(':')
+                if (colonIdx <= 0) continue
+                val name = line.substring(0, colonIdx).trim().lowercase(java.util.Locale.US)
+                val value = line.substring(colonIdx + 1).lowercase(java.util.Locale.US)
+                if (name == "upgrade") return true
+                if (name == "connection" || name == "proxy-connection") {
+                    val tokens = value.split(',').map { it.trim() }
+                    if ("upgrade" in tokens) return true
+                }
+            }
+            return false
         }
 
         internal fun <T> selectBestUpstreamNetwork(
@@ -166,24 +467,43 @@ class EmbeddedProxyServer(
             httpVersion: String,
             rawHeaderBlock: String
         ): String {
-            val firstLineEnd = rawHeaderBlock.indexOf('\n')
-            val rest = if (firstLineEnd >= 0) rawHeaderBlock.substring(firstLineEnd + 1) else ""
-            val lines = rest.split('\n').map { it.trimEnd('\r') }.filter { it.isNotEmpty() }
-            val isUpgrade = lines.any {
-                val lower = it.lowercase(java.util.Locale.US)
-                lower.startsWith("connection:") && lower.contains("upgrade")
+            val lines = rawHeaderBlock
+                .split(Regex("\\r\\n|\\n|\\r"))
+                .drop(1)
+                .filter { it.isNotEmpty() }
+
+            val connectionNamedHeaders = HashSet<String>()
+            for (line in lines) {
+                val colonIdx = line.indexOf(':')
+                if (colonIdx <= 0) continue
+                val name = line.substring(0, colonIdx).trim().lowercase(java.util.Locale.US)
+                if (name == "connection" || name == "proxy-connection") {
+                    val value = line.substring(colonIdx + 1)
+                    for (token in value.split(',')) {
+                        val cleanToken = token.trim().lowercase(java.util.Locale.US)
+                        if (cleanToken.isNotEmpty()) {
+                            connectionNamedHeaders.add(cleanToken)
+                        }
+                    }
+                }
             }
+
             val sb = StringBuilder()
             sb.append(method).append(' ').append(rewrittenUri).append(' ').append(httpVersion).append("\r\n")
             for (line in lines) {
-                val lower = line.lowercase(java.util.Locale.US)
-                if (lower.startsWith("proxy-connection:")) continue
-                if (!isUpgrade && lower.startsWith("connection:")) continue
+                val colonIdx = line.indexOf(':')
+                if (colonIdx <= 0) continue
+                val rawName = line.substring(0, colonIdx)
+                val name = rawName.trim().lowercase(java.util.Locale.US)
+                if (name in STRIPPED_HOP_BY_HOP_HEADERS || name in connectionNamedHeaders) {
+                    continue
+                }
+                if (rawName.any { it.isWhitespace() }) {
+                    continue
+                }
                 sb.append(line).append("\r\n")
             }
-            if (!isUpgrade) {
-                sb.append("Connection: close\r\n")
-            }
+            sb.append("Connection: close\r\n")
             sb.append("\r\n")
             return sb.toString()
         }
@@ -471,6 +791,10 @@ class EmbeddedProxyServer(
         }
 
         val headerStr = headerBytes.toString("US-ASCII")
+        if (hasInvalidHttpHeaderSyntax(headerStr)) {
+            sendHttpResponse(output, 400, "Bad Request")
+            return
+        }
         val requestLine = headerStr.lineSequence().firstOrNull()?.trim() ?: return
         val parts = requestLine.split("\\s+".toRegex())
         if (parts.size < 2) {
@@ -480,6 +804,11 @@ class EmbeddedProxyServer(
 
         val method = parts[0].uppercase(java.util.Locale.US)
         val uriStr = parts[1]
+
+        if (hasUpgradeHeader(headerStr)) {
+            sendHttpResponse(output, 403, "Forbidden")
+            return
+        }
 
         if (method == "CONNECT") {
             // HTTP CONNECT Tunneling (HTTPS)
@@ -538,7 +867,7 @@ class EmbeddedProxyServer(
                 val uri = URI(uriStr)
                 val host = uri.host
                 if (!host.isNullOrEmpty()) {
-                    val port = if (uri.port > 0) uri.port else defaultPort
+                    val port = if (uri.port == -1) defaultPort else uri.port
                     val rawPath = uri.rawPath.ifEmpty { "/" }
                     val query = if (uri.rawQuery != null) "?${uri.rawQuery}" else ""
                     return Triple(host, port, rawPath + query)
@@ -550,7 +879,11 @@ class EmbeddedProxyServer(
             val slashIdx = afterScheme.indexOf('/')
             val qIdx = afterScheme.indexOf('?')
             val splitIdx = listOf(slashIdx, qIdx).filter { it >= 0 }.minOrNull() ?: afterScheme.length
-            val rawAuthority = afterScheme.substring(0, splitIdx).substringAfterLast('@')
+            val rawAuthoritySegment = afterScheme.substring(0, splitIdx)
+            if (rawAuthoritySegment.any { it == '\\' || it.isWhitespace() || it.code < 0x20 }) {
+                return Triple("", -1, "")
+            }
+            val rawAuthority = rawAuthoritySegment.substringAfterLast('@')
             val (host, port) = parseAuthority(rawAuthority, defaultPort = defaultPort)
             val tail = if (splitIdx < afterScheme.length) afterScheme.substring(splitIdx) else "/"
             val rewritten = if (tail.startsWith("?")) "/$tail" else tail.ifEmpty { "/" }
@@ -755,8 +1088,11 @@ class EmbeddedProxyServer(
     }
 
     private fun createOutboundSocket(network: Network?, host: String, port: Int): Socket {
-        val cleanHost = host.removeSurrounding("[", "]").trimEnd('.')
-        val addresses = if (network != null) {
+        if (port !in 1..65535) {
+            throw SecurityException("SSRF blocked: invalid destination port $port")
+        }
+        val cleanHost = host.trim().removeSurrounding("[", "]").trimEnd('.')
+        val addresses = outboundAddressResolver?.invoke(network, cleanHost) ?: if (network != null) {
             network.getAllByName(cleanHost)
         } else {
             InetAddress.getAllByName(cleanHost)
@@ -766,12 +1102,11 @@ class EmbeddedProxyServer(
             throw UnknownHostException("No address found for $host")
         }
 
-        // Post-DNS SSRF validation: ensure resolved IP does not route back to sensitive local ports
-        if (port == 8771 || port == DEFAULT_PROXY_PORT || port == actualPort) {
-            for (addr in addresses) {
-                if (addr.isLoopbackAddress || addr.isAnyLocalAddress || isP2pSubnetAddress(addr)) {
-                    throw SecurityException("SSRF blocked: target $host resolves to local address ${addr.hostAddress}:$port")
-                }
+        // Post-DNS SSRF validation across ALL destination ports (1-65535):
+        // reject loopback, wildcard, link-local/metadata, RFC 1918 private LAN, IPv6 ULA/site-local, and multicast.
+        for (addr in addresses) {
+            if (isBlockedInetAddress(addr)) {
+                throw SecurityException("SSRF blocked: target $host resolves to restricted address ${addr.hostAddress}:$port")
             }
         }
 
@@ -796,7 +1131,11 @@ class EmbeddedProxyServer(
             try {
                 sock.tcpNoDelay = true
                 sock.soTimeout = RELAY_IDLE_TIMEOUT_MS
-                sock.connect(InetSocketAddress(addr, port), attemptTimeoutMs)
+                if (outboundSocketConnectHook != null) {
+                    outboundSocketConnectHook.invoke(sock, addr, port, attemptTimeoutMs)
+                } else {
+                    sock.connect(InetSocketAddress(addr, port), attemptTimeoutMs)
+                }
                 return sock
             } catch (e: Exception) {
                 activeSockets.remove(sock)

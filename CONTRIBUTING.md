@@ -11,7 +11,7 @@ Contributions, bug reports, protocol fixes, and documentation improvements are w
 ## Prerequisites
 
 * **macOS**: macOS 13 (Ventura), 14 (Sonoma), or 15 (Sequoia) with Xcode Command Line Tools (`xcode-select --install`) and Python 3.9+.
-* **Android**: JDK 17+ and Android SDK (compileSdk 36, minSdk 31). Gradle wrapper is included at `android/gradlew`.
+* **Android**: JDK 17+ and Android SDK (compileSdk 37, minSdk 31). Gradle wrapper is included at `android/gradlew`.
 
 ## Repository Layout
 

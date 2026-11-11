@@ -50,7 +50,7 @@ GlideDrop transfers files, links, and text notes directly between Android (API 3
 
 * **L2CAP CoC Channels**: Android and macOS open direct Bluetooth Low Energy L2CAP Connection-Oriented Channels (`CBPeripheralManager` / `BluetoothServerSocket.listenUsingL2capChannel`) using dynamically assigned PSMs, avoiding GATT MTU bottlenecks.
 * **Hardware-Agnostic Naming**: Android builds names from `${Build.MANUFACTURER} ${Build.MODEL}` (or user override); macOS uses `Host.current().localizedName` or `scutil --get ComputerName`.
-* **Direct BLE Transfers (`ADRE`)**: Payloads under 64 KiB, URLs, and transfers where Wi-Fi Direct association fails fall back to AES-256-GCM `ADRE` frames over BLE L2CAP (using the built-in BLE frame key, capped at 30 MB on Android to avoid JVM out-of-memory failures).
+* **Direct BLE Transfers (`BLEK` & `ADRE`)**: Payloads under 64 KiB, URLs, and transfers where Wi-Fi Direct association fails run an ephemeral ECDH P-256 handshake (`BLEK`) before sending AES-256-GCM encrypted `ADRE` frames over BLE L2CAP (capped at 30 MB on Android to avoid JVM out-of-memory failures). Legacy unencrypted `ADRP` and unpinned `WP2P` fallbacks fail closed.
 
 ### B. Transport Layer (5 GHz Wi-Fi Direct + CPIO Streaming)
 
@@ -66,8 +66,8 @@ Unidirectional HTTP uploads at 45+ MB/s can starve reverse ARP traffic, causing 
 
 When macOS switches Wi-Fi to the offline `DIRECT-*` SSID, [`EmbeddedProxyServer.kt`](../android/app/src/main/java/io/github/jakharamit44/glidedrop/EmbeddedProxyServer.kt) can serve SOCKS5 (RFC 1928) and HTTP `CONNECT`/Forward traffic on port `1080`, binding outbound sockets to Android's active validated internet network or cellular fallback (`ConnectivityManager`).
 
-* Only `192.168.49.0/24` and loopback clients are accepted.
-* Post-DNS SSRF checks block connections back to loopback/P2P control ports (`8771`, `1080`) and the `192.168.49.0/24` subnet.
+* Only `192.168.49.0/24` and loopback clients are accepted (opt-in setting, off by default).
+* Pre- and post-DNS SSRF checks reject loopback, wildcard, RFC 1918 private LAN, link-local (`169.254.0.0/16`, `fe80::/10`), IPv6 ULA (`fc00::/7`), NAT64, `.localdomain`, and multicast destinations across all ports, while header filtering strips `Proxy-Authorization` and blocks `Upgrade` smuggling.
 * On macOS, `glidedrop-daemon.swift` serializes snapshot and restore operations under an advisory file lock (`proxy_state.lock`) via `networksetup`, preserving existing proxy settings and bypass domains without `sudo`.
 
 ### E. macOS Wi-Fi & VPN Recovery
@@ -76,4 +76,4 @@ Before joining a Wi-Fi Direct SSID, macOS records the active Wi-Fi network, paus
 
 ### F. Optional AI Sidecar Processor (`claude_processor.py`)
 
-When explicitly enabled, received files on macOS pass through a local Privacy Guard (blocking private keys, `.pem`, `.key`, `.env*`, and API tokens by filename and regex inspection). Benign files can be summarized offline via macOS Apple Vision OCR and a local Ollama instance (`http://localhost:11434`), or via Anthropic's Messages API (`claude-3-5-sonnet-latest` with fallback to Haiku/Opus).
+When explicitly enabled, received files on macOS pass through a local Privacy Guard (blocking private keys, `.pem`, `.key`, `.env*`, and API tokens by filename and regex inspection). Benign files can be summarized offline via macOS Apple Vision OCR and a local Ollama instance (`http://localhost:11434`), or via Anthropic's Messages API (`claude-sonnet-4-6` with fallback to `claude-haiku-4-5` / `claude-opus-4-6`).

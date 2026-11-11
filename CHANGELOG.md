@@ -2,6 +2,22 @@
 
 All notable changes to GlideDrop are documented in this file.
 
+## [v2.6.0] - 2026-11-11
+
+### Fixed (Mac -> Android Send & Transfer Stability)
+- **Wi-Fi Direct Join & 25s DHCP Window (`glidedrop-daemon.swift`)**: Removed duplicate mid-join `networksetup` calls (`retriedJoin`) across both outgoing and incoming P2P sessions that caused `DISASSOC_REASON = 8` lease wipes, extended the DHCP wait deadline to `25.0s`, fixed `DIRECT-*` detection via `currentRawWifiSsid()`, and eliminated duplicate post-send Wi-Fi restore calls.
+- **CoreBluetooth Delegates, Dynamic PSMs & Lock TTL (`glidedrop-daemon.swift`)**: Added strict active-peripheral guards, `didFailToConnect`/`didDisconnectPeripheral`/`didModifyServices` delegates, immediate scan shutdown when L2CAP opens, acceptance of lower dynamic Android PSMs on restart, ping timer refresh on `W2P2`/`WP2P` handshakes, and a 180s timestamp TTL + periodic refresh on `tx_in_progress.lock`.
+- **BLE Fallback Archive Guard & Progress Persistence (`glidedrop-daemon.swift`, `glidedrop.sh`)**: Enforced the 30 MB Android `ADRE` cap before building oversized compressed fallback frames, eliminated cross-thread `FileHandle` close races in `buildDvzipCpio`, preserved `transfer_progress.json` across `glidedrop.sh` -> BLE fallback transitions, fixed 4-byte `WP2P` framing, and added bounded `readExact` timeouts with periodic UI freshness ticks.
+
+### Security
+- **Ephemeral ECDH BLE Payload Keys & Fail-Closed Paths (`glidedrop-daemon.swift`, `GlideDropNode.kt`)**: Added ephemeral ECDH P-256 (`BLEK`) session negotiation for `ADRE` BLE transfers instead of a static key, removed unpinned/plaintext legacy `WP2P` and `ADRP` fallbacks, and enforced a signed-overflow guard (`fileSize >= 0L`) in `070764` CPIO extraction.
+- **Per-Session Bearer Token Auth & Daemon Timeouts (`glidedrop.sh`, `GlideDropNode.kt`)**: Issued per-session `X-GlideDrop-Token` authorization inside `W2P2` validated in constant time on `:8772` (revoked on declined/invalid joins), aligned Android `joinReply` (`100s`) and `ADRE` ACK (`65s`) timeouts, tightened AI config file permissions (`0600` in `0700` `~/.glidedrop`), and isolated icon generation temp directories.
+- **Opt-In Embedded Proxy & SSRF Hardening (`EmbeddedProxyServer.kt`, `GlideDropNode.kt`)**: Defaulted `shareCellularInternet` to disabled, rejected loopback, wildcard, RFC 1918 private LAN, link-local, IPv6 ULA, NAT64, `.localdomain`, and multicast destinations across all ports pre- and post-DNS, stripped `Proxy-Authorization` and hop-by-hop headers, and blocked bare `\r` header smuggling and `Upgrade` tunneling.
+
+### Changed (UI Polish, SDK Updates & Cleanup)
+- **Reduced-Motion Compose & Live AI Badges (`MainActivity.kt`, `glidedrop-daemon.swift`, `docs/index.html`)**: Gated infinite animations in `ReceiveRadarTab`, `LiveConnectionBridgeCard`, and `pressableScale` on live `rememberAnimatorsEnabled()` state, updated macOS Settings AI pills to reflect standby vs active state, and added responsive mobile section links + WCAG contrast fixes in `docs/index.html`.
+- **SDK Modernization & Dead Code Removal**: Updated Gradle (`9.9.1`), AGP (`9.5.1`), AndroidX/Kotlin (`compileSdk`/`targetSdk = 37`), replaced deprecated `allNetworks` with a tracked `ConnectivityManager.NetworkCallback`, fixed all Android Lint issues (0 errors, 0 warnings), added env-driven Android release APK signing in `build.gradle.kts` & `scripts/build-release.sh`, updated Claude 4.x default models in `claude_processor.py`, and removed dead Swift/Kotlin/XML resources.
+
 ## [v2.5.0] - 2026-11-10
 ### Rebrand & Icon Redesign
 - **Rebranded Project to GlideDrop**: Renamed application ID (`io.github.jakharamit44.glidedrop` on Android, `io.github.jakharamit44.glidedrop.mac` on macOS), package namespaces, app bundles (`GlideDrop.app`, `GlideDrop-v2.5.0.apk/.dmg/.pkg`), daemon state directories (`~/.glidedrop`), Downloads subfolder (`Downloads/GlideDrop`), Wi-Fi Direct group prefix (`DIRECT-GlideDrop`), and mDNS proxy hostname (`glidedrop.local.`) cleanly across both platforms.

@@ -253,64 +253,100 @@ func renderExactPng(pixels: Int, fullBleed: Bool = false, edgeToEdgeSquircle: Bo
     return pngData
 }
 
-let fileManager = FileManager.default
-let scriptURL = URL(fileURLWithPath: CommandLine.arguments[0])
-let scriptDir = scriptURL.deletingLastPathComponent().path
-let defaultIcnsPath: String
-if fileManager.fileExists(atPath: (scriptDir as NSString).appendingPathComponent("generate-icon.swift")) {
-    defaultIcnsPath = (scriptDir as NSString).appendingPathComponent("AppIcon.icns")
-} else if fileManager.fileExists(atPath: "macos/generate-icon.swift") {
-    defaultIcnsPath = "macos/AppIcon.icns"
-} else {
-    defaultIcnsPath = (scriptDir as NSString).appendingPathComponent("AppIcon.icns")
+private enum IconGenError: Error, LocalizedError {
+    case iconutilFailed(Int32)
+
+    var errorDescription: String? {
+        switch self {
+        case .iconutilFailed(let code):
+            return "iconutil failed with exit code \(code)"
+        }
+    }
 }
 
-// Optional mode: --web <icon512Path> <appleTouch180Path>
-if CommandLine.arguments.count >= 4 && CommandLine.arguments[1] == "--web" {
-    let icon512 = renderExactPng(pixels: 512, fullBleed: false, edgeToEdgeSquircle: true)
-    let touch180 = renderExactPng(pixels: 180, fullBleed: true, edgeToEdgeSquircle: false)
-    try icon512.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
-    try touch180.write(to: URL(fileURLWithPath: CommandLine.arguments[3]))
-    print("[+] Generated web icon PNGs")
-    exit(0)
+private func runGenerateIcon() throws {
+    let fileManager = FileManager.default
+    let scriptURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    let scriptDir = scriptURL.deletingLastPathComponent().path
+    let defaultIcnsPath: String
+    if fileManager.fileExists(atPath: (scriptDir as NSString).appendingPathComponent("generate-icon.swift")) {
+        defaultIcnsPath = (scriptDir as NSString).appendingPathComponent("AppIcon.icns")
+    } else if fileManager.fileExists(atPath: "macos/generate-icon.swift") {
+        defaultIcnsPath = "macos/AppIcon.icns"
+    } else {
+        defaultIcnsPath = (scriptDir as NSString).appendingPathComponent("AppIcon.icns")
+    }
+
+    // Optional mode: --web <icon512Path> <appleTouch180Path>
+    if CommandLine.arguments.count >= 4 && CommandLine.arguments[1] == "--web" {
+        let icon512 = renderExactPng(pixels: 512, fullBleed: false, edgeToEdgeSquircle: true)
+        let touch180 = renderExactPng(pixels: 180, fullBleed: true, edgeToEdgeSquircle: false)
+        try icon512.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+        try touch180.write(to: URL(fileURLWithPath: CommandLine.arguments[3]))
+        print("[+] Generated web icon PNGs")
+        return
+    }
+
+    let targetIcnsPath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : defaultIcnsPath
+
+    let tempWorkDir = fileManager.temporaryDirectory
+        .appendingPathComponent("glidedrop-icon-\(UUID().uuidString)", isDirectory: true)
+    try fileManager.createDirectory(
+        at: tempWorkDir,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    defer {
+        try? fileManager.removeItem(at: tempWorkDir)
+    }
+
+    let iconsetDir = tempWorkDir.appendingPathComponent("AppIcon.iconset", isDirectory: true)
+    try fileManager.createDirectory(
+        at: iconsetDir,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+
+    let iconSizes: [(String, Int)] = [
+        ("icon_16x16.png", 16),
+        ("icon_16x16@2x.png", 32),
+        ("icon_32x32.png", 32),
+        ("icon_32x32@2x.png", 64),
+        ("icon_128x128.png", 128),
+        ("icon_128x128@2x.png", 256),
+        ("icon_256x256.png", 256),
+        ("icon_256x256@2x.png", 512),
+        ("icon_512x512.png", 512),
+        ("icon_512x512@2x.png", 1024)
+    ]
+
+    for (name, pixels) in iconSizes {
+        let pngData = renderExactPng(pixels: pixels)
+        let destURL = iconsetDir.appendingPathComponent(name)
+        try pngData.write(to: destURL)
+    }
+
+    print("[+] Successfully generated all 10 canonical resolutions in \(iconsetDir.path)")
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+    process.arguments = ["-c", "icns", iconsetDir.path, "-o", targetIcnsPath]
+
+    try process.run()
+    process.waitUntilExit()
+
+    if process.terminationStatus == 0 {
+        print("[+] Successfully compiled ICNS to: \(targetIcnsPath)")
+    } else {
+        throw IconGenError.iconutilFailed(process.terminationStatus)
+    }
 }
 
-let targetIcnsPath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : defaultIcnsPath
-
-let iconsetDir = URL(fileURLWithPath: "/tmp/AppIcon.iconset")
-try? fileManager.removeItem(at: iconsetDir)
-try fileManager.createDirectory(at: iconsetDir, withIntermediateDirectories: true)
-
-let iconSizes: [(String, Int)] = [
-    ("icon_16x16.png", 16),
-    ("icon_16x16@2x.png", 32),
-    ("icon_32x32.png", 32),
-    ("icon_32x32@2x.png", 64),
-    ("icon_128x128.png", 128),
-    ("icon_128x128@2x.png", 256),
-    ("icon_256x256.png", 256),
-    ("icon_256x256@2x.png", 512),
-    ("icon_512x512.png", 512),
-    ("icon_512x512@2x.png", 1024)
-]
-
-for (name, pixels) in iconSizes {
-    let pngData = renderExactPng(pixels: pixels)
-    let destURL = iconsetDir.appendingPathComponent(name)
-    try pngData.write(to: destURL)
-}
-
-print("[+] Successfully generated all 10 canonical resolutions in /tmp/AppIcon.iconset")
-
-let process = Process()
-process.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
-process.arguments = ["-c", "icns", iconsetDir.path, "-o", targetIcnsPath]
-
-try process.run()
-process.waitUntilExit()
-
-if process.terminationStatus == 0 {
-    print("[+] Successfully compiled ICNS to: \(targetIcnsPath)")
-} else {
-    fatalError("[-] iconutil failed with exit code \(process.terminationStatus)")
-}
+private let _generateIconEntryPoint: Void = {
+    do {
+        try runGenerateIcon()
+    } catch {
+        fputs("[-] \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+}()

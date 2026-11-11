@@ -44,16 +44,16 @@
         "applicationCategory": "UtilitiesApplication",
         "applicationSubCategory": "Peer-to-Peer File Transfer",
         "operatingSystem": "Android 12+, macOS 13+",
-        "softwareVersion": "2.5.0",
-        "datePublished": "2026-11-10",
+        "softwareVersion": "2.6.0",
+        "datePublished": "2026-11-11",
         "license": "https://opensource.org/license/mit",
         "isAccessibleForFree": true,
         "url": "https://jakharamit44.github.io/glidedrop/",
         "image": "https://jakharamit44.github.io/glidedrop/og-image.png",
         "downloadUrl": [
-          "https://github.com/jakharamit44/glidedrop/releases/download/v2.5.0/GlideDrop-v2.5.0.apk",
-          "https://github.com/jakharamit44/glidedrop/releases/download/v2.5.0/GlideDrop-v2.5.0.pkg",
-          "https://github.com/jakharamit44/glidedrop/releases/download/v2.5.0/GlideDrop-v2.5.0.dmg"
+          "https://github.com/jakharamit44/glidedrop/releases/download/v2.6.0/GlideDrop-v2.6.0.apk",
+          "https://github.com/jakharamit44/glidedrop/releases/download/v2.6.0/GlideDrop-v2.6.0.pkg",
+          "https://github.com/jakharamit44/glidedrop/releases/download/v2.6.0/GlideDrop-v2.6.0.dmg"
         ],
         "installUrl": "https://github.com/jakharamit44/glidedrop/releases/latest",
         "releaseNotes": "https://github.com/jakharamit44/glidedrop/blob/main/CHANGELOG.md",
@@ -135,7 +135,7 @@
             "name": "How do I avoid macOS Gatekeeper warnings when installing?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "Install with GlideDrop-v2.5.0.pkg, which installs into /Applications and runs xattr -cr during setup. If you downloaded the .dmg, run the bundled Gatekeeper helper script or run xattr -cr \"/Applications/GlideDrop.app\" in Terminal."
+              "text": "Install with GlideDrop-v2.6.0.pkg, which installs into /Applications and runs xattr -cr during setup. If you downloaded the .dmg, run the bundled Gatekeeper helper script or run xattr -cr \"/Applications/GlideDrop.app\" in Terminal."
             }
           },
           {
@@ -189,7 +189,7 @@
         --accent: #0369a1;
         --accent-strong: #434fe0;
         --accent-strong-hover: #3540c9;
-        --green: #15803d;
+        --green: #166534;
         --green-bg: rgba(21, 128, 61, 0.10);
         --amber: #b45309;
         --code-bg: #eef2fa;
@@ -275,7 +275,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 16px;
+      gap: 20px;
       min-height: 64px;
     }
 
@@ -287,6 +287,8 @@
       font-weight: 700;
       font-size: 17px;
       letter-spacing: -0.01em;
+      margin-right: auto;
+      flex-shrink: 0;
     }
 
     .brand:hover {
@@ -307,7 +309,7 @@
       flex-wrap: wrap;
     }
 
-    .nav-links a {
+    .nav-links a.nav-pill {
       color: var(--text-muted);
       font-size: 14px;
       font-weight: 500;
@@ -315,9 +317,10 @@
       min-height: 44px;
       display: inline-flex;
       align-items: center;
+      white-space: nowrap;
     }
 
-    .nav-links a:hover {
+    .nav-links a.nav-pill:hover {
       color: var(--text);
       text-decoration: none;
     }
@@ -326,19 +329,84 @@
       background: var(--bg-card);
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 8px 14px !important;
-      color: var(--text) !important;
-      font-weight: 600 !important;
+      padding: 8px 14px;
+      min-height: 44px;
+      display: inline-flex;
+      align-items: center;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
 
     .nav-cta:hover {
       border-color: var(--border-strong);
       background: var(--bg-card-hover);
+      text-decoration: none;
+    }
+
+    section[id] {
+      scroll-margin-top: 80px;
     }
 
     @media (max-width: 720px) {
-      .nav-hide-mobile {
-        display: none !important;
+      .container {
+        padding: 0 16px;
+      }
+
+      .nav-bar {
+        flex-wrap: wrap;
+        row-gap: 10px;
+        column-gap: 12px;
+        padding-top: 10px;
+        padding-bottom: 12px;
+        min-height: 0;
+      }
+
+      .brand {
+        order: 1;
+      }
+
+      .nav-cta {
+        order: 2;
+        padding: 7px 12px;
+        min-height: 40px;
+        font-size: 13px;
+      }
+
+      .nav-links {
+        order: 3;
+        width: 100%;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .nav-links a.nav-pill {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        color: var(--text);
+        font-size: 13px;
+        font-weight: 600;
+        padding: 7px 13px;
+        min-height: 40px;
+      }
+
+      .nav-links a.nav-pill:hover,
+      .nav-links a.nav-pill:focus-visible {
+        border-color: var(--accent);
+        background: var(--bg-card-hover);
+      }
+
+      section[id] {
+        scroll-margin-top: 132px;
+      }
+    }
+
+    @media (max-width: 374px) {
+      section[id] {
+        scroll-margin-top: 176px;
       }
     }
 
@@ -896,12 +964,12 @@
         <span>GlideDrop</span>
       </a>
       <nav class="nav-links" aria-label="Primary navigation">
-        <a class="nav-hide-mobile" href="#downloads">Downloads</a>
-        <a class="nav-hide-mobile" href="#comparison">Compare</a>
-        <a class="nav-hide-mobile" href="#how-it-works">Protocol</a>
-        <a class="nav-hide-mobile" href="#faq">FAQ</a>
-        <a class="nav-cta" href="https://github.com/jakharamit44/glidedrop">GitHub Repo</a>
+        <a class="nav-pill" href="#downloads">Downloads</a>
+        <a class="nav-pill" href="#comparison">Compare</a>
+        <a class="nav-pill" href="#how-it-works">Protocol</a>
+        <a class="nav-pill" href="#faq">FAQ</a>
       </nav>
+      <a class="nav-cta" href="https://github.com/jakharamit44/glidedrop">GitHub Repo</a>
     </div>
   </header>
 
@@ -912,17 +980,17 @@
           <div>
             <div class="release-pill">
               <span class="status-dot" aria-hidden="true"></span>
-              <span>Release v2.5.0 (Public Beta)</span>
+              <span>Release v2.6.0 (Public Beta)</span>
             </div>
             <h1>Open-Source AirDrop Alternative for Android and Mac</h1>
             <p class="hero-lead">
               GlideDrop lets you send files between Android and Mac without Wi-Fi routers, USB cables, cloud accounts, or size limits. Built as a fast, encrypted alternative to Apple AirDrop&reg; and Google Quick Share&trade; over BLE L2CAP and 5 GHz Wi-Fi Direct.
             </p>
             <div class="cta-group">
-              <a class="btn btn-primary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.5.0.apk">
+              <a class="btn btn-primary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.6.0.apk">
                 Download Android APK
               </a>
-              <a class="btn btn-secondary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.5.0.pkg">
+              <a class="btn btn-secondary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.6.0.pkg">
                 Download macOS PKG
               </a>
               <a class="btn btn-secondary" href="https://github.com/jakharamit44/glidedrop">
@@ -995,7 +1063,7 @@
 
     <section id="downloads">
       <div class="container">
-        <h2>Download Release v2.5.0</h2>
+        <h2>Download Release v2.6.0</h2>
         <p class="section-intro">
           Pre-built binaries are published on GitHub Releases with SHA-256 checksums. Both apps run natively without third-party transfer servers.
         </p>
@@ -1009,8 +1077,8 @@
               </p>
             </div>
             <div class="dl-actions">
-              <a class="btn btn-primary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.5.0.apk">
-                GlideDrop-v2.5.0.apk
+              <a class="btn btn-primary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.6.0.apk">
+                GlideDrop-v2.6.0.apk
               </a>
             </div>
           </article>
@@ -1023,11 +1091,11 @@
               </p>
             </div>
             <div class="dl-actions">
-              <a class="btn btn-primary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.5.0.pkg">
-                GlideDrop-v2.5.0.pkg (Recommended)
+              <a class="btn btn-primary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.6.0.pkg">
+                GlideDrop-v2.6.0.pkg (Recommended)
               </a>
-              <a class="btn btn-secondary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.5.0.dmg">
-                GlideDrop-v2.5.0.dmg
+              <a class="btn btn-secondary" href="https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v2.6.0.dmg">
+                GlideDrop-v2.6.0.dmg
               </a>
             </div>
           </article>
@@ -1195,7 +1263,7 @@
         </div>
 
         <div class="note-box">
-          <strong>Build from source:</strong> Run <code>cd macos &amp;&amp; ./build.sh</code> on macOS (Xcode CLT + Python 3.9+) and <code>cd android &amp;&amp; ./gradlew assembleDebug</code> (JDK 17 + Android SDK 36). See the <a href="https://github.com/jakharamit44/glidedrop/blob/main/docs/ARCHITECTURE.md">Architecture Specification</a> and <a href="https://github.com/jakharamit44/glidedrop/blob/main/SECURITY.md">Security Policy</a> for protocol details.
+          <strong>Build from source:</strong> Run <code>cd macos &amp;&amp; ./build.sh</code> on macOS (Xcode CLT + Python 3.9+) and <code>cd android &amp;&amp; ./gradlew assembleDebug</code> (JDK 17 + Android SDK 37). See the <a href="https://github.com/jakharamit44/glidedrop/blob/main/docs/ARCHITECTURE.md">Architecture Specification</a> and <a href="https://github.com/jakharamit44/glidedrop/blob/main/SECURITY.md">Security Policy</a> for protocol details.
         </div>
       </div>
     </section>
@@ -1232,7 +1300,7 @@
           </details>
           <details class="faq-item">
             <summary>How do I avoid macOS Gatekeeper warnings when installing?</summary>
-            <p>Install with <code>GlideDrop-v2.5.0.pkg</code>, which installs into <code>/Applications</code> and runs <code>xattr -cr</code> during setup. If you downloaded the <code>.dmg</code>, run the bundled Gatekeeper helper script or run <code>xattr -cr "/Applications/GlideDrop.app"</code> in Terminal.</p>
+            <p>Install with <code>GlideDrop-v2.6.0.pkg</code>, which installs into <code>/Applications</code> and runs <code>xattr -cr</code> during setup. If you downloaded the <code>.dmg</code>, run the bundled Gatekeeper helper script or run <code>xattr -cr "/Applications/GlideDrop.app"</code> in Terminal.</p>
           </details>
           <details class="faq-item">
             <summary>Does the AI summary feature send my private keys to the cloud?</summary>
@@ -1245,7 +1313,7 @@
 
   <footer>
     <div class="container footer-grid">
-      <div>GlideDrop v2.5.0 &middot; Open source under the MIT License</div>
+      <div>GlideDrop v2.6.0 &middot; Open source under the MIT License</div>
       <div class="footer-links">
         <a href="https://github.com/jakharamit44/glidedrop">GitHub</a>
         <a href="https://github.com/jakharamit44/glidedrop/releases">Releases</a>

@@ -1,6 +1,7 @@
 package io.github.jakharamit44.glidedrop
 
 import android.Manifest
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.DownloadManager
 import android.bluetooth.BluetoothAdapter
@@ -8,6 +9,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -73,6 +75,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
@@ -83,6 +86,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
@@ -108,7 +114,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.net.toUri
 import androidx.core.view.WindowCompat
 import io.github.jakharamit44.glidedrop.theme.GlideDropTheme
 import ds.tokens.DsMotion
@@ -165,18 +173,53 @@ private fun categoryForFileName(name: String, isUrl: Boolean = false): String {
     }
 }
 
+@Composable
+private fun rememberAnimatorsEnabled(): Boolean {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var enabled by remember { mutableStateOf(ValueAnimator.areAnimatorsEnabled()) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                enabled = ValueAnimator.areAnimatorsEnabled()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        val scaleListener = if (Build.VERSION.SDK_INT >= 33) {
+            ValueAnimator.DurationScaleChangeListener { scale ->
+                enabled = scale > 0f && ValueAnimator.areAnimatorsEnabled()
+            }.also { ValueAnimator.registerDurationScaleChangeListener(it) }
+        } else {
+            null
+        }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            if (Build.VERSION.SDK_INT >= 33 && scaleListener != null) {
+                ValueAnimator.unregisterDurationScaleChangeListener(scaleListener)
+            }
+        }
+    }
+    return enabled
+}
+
 private fun Modifier.pressableScale(
     enabled: Boolean = true,
     pressedScale: Float = DsMotion.scalePress,
     onClick: () -> Unit
 ): Modifier = composed {
+    val animatorsEnabled = rememberAnimatorsEnabled()
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
-    val scale by animateFloatAsState(
-        targetValue = if (isPressed && enabled) pressedScale else 1f,
-        animationSpec = DsMotion.springEffectsDefault(),
-        label = "pressScale"
-    )
+    val targetScale = if (isPressed && enabled) pressedScale else 1f
+    val scale = if (animatorsEnabled) {
+        val animated by animateFloatAsState(
+            targetValue = targetScale,
+            animationSpec = DsMotion.springEffectsDefault(),
+            label = "pressScale"
+        )
+        animated
+    } else {
+        targetScale
+    }
     this
         .graphicsLayer {
             scaleX = scale
@@ -266,7 +309,7 @@ class MainActivity : ComponentActivity() {
                         },
                         onOpenUrl = { url ->
                             runCatching {
-                                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                                startActivity(Intent(Intent.ACTION_VIEW, url.toUri()))
                             }
                         },
                         onOpenDownloads = {
@@ -772,7 +815,20 @@ fun GlideDropScreen(
                     wifiEnabled = wifiEnabled,
                     permsGranted = permsGranted,
                     onEnableBluetooth = {
-                        runCatching { context.startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)) }
+                        if (ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.BLUETOOTH_CONNECT
+                            ) == PackageManager.PERMISSION_GRANTED
+                        ) {
+                            try {
+                                context.startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                            } catch (_: SecurityException) {
+                                permLauncher.launch(requiredPermissions)
+                            } catch (_: Throwable) {
+                            }
+                        } else {
+                            permLauncher.launch(requiredPermissions)
+                        }
                     },
                     onEnableWifi = {
                         runCatching { context.startActivity(Intent(Settings.Panel.ACTION_WIFI)) }
@@ -1034,23 +1090,36 @@ private fun LiveConnectionBridgeCard(
     onCancel: () -> Unit
 ) {
     val c = LocalDsColors.current
+    val animatorsEnabled = rememberAnimatorsEnabled()
     val senderName = if (progress.isSending) localDeviceName else progress.peerName.ifEmpty { "Nearby Peer" }
     val receiverName = if (progress.isSending) progress.peerName.ifEmpty { "Nearby Peer" } else localDeviceName
-    val animatedFraction by animateFloatAsState(
-        targetValue = (progress.percent / 100f).coerceIn(0f, 1f),
-        animationSpec = tween(250, easing = LinearOutSlowInEasing),
-        label = "transferPct"
-    )
-    val pulseTransition = rememberInfiniteTransition(label = "bridgePulse")
-    val dashPhase by pulseTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 36f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(900, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "dashPhase"
-    )
+    val targetFraction = (progress.percent / 100f).coerceIn(0f, 1f)
+    val animatedFraction = if (animatorsEnabled) {
+        val animated by animateFloatAsState(
+            targetValue = targetFraction,
+            animationSpec = tween(250, easing = LinearOutSlowInEasing),
+            label = "transferPct"
+        )
+        animated
+    } else {
+        targetFraction
+    }
+    val shouldAnimateBridge = animatorsEnabled && (progress.isConnecting || progress.speedBytesPerSec > 0L)
+    val dashPhase = if (shouldAnimateBridge) {
+        val pulseTransition = rememberInfiniteTransition(label = "bridgePulse")
+        val phase by pulseTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 36f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(900, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "dashPhase"
+        )
+        phase
+    } else {
+        0f
+    }
 
     Surface(
         color = c.surfaceRaised,
@@ -1266,14 +1335,26 @@ private fun LiveConnectionBridgeCard(
                 }
 
                 if (progress.isConnecting) {
-                    LinearProgressIndicator(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(6.dp)
-                            .clip(CircleShape),
-                        color = c.bgActionPrimary,
-                        trackColor = c.bgAccentSubtle
-                    )
+                    if (animatorsEnabled) {
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(6.dp)
+                                .clip(CircleShape),
+                            color = c.bgActionPrimary,
+                            trackColor = c.bgAccentSubtle
+                        )
+                    } else {
+                        LinearProgressIndicator(
+                            progress = { 0.35f },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(6.dp)
+                                .clip(CircleShape),
+                            color = c.bgActionPrimary,
+                            trackColor = c.bgAccentSubtle
+                        )
+                    }
                 } else {
                     LinearProgressIndicator(
                         progress = { animatedFraction },
@@ -2097,16 +2178,22 @@ private fun ReceiveRadarTab(
     onViewAllReceived: () -> Unit
 ) {
     val c = LocalDsColors.current
-    val pulseTransition = rememberInfiniteTransition(label = "receiveRadar")
-    val radarWave by pulseTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(2400, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "radarWave"
-    )
+    val animateRadar = running && rememberAnimatorsEnabled()
+    val radarWave: Float? = if (animateRadar) {
+        val pulseTransition = rememberInfiniteTransition(label = "receiveRadar")
+        val wave by pulseTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(2400, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "radarWave"
+        )
+        wave
+    } else {
+        null
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -2157,7 +2244,7 @@ private fun ReceiveRadarTab(
                             drawCircle(color = accentColor.copy(alpha = 0.08f), radius = maxR, center = center)
                             drawCircle(color = accentColor.copy(alpha = 0.14f), radius = maxR * 0.72f, center = center)
                             drawCircle(color = accentColor.copy(alpha = 0.24f), radius = maxR * 0.46f, center = center)
-                            if (running) {
+                            if (radarWave != null) {
                                 val pulseR = maxR * (0.28f + 0.72f * radarWave)
                                 drawCircle(
                                     color = accentColor.copy(alpha = (1f - radarWave) * 0.35f),
