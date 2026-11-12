@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 import CryptoKit
 import CoreWLAN
 import Darwin
+import SystemConfiguration
 
 private let p2pSessionTokenLock = NSLock()
 private let P2P_SESSION_TOKEN_TTL: TimeInterval = 300.0
@@ -106,6 +107,299 @@ func revokeP2pSessionToken(_ token: String, stateDir: URL = STATE_DIR) {
             try? FileManager.default.removeItem(at: tmpFile)
         }
     }
+}
+
+let DEFAULT_MAC_RX_PORT = 8772
+let DEFAULT_PROXY_PORT = 1080
+let DEFAULT_AWDL_BRIDGE_PORT: UInt16 = 8774
+let DEFAULT_FINDER_PROXY_PORT: UInt16 = 8773
+
+func parseIpv4Address(_ ip: String) -> UInt32? {
+    let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+    var addr = in_addr()
+    guard clean.withCString({ inet_pton(AF_INET, $0, &addr) }) == 1 else {
+        return nil
+    }
+    return UInt32(bigEndian: addr.s_addr)
+}
+
+func formatIpv4Address(_ value: UInt32) -> String {
+    var netOrder = in_addr(s_addr: value.bigEndian)
+    var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+    guard inet_ntop(AF_INET, &netOrder, &buf, socklen_t(INET_ADDRSTRLEN)) != nil else {
+        return ""
+    }
+    return String(cString: buf)
+}
+
+func deriveIpv4Cidr(ip: String, prefixLen: Int = 24) -> String? {
+    guard prefixLen > 0, prefixLen <= 32, let ipInt = parseIpv4Address(ip) else { return nil }
+    let mask: UInt32 = (0xFFFF_FFFF << UInt32(32 - prefixLen))
+    let netStr = formatIpv4Address(ipInt & mask)
+    return netStr.isEmpty ? nil : "\(netStr)/\(prefixLen)"
+}
+
+func prefixLengthFromIpv4Netmask(_ maskIp: String) -> Int? {
+    guard let maskInt = parseIpv4Address(maskIp), maskInt != 0 else { return nil }
+    var leading = 0
+    for shift in stride(from: 31, through: 0, by: -1) {
+        if (maskInt & (1 << UInt32(shift))) != 0 {
+            leading += 1
+        } else {
+            let remMask: UInt32 = (1 << UInt32(shift + 1)) - 1
+            if (maskInt & remMask) != 0 { return nil }
+            break
+        }
+    }
+    return leading > 0 ? leading : nil
+}
+
+func parseIpv4Cidr(_ cidr: String) -> (network: UInt32, mask: UInt32)? {
+    let parts = cidr.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "/")
+    guard parts.count == 2,
+          let ipInt = parseIpv4Address(String(parts[0])),
+          let prefix = Int(parts[1]),
+          prefix > 0 && prefix <= 32 else {
+        return nil
+    }
+    let mask: UInt32 = (0xFFFF_FFFF << UInt32(32 - prefix))
+    return (ipInt & mask, mask)
+}
+
+func cidrContains(cidr: String, ip: String) -> Bool {
+    guard let parsed = parseIpv4Cidr(cidr),
+          let ipInt = parseIpv4Address(ip) else {
+        return false
+    }
+    return (ipInt & parsed.mask) == parsed.network
+}
+
+func isRfc1918Ipv4(_ ip: String) -> Bool {
+    guard let v = parseIpv4Address(ip) else { return false }
+    if (v & 0xFF00_0000) == 0x0A00_0000 { return true }       // 10.0.0.0/8
+    if (v & 0xFFF0_0000) == 0xAC10_0000 { return true }       // 172.16.0.0/12
+    if (v & 0xFFFF_0000) == 0xC0A8_0000 { return true }       // 192.168.0.0/16
+    return false
+}
+
+func isCgnatIpv4(_ ip: String) -> Bool {
+    guard let v = parseIpv4Address(ip) else { return false }
+    return (v & 0xFFC0_0000) == 0x6440_0000                   // 100.64.0.0/10
+}
+
+func isValidP2pGatewayIp(_ ip: String) -> Bool {
+    let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+    if clean.isEmpty { return false }
+    if let v = parseIpv4Address(clean) {
+        if (v & 0xFF00_0000) == 0 { return false }            // 0.0.0.0/8
+        if (v & 0xFF00_0000) == 0x7F00_0000 { return false }  // 127.0.0.0/8 loopback
+        if (v & 0xF000_0000) == 0xE000_0000 { return false }  // multicast/reserved
+        if isRfc1918Ipv4(clean) { return true }
+        if (v & 0xFFFF_0000) == 0xA9FE_0000 { return true }   // 169.254.0.0/16 link-local
+        return false
+    }
+    var addr6 = in6_addr()
+    let zoneStripped = clean.split(separator: "%", maxSplits: 1).first.map(String.init) ?? clean
+    guard zoneStripped.withCString({ inet_pton(AF_INET6, $0, &addr6) }) == 1 else {
+        return false
+    }
+    let b0 = withUnsafeBytes(of: addr6) { $0[0] }
+    let b1 = withUnsafeBytes(of: addr6) { $0[1] }
+    if b0 == 0xFE && (b1 & 0xC0) == 0x80 { return true }      // fe80::/10 link-local
+    if (b0 & 0xFE) == 0xFC { return true }                    // fc00::/7 ULA
+    return false
+}
+
+func isNormalWifiIpv4(_ ip: String, activeP2pCidr: String? = nil, rawWifiSsid: String? = nil) -> Bool {
+    if let ssid = rawWifiSsid, ssid.hasPrefix("DIRECT-") { return false }
+    guard let v = parseIpv4Address(ip) else { return false }
+    if (v & 0xFF00_0000) == 0 || v == 0xFFFF_FFFF { return false }
+    if (v & 0xFF00_0000) == 0x7F00_0000 { return false }      // loopback 127.0.0.0/8
+    if (v & 0xFFFF_0000) == 0xA9FE_0000 { return false }      // link-local 169.254.0.0/16
+    if (v & 0xF000_0000) == 0xE000_0000 { return false }      // multicast / reserved
+    if let cidr = activeP2pCidr, !cidr.isEmpty, cidrContains(cidr: cidr, ip: ip) { return false }
+    return true
+}
+
+struct ActiveP2pSession: Codable, Equatable {
+    let gatewayIp: String
+    let cidr: String
+    let httpsPort: Int
+    let proxyPort: Int
+    let macRxPort: Int
+    let udpKeepalivePort: Int
+    let updatedAt: Double
+
+    enum CodingKeys: String, CodingKey {
+        case gatewayIp, cidr, httpsPort, proxyPort, macRxPort, udpKeepalivePort, updatedAt
+    }
+
+    init(
+        gatewayIp: String,
+        cidr: String,
+        httpsPort: Int,
+        proxyPort: Int,
+        macRxPort: Int = DEFAULT_MAC_RX_PORT,
+        udpKeepalivePort: Int = Int(DEFAULT_AWDL_BRIDGE_PORT),
+        updatedAt: Double
+    ) {
+        self.gatewayIp = gatewayIp
+        self.cidr = cidr
+        self.httpsPort = httpsPort
+        self.proxyPort = proxyPort
+        self.macRxPort = macRxPort
+        self.udpKeepalivePort = udpKeepalivePort
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.gatewayIp = try c.decode(String.self, forKey: .gatewayIp)
+        self.cidr = try c.decode(String.self, forKey: .cidr)
+        self.httpsPort = try c.decode(Int.self, forKey: .httpsPort)
+        self.proxyPort = try c.decode(Int.self, forKey: .proxyPort)
+        self.macRxPort = try c.decodeIfPresent(Int.self, forKey: .macRxPort) ?? DEFAULT_MAC_RX_PORT
+        self.udpKeepalivePort = try c.decodeIfPresent(Int.self, forKey: .udpKeepalivePort) ?? Int(DEFAULT_AWDL_BRIDGE_PORT)
+        self.updatedAt = try c.decode(Double.self, forKey: .updatedAt)
+    }
+}
+
+func writeAtomicPrivateFile(data: Data, to target: URL) {
+    let tmp = target.deletingLastPathComponent().appendingPathComponent("\(target.lastPathComponent).tmp.\(UUID().uuidString)")
+    if FileManager.default.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: 0o600]) {
+        _ = chmod(tmp.path, 0o600)
+        if Darwin.rename(tmp.path, target.path) != 0 {
+            try? FileManager.default.removeItem(at: tmp)
+        }
+    }
+}
+
+func writeActiveP2pSession(
+    gatewayIp: String,
+    cidr: String,
+    httpsPort: Int,
+    proxyPort: Int,
+    macRxPort: Int = readPortFile("mac_rx_port", defaultPort: DEFAULT_MAC_RX_PORT),
+    udpKeepalivePort: Int = readPortFile("awdl_bridge_port", defaultPort: Int(DEFAULT_AWDL_BRIDGE_PORT)),
+    stateDir: URL = STATE_DIR,
+    now: Double = Date().timeIntervalSince1970
+) {
+    guard isValidP2pGatewayIp(gatewayIp) else { return }
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    let normalizedCidr = !cidr.isEmpty ? cidr : (deriveIpv4Cidr(ip: gatewayIp) ?? "")
+    let session = ActiveP2pSession(
+        gatewayIp: gatewayIp,
+        cidr: normalizedCidr,
+        httpsPort: (1...65535).contains(httpsPort) ? httpsPort : 8771,
+        proxyPort: (1...65535).contains(proxyPort) ? proxyPort : 0,
+        macRxPort: (1...65535).contains(macRxPort) ? macRxPort : DEFAULT_MAC_RX_PORT,
+        udpKeepalivePort: (1...65535).contains(udpKeepalivePort) ? udpKeepalivePort : Int(DEFAULT_AWDL_BRIDGE_PORT),
+        updatedAt: now
+    )
+    guard let data = try? JSONEncoder().encode(session) else { return }
+    writeAtomicPrivateFile(data: data, to: stateDir.appendingPathComponent("active_p2p_session.json"))
+}
+
+func loadActiveP2pSession(
+    stateDir: URL = STATE_DIR,
+    maxAge: TimeInterval = 1800.0,
+    now: Double = Date().timeIntervalSince1970
+) -> ActiveP2pSession? {
+    let file = stateDir.appendingPathComponent("active_p2p_session.json")
+    guard let data = try? Data(contentsOf: file),
+          let session = try? JSONDecoder().decode(ActiveP2pSession.self, from: data),
+          (now - session.updatedAt) <= maxAge else {
+        return nil
+    }
+    return session
+}
+
+func clearActiveP2pSession(stateDir: URL = STATE_DIR) {
+    try? FileManager.default.removeItem(at: stateDir.appendingPathComponent("active_p2p_session.json"))
+}
+
+func writeOutgoingP2pToken(
+    _ token: String,
+    host: String,
+    port: Int,
+    stateDir: URL = STATE_DIR,
+    ttl: TimeInterval = P2P_SESSION_TOKEN_TTL
+) {
+    let clean = token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard clean.count == 64,
+          clean.unicodeScalars.allSatisfy({ ($0.value >= 48 && $0.value <= 57) || ($0.value >= 97 && $0.value <= 102) }) else {
+        return
+    }
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    let now = Date().timeIntervalSince1970
+    let payload: [String: Any] = [
+        "token": clean,
+        "host": host,
+        "port": port,
+        "created_at": now,
+        "expires_at": now + max(1.0, ttl)
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else { return }
+    writeAtomicPrivateFile(data: data, to: stateDir.appendingPathComponent("p2p_outgoing_token.json"))
+}
+
+func clearOutgoingP2pToken(stateDir: URL = STATE_DIR) {
+    try? FileManager.default.removeItem(at: stateDir.appendingPathComponent("p2p_outgoing_token.json"))
+}
+
+func readPortFile(_ name: String, defaultPort: Int, stateDir: URL = STATE_DIR) -> Int {
+    let file = stateDir.appendingPathComponent(name)
+    guard let raw = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+          let val = Int(raw), val >= 1 && val <= 65535 else {
+        return defaultPort
+    }
+    return val
+}
+
+func writeAwdlBridgePortFile(port: Int, stateDir: URL = STATE_DIR) {
+    guard (1...65535).contains(port) else { return }
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    guard let data = "\(port)\n".data(using: .utf8) else { return }
+    writeAtomicPrivateFile(data: data, to: stateDir.appendingPathComponent("awdl_bridge_port"))
+}
+
+func isAllowedAwdlInterfaceNames(_ names: [String]) -> Bool {
+    return names.contains { $0 == "awdl0" || $0.hasPrefix("awdl") }
+}
+
+func isAllowedAwdlEndpoint(_ endpoint: NWEndpoint?) -> Bool {
+    guard let ep = endpoint else { return true }
+    switch ep {
+    case .hostPort(let host, _):
+        switch host {
+        case .ipv4(_):
+            return false
+        case .ipv6(let addr):
+            if !addr.isLinkLocal { return false }
+            if let ifName = addr.interface?.name, !ifName.hasPrefix("awdl") {
+                return false
+            }
+            return true
+        case .name(_, let iface):
+            if let ifName = iface?.name, !ifName.hasPrefix("awdl") {
+                return false
+            }
+            return true
+        @unknown default:
+            return true
+        }
+    default:
+        return true
+    }
+}
+
+func readFinderProxySockPath(stateDir: URL = STATE_DIR) -> String {
+    let file = stateDir.appendingPathComponent("finder_proxy_sock")
+    if let raw = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+       !raw.isEmpty {
+        return raw
+    }
+    return stateDir.appendingPathComponent("finder_proxy.sock").path
 }
 
 func ensureLocalMacTlsCertFiles() {
@@ -341,22 +635,40 @@ func currentMacLanIp() -> String {
     guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return "" }
     defer { freeifaddrs(ifaddr) }
     let wifiIface = getWifiInterfaceName()
+    let activeCidr = loadActiveP2pSession()?.cidr
+    let rawSsid = currentRawWifiSsid()
+
+    func extractValidLanIpv4(_ ptr: UnsafeMutablePointer<ifaddrs>, rawWifiSsid: String? = nil) -> String? {
+        guard let sa = ptr.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else { return nil }
+        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 else {
+            return nil
+        }
+        let ip = String(cString: hostname)
+        guard isNormalWifiIpv4(ip, activeP2pCidr: activeCidr, rawWifiSsid: rawWifiSsid), !isCgnatIpv4(ip) else {
+            return nil
+        }
+        return ip
+    }
+
+    // Pass 1: prefer active Wi-Fi interface over secondary USB/Docker/virtual en* interfaces
     for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
         let flags = Int32(ptr.pointee.ifa_flags)
-        if (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) {
-            let name = String(cString: ptr.pointee.ifa_name)
-            if name == wifiIface || name.starts(with: "en") {
-                guard let sa = ptr.pointee.ifa_addr else { continue }
-                if sa.pointee.sa_family == UInt8(AF_INET) {
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 {
-                        let ip = String(cString: hostname)
-                        if !ip.starts(with: "192.168.49.") && !ip.starts(with: "127.") && !ip.starts(with: "169.254.") {
-                            return ip
-                        }
-                    }
-                }
-            }
+        guard (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) else { continue }
+        if String(cString: ptr.pointee.ifa_name) == wifiIface,
+           let ip = extractValidLanIpv4(ptr, rawWifiSsid: rawSsid) {
+            return ip
+        }
+    }
+
+    // Pass 2: fallback to other active physical en* Ethernet interfaces
+    for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+        let flags = Int32(ptr.pointee.ifa_flags)
+        guard (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) else { continue }
+        let name = String(cString: ptr.pointee.ifa_name)
+        if name != wifiIface && name.hasPrefix("en"),
+           let ip = extractValidLanIpv4(ptr) {
+            return ip
         }
     }
     return ""
@@ -619,7 +931,18 @@ func saveMacSettings(autoAccept: Bool, visible: Bool, deviceName: String, themeM
     }
 }
 
-func waitForMacUserAccept(senderName: String, fileNames: [String], totalBytes: Int64, forcePrompt: Bool = false) -> Bool {
+func isStreamAborted(_ stream: InputStream?) -> Bool {
+    guard let st = stream?.streamStatus else { return false }
+    return st == .atEnd || st == .closed || st == .error
+}
+
+func waitForMacUserAccept(
+    senderName: String,
+    fileNames: [String],
+    totalBytes: Int64,
+    forcePrompt: Bool = false,
+    isRemoteAborted: (() -> Bool)? = nil
+) -> Bool {
     let settings = loadMacSettings()
     if settings.autoAccept && !forcePrompt { return true }
 
@@ -651,6 +974,16 @@ func waitForMacUserAccept(senderName: String, fileNames: [String], totalBytes: I
 
     let deadline = Date().addingTimeInterval(60.0)
     while Date() < deadline {
+        if isTransferCancelled() {
+            writeProgressJson(active: false)
+            return false
+        }
+        if isRemoteAborted?() == true {
+            print("[BLE-Daemon] Incoming request cancelled by \(senderName) before acceptance")
+            fflush(stdout)
+            writeProgressJson(active: false)
+            return false
+        }
         if let d = try? Data(contentsOf: decFile),
            let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
            (obj["id"] as? String) == reqId {
@@ -679,7 +1012,18 @@ func clearCancelFlag() {
 let TX_LOCK_TTL_SECONDS: TimeInterval = 180.0
 let MAX_ENCRYPTED_BLE_ARCHIVE_BYTES = 30_000_000
 let BLE_RAW_PRECHECK_MAX_BYTES: Int64 = 120_000_000
+let BLE_AUTO_FALLBACK_MAX_RAW_BYTES: Int64 = 5_000_000
 let MAX_BLE_META_BYTES = 1_048_576
+
+func shouldAllowBleAutoFallback(fileCount: Int, totalRawBytes: Int64, txExitCode: Int32? = nil) -> Bool {
+    if let code = txExitCode, code == 43 || code == 44 || code == 45 || code == 46 {
+        return false
+    }
+    if fileCount > 0 && totalRawBytes > BLE_AUTO_FALLBACK_MAX_RAW_BYTES {
+        return false
+    }
+    return true
+}
 
 func writeTxInProgressLock(timestamp: TimeInterval = Date().timeIntervalSince1970) {
     let txLock = STATE_DIR.appendingPathComponent("tx_in_progress.lock")
@@ -724,7 +1068,7 @@ func resolveWarpCliPath() -> String? {
 
 /// Pauses Cloudflare WARP before associating `en0` with an offline `DIRECT-*` Wi-Fi Direct SSID.
 /// Without an explicit manual disconnect, WARP's Happy Eyeballs check times out at ~36s on offline P2P
-/// networks and activates its fail-closed base firewall (`catch all policy Deny`), dropping 192.168.49.0/24.
+/// networks and activates its fail-closed base firewall (`catch all policy Deny`), dropping offline P2P subnet traffic.
 /// Returns `true` if WARP is absent or cleanly disconnected; `false` if corporate MDM locked the WARP switch.
 func pauseCloudflareWarpIfNeeded() -> Bool {
     guard let warpCli = resolveWarpCliPath() else { return true }
@@ -778,6 +1122,16 @@ func keepCloudflareWarpPausedIfFlagged() {
     }
 }
 
+/// Enforces the WARP pause at most once per `interval` during P2P join/transfer wait loops
+/// because Always-On Zero Trust profiles can auto-reconnect WARP immediately on SSID change.
+func keepCloudflareWarpPausedPeriodically(lastChecked: inout Date, interval: TimeInterval = 2.5) {
+    let now = Date()
+    if now.timeIntervalSince(lastChecked) >= interval {
+        lastChecked = now
+        keepCloudflareWarpPausedIfFlagged()
+    }
+}
+
 func resumeCloudflareWarpIfNeeded() {
     guard FileManager.default.fileExists(atPath: WARP_PAUSED_FILE.path) else { return }
     defer { try? FileManager.default.removeItem(at: WARP_PAUSED_FILE) }
@@ -808,7 +1162,7 @@ func getWifiInterfaceName() -> String {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("Hardware Port:") {
             let portName = trimmed.replacingOccurrences(of: "Hardware Port:", with: "").trimmingCharacters(in: .whitespaces).lowercased()
-            isWifiPort = portName.contains("wi-fi") || portName.contains("airport")
+            isWifiPort = portName.contains("wi-fi") || portName.contains("wifi") || portName.contains("airport") || portName.contains("wlan")
         } else if isWifiPort && trimmed.hasPrefix("Device:") {
             let dev = trimmed.replacingOccurrences(of: "Device:", with: "").trimmingCharacters(in: .whitespaces)
             if !dev.isEmpty {
@@ -817,7 +1171,7 @@ func getWifiInterfaceName() -> String {
             }
         }
     }
-    _cachedWifiInterface = "en0"
+    // Do not permanently cache fallback "en0" when lookup fails
     return "en0"
 }
 
@@ -834,6 +1188,51 @@ func currentRawWifiSsid() -> String {
     let iface = getWifiInterfaceName()
     let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-getairportnetwork", iface])
     return parseAirportNetworkSsid(out)
+}
+
+func currentWifiRouterIp(on iface: String = getWifiInterfaceName()) -> String? {
+    let cleanIface = iface.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanIface.isEmpty else { return nil }
+
+    func validRouterCandidate(_ raw: String?) -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let v = parseIpv4Address(raw) else { return nil }
+        if (v & 0xFF00_0000) == 0 || v == 0xFFFF_FFFF { return nil }
+        if (v & 0xFF00_0000) == 0x7F00_0000 { return nil }
+        if (v & 0xF000_0000) == 0xE000_0000 { return nil }
+        return raw
+    }
+
+    if let store = SCDynamicStoreCreate(nil, "GlideDrop" as CFString, nil, nil),
+       let dict = SCDynamicStoreCopyValue(store, "State:/Network/Interface/\(cleanIface)/IPv4" as CFString) as? [String: Any],
+       let router = validRouterCandidate(dict["Router"] as? String) {
+        return router
+    }
+
+    let (rc, ipconfigOut) = runProcessCapture("/usr/sbin/ipconfig", ["getoption", cleanIface, "router"])
+    if rc == 0, let router = validRouterCandidate(ipconfigOut) {
+        return router
+    }
+
+    let (routeRc, routeOut) = runProcessCapture("/sbin/route", ["-n", "get", "default"])
+    if routeRc == 0 {
+        var routeIface: String?
+        var routeGateway: String?
+        for line in routeOut.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("interface:") {
+                routeIface = trimmed.replacingOccurrences(of: "interface:", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if trimmed.hasPrefix("gateway:") {
+                routeGateway = trimmed.replacingOccurrences(of: "gateway:", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        if routeIface == cleanIface, let router = validRouterCandidate(routeGateway) {
+            return router
+        }
+    }
+
+    return nil
 }
 
 func currentWifiSsid() -> String {
@@ -893,7 +1292,6 @@ func getWifiServiceName() -> String {
             }
         }
     }
-    _cachedWifiServiceName = "Wi-Fi"
     return "Wi-Fi"
 }
 
@@ -906,12 +1304,19 @@ struct ProxyEndpointConfig: Codable {
     let authenticated: Bool
 }
 
+struct AppliedProxyTarget: Codable {
+    let host: String
+    let port: Int
+    let cidr: String
+}
+
 struct SavedProxySettings: Codable {
     let service: String
     let socks: ProxyEndpointConfig
     let http: ProxyEndpointConfig
     let https: ProxyEndpointConfig
     let bypassDomains: [String]
+    let appliedTarget: AppliedProxyTarget?
 }
 
 func parseProxyOutput(_ output: String) -> ProxyEndpointConfig {
@@ -1020,21 +1425,63 @@ func isTcpPortReachable(host: String, port: Int, timeoutMs: Int = 200) -> Bool {
     return false
 }
 
-func enableMacInternetProxy(host: String = "192.168.49.1", port: Int = 1080) {
-    if host.starts(with: "192.168.49.") {
-        if currentWifiP2pIp().isEmpty {
-            print("[BLE-Daemon] No active 192.168.49.x Wi-Fi Direct IP — skipping proxy setup for \(host):\(port)")
-            fflush(stdout)
-            return
+func shouldClearFallbackP2pProxy(
+    _ cfg: ProxyEndpointConfig,
+    session: ActiveP2pSession?,
+    currentRouterIp: String? = nil
+) -> Bool {
+    if let s = session, !cfg.server.isEmpty {
+        if cfg.server == s.gatewayIp || (!s.cidr.isEmpty && cidrContains(cidr: s.cidr, ip: cfg.server)) {
+            return true
         }
-    } else if host != "127.0.0.1" && host != "::1" {
-        print("[BLE-Daemon] Non-P2P host \(host) — skipping macOS system proxy")
+    }
+    if let router = currentRouterIp?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !router.isEmpty,
+       !cfg.server.isEmpty {
+        if cfg.server == router {
+            return true
+        }
+        if let routerCidr = deriveIpv4Cidr(ip: router), cidrContains(cidr: routerCidr, ip: cfg.server) {
+            return true
+        }
+    }
+    if cfg.enabled && (cfg.server == "127.0.0.1" || cfg.server == "::1") {
+        let trackedPort = (session?.proxyPort ?? 0) > 0 ? session!.proxyPort : DEFAULT_PROXY_PORT
+        if cfg.port == DEFAULT_PROXY_PORT || cfg.port == trackedPort {
+            return true
+        }
+    }
+    return false
+}
+
+func enableMacInternetProxy(host: String, port: Int = DEFAULT_PROXY_PORT, cidr: String? = nil) {
+    let cleanHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanHost.isEmpty, port >= 1 && port <= 65535 else {
+        print("[BLE-Daemon] Cellular internet sharing disabled or invalid endpoint (\(cleanHost):\(port)) — skipping macOS system proxy")
         fflush(stdout)
         return
     }
+    let activeSession = loadActiveP2pSession()
+    let sessionCidr = (cidr?.isEmpty == false ? cidr! : nil)
+        ?? (activeSession?.cidr.isEmpty == false ? activeSession?.cidr : nil)
+        ?? deriveIpv4Cidr(ip: cleanHost)
+        ?? ""
+    let isLoopback = (cleanHost == "127.0.0.1" || cleanHost == "::1")
+    if !isLoopback {
+        guard isValidP2pGatewayIp(cleanHost) else {
+            print("[BLE-Daemon] Non-P2P host \(cleanHost) — skipping macOS system proxy")
+            fflush(stdout)
+            return
+        }
+        if currentWifiP2pIp(matchingGateway: cleanHost, matchingCidr: sessionCidr.isEmpty ? nil : sessionCidr).isEmpty {
+            print("[BLE-Daemon] No active P2P Wi-Fi Direct IP matching \(sessionCidr) — skipping proxy setup for \(cleanHost):\(port)")
+            fflush(stdout)
+            return
+        }
+    }
 
-    guard isTcpPortReachable(host: host, port: port, timeoutMs: 500) else {
-        print("[BLE-Daemon] Peer proxy \(host):\(port) unreachable or disabled — skipping macOS system proxy")
+    guard isTcpPortReachable(host: cleanHost, port: port, timeoutMs: 500) else {
+        print("[BLE-Daemon] Peer proxy \(cleanHost):\(port) unreachable or disabled — skipping macOS system proxy")
         fflush(stdout)
         return
     }
@@ -1055,7 +1502,8 @@ func enableMacInternetProxy(host: String = "192.168.49.1", port: Int = 1080) {
                 socks: parseProxyOutput(socksOut),
                 http: parseProxyOutput(httpOut),
                 https: parseProxyOutput(httpsOut),
-                bypassDomains: parseBypassDomainsOutput(bypassOut)
+                bypassDomains: parseBypassDomainsOutput(bypassOut),
+                appliedTarget: AppliedProxyTarget(host: cleanHost, port: port, cidr: sessionCidr)
             )
             if let data = try? JSONEncoder().encode(saved) {
                 try? data.write(to: PREV_PROXY_FILE, options: .atomic)
@@ -1065,7 +1513,12 @@ func enableMacInternetProxy(host: String = "192.168.49.1", port: Int = 1080) {
         }
 
         // 2. Configure proxy bypass domains: preserve user's existing bypass domains alongside P2P / local bypasses
-        var bypassList = ["192.168.49.0/24", "127.0.0.1", "*.local", "169.254/16"]
+        var bypassList: [String] = []
+        for entry in [sessionCidr, "localhost", "127.0.0.1", "::1", "*.local", "169.254/16"] {
+            if !entry.isEmpty && !bypassList.contains(entry) {
+                bypassList.append(entry)
+            }
+        }
         if let savedData = try? Data(contentsOf: PREV_PROXY_FILE),
            let savedObj = try? JSONDecoder().decode(SavedProxySettings.self, from: savedData) {
             for d in savedObj.bypassDomains {
@@ -1079,18 +1532,18 @@ func enableMacInternetProxy(host: String = "192.168.49.1", port: Int = 1080) {
         _ = runProcessCapture("/usr/sbin/networksetup", bypassArgs)
 
         // 3. Configure SOCKS5 proxy
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", service, host, String(port)])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", service, cleanHost, String(port)])
         _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", service, "on"])
 
         // 4. Configure Web (HTTP) proxy
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", service, host, String(port)])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", service, cleanHost, String(port)])
         _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", service, "on"])
 
         // 5. Configure Secure Web (HTTPS) proxy
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", service, host, String(port)])
+        _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", service, cleanHost, String(port)])
         _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", service, "on"])
 
-        print("[BLE-Daemon] Dual-Protocol embedded proxy active for \(service) -> \(host):\(port) (SOCKS5 + HTTP CONNECT/Forward)")
+        print("[BLE-Daemon] Dual-Protocol embedded proxy active for \(service) -> \(cleanHost):\(port) (SOCKS5 + HTTP CONNECT/Forward)")
         fflush(stdout)
     }
 }
@@ -1100,6 +1553,7 @@ func disableMacInternetProxy() {
         defer { proxyEnabledInCurrentProcess = false }
         let defaultService = getWifiServiceName()
         var targetService = defaultService
+        let activeSession = loadActiveP2pSession()
 
         if FileManager.default.fileExists(atPath: PREV_PROXY_FILE.path) {
             if let data = try? Data(contentsOf: PREV_PROXY_FILE),
@@ -1146,24 +1600,25 @@ func disableMacInternetProxy() {
             }
             try? FileManager.default.removeItem(at: PREV_PROXY_FILE)
         } else {
-            // Fallback: If no snapshot file exists, only clear stale P2P proxy state (never unrelated local proxies)
+            // Fallback: If no snapshot file exists, only clear stale tracked/P2P proxy state (never unrelated local proxies)
+            let fallbackRouterIp: String? = currentRawWifiSsid().hasPrefix("DIRECT-") ? currentWifiRouterIp(on: getWifiInterfaceName()) : nil
             let (_, socksOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsocksfirewallproxy", targetService])
             let socksCfg = parseProxyOutput(socksOut)
-            if socksCfg.server.starts(with: "192.168.49.") || (socksCfg.enabled && socksCfg.server == "127.0.0.1" && socksCfg.port == 1080) {
+            if shouldClearFallbackP2pProxy(socksCfg, session: activeSession, currentRouterIp: fallbackRouterIp) {
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxy", targetService, "", "0"])
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", targetService, "off"])
             }
 
             let (_, httpOut) = runProcessCapture("/usr/sbin/networksetup", ["-getwebproxy", targetService])
             let httpCfg = parseProxyOutput(httpOut)
-            if httpCfg.server.starts(with: "192.168.49.") || (httpCfg.enabled && httpCfg.server == "127.0.0.1" && httpCfg.port == 1080) {
+            if shouldClearFallbackP2pProxy(httpCfg, session: activeSession, currentRouterIp: fallbackRouterIp) {
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxy", targetService, "", "0"])
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setwebproxystate", targetService, "off"])
             }
 
             let (_, httpsOut) = runProcessCapture("/usr/sbin/networksetup", ["-getsecurewebproxy", targetService])
             let httpsCfg = parseProxyOutput(httpsOut)
-            if httpsCfg.server.starts(with: "192.168.49.") || (httpsCfg.enabled && httpsCfg.server == "127.0.0.1" && httpsCfg.port == 1080) {
+            if shouldClearFallbackP2pProxy(httpsCfg, session: activeSession, currentRouterIp: fallbackRouterIp) {
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxy", targetService, "", "0"])
                 _ = runProcessCapture("/usr/sbin/networksetup", ["-setsecurewebproxystate", targetService, "off"])
             }
@@ -1172,10 +1627,12 @@ func disableMacInternetProxy() {
 }
 
 func restoreMacInternetWifi(ssid: String = "DIRECT-") {
+    let activeSession = loadActiveP2pSession()
     disableMacInternetProxy()
     try? FileManager.default.removeItem(at: LAN_FALLBACK_FILE)
     try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
     clearP2pSessionTokens()
+    clearOutgoingP2pToken()
 
     let iface = getWifiInterfaceName()
     // 1. ALWAYS unconditionally remove any ephemeral P2P network from preferred list so macOS never stays stuck or reconnects to it
@@ -1188,6 +1645,9 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     }
 
     func wifiHasNormalIpv4() -> Bool {
+        let rawSsid = currentRawWifiSsid()
+        if rawSsid.hasPrefix("DIRECT-") { return false }
+        let sessionCidr = activeSession?.cidr ?? loadActiveP2pSession()?.cidr
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return false }
         defer { freeifaddrs(ifaddr) }
@@ -1201,8 +1661,7 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
                         var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                         if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 {
                             let ip = String(cString: hostname)
-                            if ip.starts(with: "192.168.49.") { return false }
-                            if ip.starts(with: "192.168.") || ip.starts(with: "10.") || ip.starts(with: "172.") {
+                            if isNormalWifiIpv4(ip, activeP2pCidr: sessionCidr, rawWifiSsid: rawSsid) {
                                 return true
                             }
                         }
@@ -1215,12 +1674,13 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
 
     // 2. Check if iface is already back on normal Wi-Fi or was never on P2P
     let curSsid = currentRawWifiSsid()
-    let onP2p = curSsid.hasPrefix("DIRECT-") || !currentWifiP2pIp().isEmpty
+    let onP2p = curSsid.hasPrefix("DIRECT-") || !currentWifiP2pIp(matchingGateway: activeSession?.gatewayIp, matchingCidr: activeSession?.cidr).isEmpty
     let savedSsid = (try? String(contentsOf: PREV_WIFI_FILE, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     if !onP2p && (wifiHasNormalIpv4() || savedSsid.isEmpty) {
         print("[BLE-Daemon] \(iface) already on normal Wi-Fi ('\(curSsid)'). P2P cleanup completed.")
         fflush(stdout)
         try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
+        clearActiveP2pSession()
         resumeCloudflareWarpIfNeeded()
         return
     }
@@ -1229,6 +1689,7 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
         print("[BLE-Daemon] \(iface) connected to normal Wi-Fi. P2P removed from preferred list.")
         fflush(stdout)
         try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
+        clearActiveP2pSession()
         resumeCloudflareWarpIfNeeded()
         return
     }
@@ -1263,6 +1724,7 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     }
 
     try? FileManager.default.removeItem(at: PREV_WIFI_FILE)
+    clearActiveP2pSession()
     resumeCloudflareWarpIfNeeded()
     print("[BLE-Daemon] Wi-Fi restored and auto-reassociation completed.")
     fflush(stdout)
@@ -1510,37 +1972,333 @@ func writeAll(
 private let wp2pJoinLock = NSLock()
 private var wp2pJoinActive = false
 
-func currentWifiP2pIp() -> String {
-    var ifaddr: UnsafeMutablePointer<ifaddrs>?
-    guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return "" }
-    defer { freeifaddrs(ifaddr) }
-    let wifiIface = getWifiInterfaceName()
-    for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-        let flags = Int32(ptr.pointee.ifa_flags)
-        if (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) {
-            let name = String(cString: ptr.pointee.ifa_name)
-            if name == wifiIface {
-                guard let sa = ptr.pointee.ifa_addr else { continue }
-                if sa.pointee.sa_family == UInt8(AF_INET) {
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 {
-                        let ip = String(cString: hostname)
-                        if ip.starts(with: "192.168.49.") {
-                            return ip
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return ""
+struct ParsedWp2pJoinPayload: Equatable {
+    let ssid: String
+    let pass: String
+    let goIp: String
+    let proxyPort: Int
+    let isV2: Bool
 }
 
-func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerName: String? = nil, sessionToken: String? = nil) {
+func parseWp2pJoinCredentials(_ decStr: String) -> ParsedWp2pJoinPayload? {
+    let parts = decStr.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+    guard parts.count >= 2 else { return nil }
+    let ssid = parts[0]
+    let pass = parts[1]
+    guard !ssid.isEmpty, !pass.isEmpty else { return nil }
+    let isV2 = parts.count >= 4
+    let rawGo = parts.count >= 3 ? parts[2].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    let goIp = isValidP2pGatewayIp(rawGo) ? rawGo : ""
+    let rawProxy = parts.count >= 4 ? (Int(parts[3].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0
+    let proxyPort = (1...65535).contains(rawProxy) ? rawProxy : 0
+    return ParsedWp2pJoinPayload(ssid: ssid, pass: pass, goIp: goIp, proxyPort: proxyPort, isV2: isV2)
+}
+
+func formatWp2pJoinReply(macIp: String, isV2: Bool, macRxPort: Int, udpKeepalivePort: Int) -> String {
+    if isV2 {
+        return "OK \(macIp)\t\(macRxPort)\t\(udpKeepalivePort)\n"
+    }
+    return "OK \(macIp)\n"
+}
+
+func matchWifiP2pInterfaceAddress(
+    ip: String,
+    netmask: String?,
+    rawSsidIsDirect: Bool,
+    matchingGateway: String? = nil,
+    matchingCidr: String? = nil,
+    activeSession: ActiveP2pSession? = nil
+) -> (ip: String, cidr: String)? {
+    let targetGateway = matchingGateway?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let cleanMatchingCidr = matchingCidr?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let fallbackGateway = (targetGateway?.isEmpty == false ? targetGateway : activeSession?.gatewayIp)
+    let explicitTarget = (cleanMatchingCidr?.isEmpty == false) || (targetGateway?.isEmpty == false)
+    let sessionMatchesTargetGateway = (targetGateway?.isEmpty != false) || (activeSession?.gatewayIp == targetGateway)
+    let expectedCidr: String? = (cleanMatchingCidr?.isEmpty == false ? cleanMatchingCidr : nil)
+        ?? (sessionMatchesTargetGateway && activeSession?.cidr.isEmpty == false ? activeSession?.cidr : nil)
+        ?? (fallbackGateway.flatMap { deriveIpv4Cidr(ip: $0) })
+
+    var actualCidr: String? = nil
+    var actualPrefix: Int? = nil
+    if let maskStr = netmask,
+       let prefix = prefixLengthFromIpv4Netmask(maskStr),
+       let derived = deriveIpv4Cidr(ip: ip, prefixLen: prefix) {
+        actualCidr = derived
+        actualPrefix = prefix
+    }
+    guard let resolvedCidr = actualCidr ?? expectedCidr ?? deriveIpv4Cidr(ip: ip) else {
+        return nil
+    }
+    if let prefix = actualPrefix,
+       let netCidr = actualCidr,
+       let gw = fallbackGateway,
+       !gw.isEmpty {
+        if ip != gw &&
+           (prefix >= 22 || rawSsidIsDirect) &&
+           cidrContains(cidr: netCidr, ip: gw) &&
+           isValidP2pGatewayIp(ip) {
+            return (ip, netCidr)
+        }
+        if !cidrContains(cidr: netCidr, ip: gw) {
+            if !explicitTarget && rawSsidIsDirect && isValidP2pGatewayIp(ip) && !isCgnatIpv4(ip) {
+                return (ip, netCidr)
+            }
+            return nil
+        }
+    }
+    if let expected = expectedCidr,
+       ip != fallbackGateway,
+       cidrContains(cidr: expected, ip: ip) {
+        return (ip, resolvedCidr)
+    }
+    if !explicitTarget && rawSsidIsDirect && isValidP2pGatewayIp(ip) && !isCgnatIpv4(ip) {
+        return (ip, resolvedCidr)
+    }
+    return nil
+}
+
+func currentWifiP2pAddressAndCidr(matchingGateway: String? = nil, matchingCidr: String? = nil) -> (ip: String, cidr: String)? {
+    var ifaddr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
+    defer { freeifaddrs(ifaddr) }
+    let wifiIface = getWifiInterfaceName()
+    let activeSession = loadActiveP2pSession()
+    let rawSsidIsDirect = currentRawWifiSsid().hasPrefix("DIRECT-")
+
+    for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+        let flags = Int32(ptr.pointee.ifa_flags)
+        guard (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) else { continue }
+        let name = String(cString: ptr.pointee.ifa_name)
+        guard name == wifiIface,
+              let sa = ptr.pointee.ifa_addr,
+              sa.pointee.sa_family == UInt8(AF_INET) else { continue }
+        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 else {
+            continue
+        }
+        let ip = String(cString: hostname)
+        var netmaskStr: String? = nil
+        if let maskSa = ptr.pointee.ifa_netmask, maskSa.pointee.sa_family == UInt8(AF_INET) {
+            var maskBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(maskSa, socklen_t(maskSa.pointee.sa_len), &maskBuf, socklen_t(maskBuf.count), nil, 0, NI_NUMERICHOST) == 0 {
+                netmaskStr = String(cString: maskBuf)
+            }
+        }
+        if let matched = matchWifiP2pInterfaceAddress(
+            ip: ip,
+            netmask: netmaskStr,
+            rawSsidIsDirect: rawSsidIsDirect,
+            matchingGateway: matchingGateway,
+            matchingCidr: matchingCidr,
+            activeSession: activeSession
+        ) {
+            return matched
+        }
+    }
+    return nil
+}
+
+func currentWifiP2pIp(matchingGateway: String? = nil, matchingCidr: String? = nil) -> String {
+    return currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway, matchingCidr: matchingCidr)?.ip ?? ""
+}
+
+@discardableResult
+func waitForLanFallbackSession(
+    stateDir: URL = STATE_DIR,
+    initialStartTimeout: TimeInterval = 30.0,
+    idleTimeout: TimeInterval = 40.0,
+    maxDuration: TimeInterval = 180.0,
+    pollInterval: TimeInterval = 0.5
+) -> Bool {
+    let uploadDoneFile = stateDir.appendingPathComponent("upload_completed.flag")
+    let askFile = stateDir.appendingPathComponent("pending_ask.json")
+    let txFile = stateDir.appendingPathComponent("transfer_progress.json")
+    let startAt = Date()
+    let startDeadline = startAt.addingTimeInterval(initialStartTimeout)
+    var transferDetected = false
+
+    while Date() < startDeadline {
+        if isTransferCancelled() {
+            writeProgressJson(active: false)
+            return false
+        }
+        if FileManager.default.fileExists(atPath: uploadDoneFile.path) {
+            try? FileManager.default.removeItem(at: uploadDoneFile)
+            return true
+        }
+        let detected = autoreleasepool { () -> Bool in
+            if FileManager.default.fileExists(atPath: askFile.path) ||
+                hasActiveTcpReceiverConnection() {
+                return true
+            }
+            let now = Date().timeIntervalSince1970
+            if let data = try? Data(contentsOf: txFile),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let active = obj["active"] as? Bool, active,
+               let updatedAt = obj["updatedAt"] as? Double,
+               (now - updatedAt) < 30.0 {
+                return true
+            }
+            return false
+        }
+        if detected {
+            transferDetected = true
+            break
+        }
+        Thread.sleep(forTimeInterval: pollInterval)
+    }
+
+    if !transferDetected {
+        return false
+    }
+
+    var lastActivity = Date()
+    let maxDeadline = startAt.addingTimeInterval(maxDuration)
+    while Date() < maxDeadline {
+        if isTransferCancelled() {
+            writeProgressJson(active: false)
+            return false
+        }
+        if FileManager.default.fileExists(atPath: uploadDoneFile.path) {
+            try? FileManager.default.removeItem(at: uploadDoneFile)
+            return true
+        }
+        let isBusy = autoreleasepool { () -> Bool in
+            if FileManager.default.fileExists(atPath: askFile.path) || hasActiveTcpReceiverConnection() {
+                return true
+            }
+            let now = Date().timeIntervalSince1970
+            if let data = try? Data(contentsOf: txFile),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let active = obj["active"] as? Bool, active,
+               let updatedAt = obj["updatedAt"] as? Double {
+                return (now - updatedAt) < 30.0
+            }
+            return false
+        }
+        if isBusy {
+            lastActivity = Date()
+        } else if Date().timeIntervalSince(lastActivity) > idleTimeout {
+            return false
+        }
+        Thread.sleep(forTimeInterval: pollInterval)
+    }
+    return false
+}
+
+/// Attempts one association pass to an ephemeral Wi-Fi Direct SoftAP. Returns true if the OS
+/// accepted the join request (even though DHCP may still take a moment to assign a P2P IP).
+func joinWifiDirectNetwork(iface: String, ssid: String, pass: String, logPrefix: String, attempt: Int = 1) -> Bool {
+    let (joinRc, joinOut) = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", iface, ssid, pass])
+    let cleanJoinOut = joinOut.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lowerOut = cleanJoinOut.lowercased()
+    let notFound = lowerOut.contains("could not find") || lowerOut.contains("failed") || lowerOut.contains("error")
+    if joinRc == 0 && !notFound {
+        if !cleanJoinOut.isEmpty {
+            print("\(logPrefix) networksetup join \(ssid) on \(iface) (attempt \(attempt)): \(cleanJoinOut)")
+            fflush(stdout)
+        }
+        return true
+    }
+    print("\(logPrefix) networksetup join \(ssid) on \(iface) (attempt \(attempt)) rc=\(joinRc)\(cleanJoinOut.isEmpty ? "" : ": \(cleanJoinOut)")")
+    fflush(stdout)
+
+    // Actively scan via CoreWLAN to warm macOS channel cache when SoftAP beacons are newly started
+    if let cwIface = CWWiFiClient.shared().interface(withName: iface) ?? CWWiFiClient.shared().interface() {
+        do {
+            let nets = try cwIface.scanForNetworks(withName: ssid)
+            if let targetNet = nets.max(by: { $0.rssiValue < $1.rssiValue }) {
+                try cwIface.associate(to: targetNet, password: pass)
+                print("\(logPrefix) CoreWLAN associated to \(ssid) (ch \(targetNet.wlanChannel?.channelNumber ?? 0))")
+                fflush(stdout)
+                return true
+            }
+            print("\(logPrefix) CoreWLAN scan found 0 networks for \(ssid) (attempt \(attempt))")
+            fflush(stdout)
+        } catch {
+            print("\(logPrefix) CoreWLAN scan/join assist failed for \(ssid) (attempt \(attempt)): \(error.localizedDescription)")
+            fflush(stdout)
+        }
+    }
+    return false
+}
+
+/// Joins an ephemeral Wi-Fi Direct SoftAP and waits for DHCP to assign an IP matching the group,
+/// retrying join attempts when freshly started SoftAP beacons are not yet visible to macOS.
+func associateWifiDirectWithRetry(
+    iface: String,
+    ssid: String,
+    pass: String,
+    matchingGateway: String?,
+    timeout: TimeInterval = 25.0,
+    logPrefix: String,
+    lastWarpCheck: inout Date,
+    isAborted: (() -> Bool)? = nil,
+    onTick: () -> Void
+) -> (ip: String, cidr: String)? {
+    if let existing = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway), !existing.ip.isEmpty {
+        return existing
+    }
+
+    let deadline = Date().addingTimeInterval(timeout)
+    var lastProgressTouch = Date()
+    var lastJoinAttemptAt = Date.distantPast
+    var attempt = 0
+    var joinAccepted = false
+
+    while Date() < deadline {
+        if isTransferCancelled() || (isAborted?() == true) { break }
+        keepCloudflareWarpPausedPeriodically(lastChecked: &lastWarpCheck)
+        if let resolved = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway), !resolved.ip.isEmpty {
+            return resolved
+        }
+
+        let retryCooldown: TimeInterval = joinAccepted ? 5.0 : 1.5
+        if Date().timeIntervalSince(lastJoinAttemptAt) >= retryCooldown {
+            attempt += 1
+            lastJoinAttemptAt = Date()
+            joinAccepted = joinWifiDirectNetwork(iface: iface, ssid: ssid, pass: pass, logPrefix: logPrefix, attempt: attempt)
+            keepCloudflareWarpPausedPeriodically(lastChecked: &lastWarpCheck, interval: 0.5)
+            if let resolved = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway), !resolved.ip.isEmpty {
+                return resolved
+            }
+        }
+
+        if Date().timeIntervalSince(lastProgressTouch) >= 2.0 {
+            lastProgressTouch = Date()
+            onTick()
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+    }
+
+    return currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway)
+}
+
+func handleIncomingWp2pJoin(
+    ssid: String,
+    pass: String,
+    out: OutputStream,
+    goIp: String = "",
+    proxyPort: Int = 0,
+    isV2Join: Bool = false,
+    peerName: String? = nil,
+    sessionToken: String? = nil,
+    inp: InputStream? = nil,
+    isRemoteDisconnected: (() -> Bool)? = nil
+) {
+    let suppliedGoIp = isValidP2pGatewayIp(goIp) ? goIp.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    let effectiveProxyPort = (1...65535).contains(proxyPort) ? proxyPort : 0
+    let macRxPort = readPortFile("mac_rx_port", defaultPort: DEFAULT_MAC_RX_PORT)
+    let udpKeepalivePort = readPortFile("awdl_bridge_port", defaultPort: Int(DEFAULT_AWDL_BRIDGE_PORT))
+    let isRemoteAbortedNow: () -> Bool = {
+        isStreamAborted(inp) || (isRemoteDisconnected?() ?? false)
+    }
+
     func revokeCurrentSessionToken() {
         if let tok = sessionToken {
             revokeP2pSessionToken(tok)
         }
+        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
     }
     guard ssid.hasPrefix("DIRECT-"), !pass.isEmpty else {
         print("[BLE-Daemon] Rejected invalid WP2P request: SSID '\(ssid)' does not start with DIRECT-")
@@ -1548,23 +2306,32 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
     }
+    if isV2Join && suppliedGoIp.isEmpty {
+        print("[BLE-Daemon] Rejected v2 WP2P request for \(ssid): missing valid GO IP")
+        revokeCurrentSessionToken()
+        _ = writeAll(out, data: Data("ERR\n".utf8))
+        return
+    }
 
     wp2pJoinLock.lock()
     if wp2pJoinActive {
-        let existingIp = currentWifiP2pIp()
+        let existingIp = currentWifiP2pIp(matchingGateway: suppliedGoIp.isEmpty ? nil : suppliedGoIp)
         wp2pJoinLock.unlock()
         if !existingIp.isEmpty {
             print("[BLE-Daemon] Reusing in-flight 5GHz P2P session at \(existingIp)")
             fflush(stdout)
-            _ = writeAll(out, data: Data("OK \(existingIp)\n".utf8))
+            let reply = formatWp2pJoinReply(macIp: existingIp, isV2: isV2Join, macRxPort: macRxPort, udpKeepalivePort: udpKeepalivePort)
+            _ = writeAll(out, data: Data(reply.utf8))
             return
         }
         // Wait briefly for in-flight join to finish obtaining DHCP
         let waitJoin = Date().addingTimeInterval(8.0)
         while Date() < waitJoin {
-            let ip = currentWifiP2pIp()
+            if isTransferCancelled() || isRemoteAbortedNow() { break }
+            let ip = currentWifiP2pIp(matchingGateway: suppliedGoIp.isEmpty ? nil : suppliedGoIp)
             if !ip.isEmpty {
-                _ = writeAll(out, data: Data("OK \(ip)\n".utf8))
+                let reply = formatWp2pJoinReply(macIp: ip, isV2: isV2Join, macRxPort: macRxPort, udpKeepalivePort: udpKeepalivePort)
+                _ = writeAll(out, data: Data(reply.utf8))
                 return
             }
             Thread.sleep(forTimeInterval: 0.25)
@@ -1587,11 +2354,9 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     let incomingPeerName = peerName ?? (loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Nearby Device")
     clearCancelFlag()
 
-    // Gate incoming WP2P join behind user confirmation/authorization
-    let settings = loadMacSettings()
-    let autoAccept = settings.autoAccept
-    if !autoAccept && !waitForMacUserAccept(senderName: incomingPeerName, fileNames: ["5 GHz Wi-Fi Direct Connection (\(ssid))"], totalBytes: 0, forcePrompt: false) {
-        print("[BLE-Daemon] User declined incoming WP2P connection request from \(incomingPeerName)")
+    // Gate incoming WP2P join behind mandatory explicit user confirmation even when autoAccept is enabled
+    if !waitForMacUserAccept(senderName: incomingPeerName, fileNames: ["5 GHz Wi-Fi Direct Connection (\(ssid))"], totalBytes: 0, forcePrompt: true, isRemoteAborted: isRemoteAbortedNow) {
+        print("[BLE-Daemon] User declined or sender cancelled incoming WP2P connection request from \(incomingPeerName)")
         revokeCurrentSessionToken()
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
@@ -1612,17 +2377,31 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
     try? FileManager.default.removeItem(at: uploadDoneFile)
 
     // Pause Cloudflare WARP before associating en0 to offline DIRECT-* P2P so WARP's 36s Happy Eyeballs
-    // fail-closed firewall never drops 192.168.49.0/24 traffic mid-transfer.
+    // fail-closed firewall never drops P2P subnet traffic mid-transfer.
     let warpCleared = pauseCloudflareWarpIfNeeded()
     if !warpCleared {
         let lanIp = currentMacLanIp()
-        if !lanIp.isEmpty {
-            try? String(Date().timeIntervalSince1970).write(to: LAN_FALLBACK_FILE, atomically: true, encoding: .utf8)
-            print("[BLE-Daemon] WARP switch locked; keeping Wi-Fi on LAN (\(lanIp)) for Split-Tunnel transfer")
+        if lanIp.isEmpty {
+            print("[BLE-Daemon] WARP switch locked and no LAN IP available — aborting WP2P join")
             fflush(stdout)
-            _ = writeAll(out, data: Data("OK \(lanIp)\n".utf8))
+            revokeCurrentSessionToken()
+            _ = writeAll(out, data: Data("ERR\n".utf8))
             return
         }
+        try? String(Date().timeIntervalSince1970).write(to: LAN_FALLBACK_FILE, atomically: true, encoding: .utf8)
+        defer {
+            try? FileManager.default.removeItem(at: LAN_FALLBACK_FILE)
+        }
+        print("[BLE-Daemon] WARP switch locked; keeping Wi-Fi on LAN (\(lanIp)) for Split-Tunnel transfer")
+        fflush(stdout)
+        let reply = formatWp2pJoinReply(macIp: lanIp, isV2: isV2Join, macRxPort: macRxPort, udpKeepalivePort: udpKeepalivePort)
+        guard writeAll(out, data: Data(reply.utf8)) else {
+            revokeCurrentSessionToken()
+            return
+        }
+        _ = waitForLanFallbackSession()
+        revokeCurrentSessionToken()
+        return
     }
 
     saveCurrentWifiSsid()
@@ -1636,43 +2415,73 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         peerName: incomingPeerName,
         isConnecting: true
     )
-    print("[BLE-Daemon] Incoming WP2P 5GHz Wi-Fi Direct request: joining \(ssid)...")
+    print("[BLE-Daemon] Incoming WP2P 5GHz Wi-Fi Direct request: joining \(ssid)\(suppliedGoIp.isEmpty ? "" : " (GO \(suppliedGoIp))")...")
     fflush(stdout)
 
     let wifiIface = getWifiInterfaceName()
-    var macP2pIp = currentWifiP2pIp()
-    if macP2pIp.isEmpty {
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
-
-        let deadline = Date().addingTimeInterval(25.0)
-        var lastProgressTouch = Date()
-        while Date() < deadline {
-            if isTransferCancelled() { break }
-            macP2pIp = currentWifiP2pIp()
-            if !macP2pIp.isEmpty { break }
-            if Date().timeIntervalSince(lastProgressTouch) >= 2.0 {
-                lastProgressTouch = Date()
-                writeProgressJson(
-                    active: true,
-                    direction: "Receiving",
-                    fileName: "Incoming transfer",
-                    fileCount: 1,
-                    percent: 0,
-                    phase: "Joining 5 GHz Wi-Fi Direct (\(ssid))…",
-                    peerName: incomingPeerName,
-                    isConnecting: true
-                )
-            }
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        macP2pIp = currentWifiP2pIp()
+    let matchGwArg: String? = suppliedGoIp.isEmpty ? nil : suppliedGoIp
+    var lastWarpCheck = Date()
+    let resolvedP2p = associateWifiDirectWithRetry(
+        iface: wifiIface,
+        ssid: ssid,
+        pass: pass,
+        matchingGateway: matchGwArg,
+        timeout: 25.0,
+        logPrefix: "[BLE-Daemon]",
+        lastWarpCheck: &lastWarpCheck,
+        isAborted: isRemoteAbortedNow
+    ) {
+        writeProgressJson(
+            active: true,
+            direction: "Receiving",
+            fileName: "Incoming transfer",
+            fileCount: 1,
+            percent: 0,
+            phase: "Joining 5 GHz Wi-Fi Direct (\(ssid))…",
+            peerName: incomingPeerName,
+            isConnecting: true
+        )
     }
 
-    if isTransferCancelled() || macP2pIp.isEmpty {
+    guard !isTransferCancelled(), !isRemoteAbortedNow(), let joined = resolvedP2p, !joined.ip.isEmpty else {
         writeProgressJson(active: false)
         restoreMacInternetWifi(ssid: ssid)
+        revokeCurrentSessionToken()
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
+    }
+    var effectiveGoIp = suppliedGoIp
+    if effectiveGoIp.isEmpty {
+        let routerDeadline = Date().addingTimeInterval(2.0)
+        while Date() < routerDeadline {
+            if let discovered = currentWifiRouterIp(on: wifiIface), isValidP2pGatewayIp(discovered) {
+                effectiveGoIp = discovered
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+    }
+    guard isValidP2pGatewayIp(effectiveGoIp) else {
+        print("[BLE-Daemon] Joined \(ssid) at \(joined.ip) but OS did not report a valid P2P gateway router — failing closed")
+        fflush(stdout)
+        writeProgressJson(active: false)
+        restoreMacInternetWifi(ssid: ssid)
+        revokeCurrentSessionToken()
+        _ = writeAll(out, data: Data("ERR\n".utf8))
+        return
+    }
+    let macP2pIp = joined.ip
+    let sessionCidr = joined.cidr
+    writeActiveP2pSession(
+        gatewayIp: effectiveGoIp,
+        cidr: sessionCidr,
+        httpsPort: 8771,
+        proxyPort: effectiveProxyPort,
+        macRxPort: macRxPort,
+        udpKeepalivePort: udpKeepalivePort
+    )
+    if let tok = sessionToken {
+        writeOutgoingP2pToken(tok, host: effectiveGoIp, port: 8771)
     }
 
     writeProgressJson(
@@ -1685,11 +2494,14 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         peerName: incomingPeerName,
         isConnecting: true
     )
-    print("[BLE-Daemon] Joined \(ssid) at \(macP2pIp), signaling peer...")
+    print("[BLE-Daemon] Joined \(ssid) at \(macP2pIp) (cidr=\(sessionCidr)), signaling peer...")
     fflush(stdout)
-    enableMacInternetProxy(host: "192.168.49.1", port: 1080)
-    if !writeAll(out, data: Data("OK \(macP2pIp)\n".utf8)) {
-        print("[BLE-Daemon] Warning: BLE L2CAP reply stream closed while sending OK \(macP2pIp); waiting briefly for TCP fallback")
+    if effectiveProxyPort > 0 {
+        enableMacInternetProxy(host: effectiveGoIp, port: effectiveProxyPort, cidr: sessionCidr)
+    }
+    let okReply = formatWp2pJoinReply(macIp: macP2pIp, isV2: isV2Join, macRxPort: macRxPort, udpKeepalivePort: udpKeepalivePort)
+    if !writeAll(out, data: Data(okReply.utf8)) {
+        print("[BLE-Daemon] Warning: BLE L2CAP reply stream closed while sending \(okReply.trimmingCharacters(in: .whitespacesAndNewlines)); waiting briefly for TCP fallback")
         fflush(stdout)
     }
 
@@ -1709,6 +2521,7 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
             try? FileManager.default.removeItem(at: authSessionFile)
             return
         }
+        keepCloudflareWarpPausedPeriodically(lastChecked: &lastWarpCheck)
         let detected = autoreleasepool { () -> Bool in
             if FileManager.default.fileExists(atPath: askFile.path) ||
                hasActiveTcpReceiverConnection() {
@@ -1724,6 +2537,14 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         if detected {
             transferDetected = true
             break
+        }
+        if isRemoteAbortedNow() {
+            print("[BLE-Daemon] Sender cancelled/disconnected before HTTPS handshake — restoring Wi-Fi")
+            fflush(stdout)
+            writeProgressJson(active: false)
+            restoreMacInternetWifi(ssid: ssid)
+            try? FileManager.default.removeItem(at: authSessionFile)
+            return
         }
         if Date().timeIntervalSince(lastPhase1ProgressTouch) >= 2.0 {
             lastPhase1ProgressTouch = Date()
@@ -1749,11 +2570,10 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
         return
     }
 
-    // Phase 2: Transfer is active. Keep link alive until completion or prolonged silence.
-    var idleCount = 0
+    // Phase 2: Transfer is active. Keep link alive until completion or peer disconnect/cancel.
+    var sawTransferActivity = false
     var lastActivity = Date()
     var lastKeepAlivePing = Date.distantPast
-    var lastWarpCheck = Date()
     var uploadCompleted = false
 
     while true {
@@ -1766,14 +2586,11 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
             if Date().timeIntervalSince(lastKeepAlivePing) >= 2.0 {
                 lastKeepAlivePing = Date()
                 DispatchQueue.global(qos: .utility).async {
-                    _ = runProcessCapture("/sbin/ping", ["-c", "1", "-t", "1", "-W", "500", "192.168.49.1"])
+                    _ = runProcessCapture("/sbin/ping", ["-c", "1", "-t", "1", "-W", "500", effectiveGoIp])
                 }
             }
 
-            if Date().timeIntervalSince(lastWarpCheck) >= 8.0 {
-                lastWarpCheck = Date()
-                keepCloudflareWarpPausedIfFlagged()
-            }
+            keepCloudflareWarpPausedPeriodically(lastChecked: &lastWarpCheck)
 
             if FileManager.default.fileExists(atPath: uploadDoneFile.path) {
                 try? FileManager.default.removeItem(at: uploadDoneFile)
@@ -1798,12 +2615,15 @@ func handleIncomingWp2pJoin(ssid: String, pass: String, out: OutputStream, peerN
             let isActiveTcp = hasActiveTcpReceiverConnection()
 
             if isAsk || isProgressActive || isActiveTcp {
+                if isProgressActive || isActiveTcp {
+                    sawTransferActivity = true
+                }
                 lastActivity = Date()
-                idleCount = 0
-            } else if Date().timeIntervalSince(lastActivity) > 30.0 {
-                idleCount += 1
-                if idleCount >= 20 {
-                    print("[BLE-Daemon] Transfer stream ended (idle timeout) — restoring Wi-Fi")
+            } else {
+                let quietFor = Date().timeIntervalSince(lastActivity)
+                let idleThreshold: TimeInterval = isRemoteAbortedNow() ? 1.5 : (sawTransferActivity ? 3.5 : 8.0)
+                if quietFor >= idleThreshold {
+                    print("[BLE-Daemon] Transfer stream ended (quiet=\(String(format: "%.1f", quietFor))s, remoteAborted=\(isRemoteAbortedNow())) — restoring Wi-Fi")
                     fflush(stdout)
                     return true
                 }
@@ -2115,10 +2935,17 @@ func buildEncryptedBleFallbackFrame(
     )
 }
 
-func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
-    let downloads = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
+@discardableResult
+func extractDvzipCpioToDownloads(
+    archiveData: Data,
+    metaDict: [String: Any],
+    downloadsDir: URL? = nil,
+    maxDecompressedBytes: Int = 100_000_000
+) -> Bool {
+    let downloads = downloadsDir ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
     let sender = (metaDict["SenderComputerName"] as? String) ?? "Android Peer"
 
+    var handledUrls = 0
     if let items = metaDict["Items"] as? [Any] {
         for item in items {
             if let s = item as? String,
@@ -2134,6 +2961,7 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                     pb.setString(s, forType: .string)
                 }
                 safeMacNotification(message: "\(s)\n(Copied to clipboard)", title: "GlideDrop link from \(sender)")
+                handledUrls += 1
             }
         }
     }
@@ -2141,22 +2969,82 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
     var savedFiles: [String] = []
     if !archiveData.isEmpty {
         let tmpBin = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("glidedrop_ble_\(UUID().uuidString).dvzip")
-        try? archiveData.write(to: tmpBin)
+        do {
+            try archiveData.write(to: tmpBin)
+        } catch {
+            return false
+        }
+        defer { try? FileManager.default.removeItem(at: tmpBin) }
         let py = Process()
         py.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         py.arguments = [
             "-c",
             """
-            import gzip, io, os, struct, sys, zlib
+            import gzip, io, os, shutil, struct, sys, zlib
             from pathlib import Path
 
+            MAX_DECOMP = int(sys.argv[3])
+            MIN_FREE_HEADROOM = 10_000_000
+
+            class BoundedGzipReader:
+                def __init__(self, gz_file, max_out):
+                    self.gz = gz_file
+                    self.max_out = max_out
+                    self.total = 0
+
+                def read(self, n=-1):
+                    if n == 0:
+                        return b""
+                    if n < 0:
+                        n = 1_048_576
+                    remaining = self.max_out - self.total
+                    step = min(n, max(1, remaining + 1))
+                    data = self.gz.read(step)
+                    self.total += len(data)
+                    if self.total > self.max_out:
+                        raise ValueError("Decompressed gzip stream exceeds limit")
+                    return data
+
             class DvzipReader(io.RawIOBase):
-                def __init__(self, raw):
+                def __init__(self, raw, max_out):
                     self.raw = raw
+                    self.max_out = max_out
+                    self.total_out = 0
                     self.buf = bytearray()
                     self.eof = False
                     self.cur_stored = False
                     self.cur_rem = 0
+                    self.decompressor = None
+
+                def _append_out(self, data):
+                    if not data:
+                        return
+                    self.total_out += len(data)
+                    if self.total_out > self.max_out:
+                        raise ValueError("Decompressed DVZip stream exceeds limit")
+                    self.buf.extend(data)
+
+                def _decompress_chunk(self, chunk):
+                    remaining = self.max_out - self.total_out
+                    cap = min(1_048_576, max(1, remaining + 1))
+                    out = self.decompressor.decompress(chunk, max_length=cap)
+                    self._append_out(out)
+                    while self.decompressor.unconsumed_tail:
+                        remaining = self.max_out - self.total_out
+                        cap = min(1_048_576, max(1, remaining + 1))
+                        out = self.decompressor.decompress(self.decompressor.unconsumed_tail, max_length=cap)
+                        if not out and not self.decompressor.unconsumed_tail:
+                            break
+                        self._append_out(out)
+                        if not out and self.decompressor.unconsumed_tail:
+                            break
+
+                def _flush_decomp(self):
+                    if self.decompressor is None:
+                        return
+                    remaining = self.max_out - self.total_out
+                    cap = min(1_048_576, max(1, remaining + 1))
+                    self._append_out(self.decompressor.flush(cap))
                     self.decompressor = None
 
                 def readinto(self, b):
@@ -2164,31 +3052,27 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                         if self.cur_rem > 0:
                             chunk = self.raw.read(min(65536, self.cur_rem))
                             if not chunk:
-                                self.eof = True
-                                break
+                                raise EOFError("Truncated DVZip block")
                             self.cur_rem -= len(chunk)
                             if self.cur_stored:
-                                self.buf.extend(chunk)
+                                self._append_out(chunk)
                             else:
                                 if self.decompressor is None:
                                     self.decompressor = zlib.decompressobj()
-                                self.buf.extend(self.decompressor.decompress(chunk))
+                                self._decompress_chunk(chunk)
                                 if self.cur_rem == 0:
-                                    self.buf.extend(self.decompressor.flush())
-                                    self.decompressor = None
+                                    self._flush_decomp()
                         else:
                             hdr4 = self.raw.read(4)
-                            if len(hdr4) < 4:
-                                if self.decompressor:
-                                    self.buf.extend(self.decompressor.flush())
-                                    self.decompressor = None
+                            if len(hdr4) == 0:
+                                self._flush_decomp()
                                 self.eof = True
                                 break
+                            if len(hdr4) < 4:
+                                raise EOFError("Truncated DVZip block header")
                             v = struct.unpack(">I", hdr4)[0]
                             if v == 0:
-                                if self.decompressor:
-                                    self.buf.extend(self.decompressor.flush())
-                                    self.decompressor = None
+                                self._flush_decomp()
                                 self.eof = True
                                 break
                             self.cur_stored = bool(v & 0x80000000)
@@ -2200,83 +3084,139 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                     del self.buf[:take]
                     return take if (take > 0 or not self.eof) else 0
 
+            def read_exact(stream, n):
+                buf = bytearray()
+                while len(buf) < n:
+                    part = stream.read(n - len(buf))
+                    if not part:
+                        break
+                    buf.extend(part)
+                return bytes(buf)
+
             src = Path(sys.argv[1])
-            dest = Path(sys.argv[2]).resolve()
+            dest_raw = Path(sys.argv[2])
+            if dest_raw.is_symlink():
+                raise ValueError("Destination must not be a symlink")
+            dest_raw.mkdir(parents=True, exist_ok=True)
+            dest = dest_raw.resolve()
+            saw_trailer = False
+            raw_total_bytes = 0
+
             with src.open("rb") as f:
                 prefix = f.read(6)
                 f.seek(0)
                 if len(prefix) >= 2 and prefix[:2] == b"\\x1f\\x8b":
-                    stream = gzip.GzipFile(fileobj=f, mode="rb")
+                    stream = BoundedGzipReader(gzip.GzipFile(fileobj=f, mode="rb"), MAX_DECOMP)
                 elif len(prefix) >= 6 and prefix[:6] in (b"070707", b"070701", b"070702", b"070764"):
                     stream = f
                 else:
-                    stream = io.BufferedReader(DvzipReader(f), buffer_size=65536)
+                    stream = io.BufferedReader(DvzipReader(f, MAX_DECOMP), buffer_size=65536)
 
                 while True:
-                    magic = stream.read(6)
-                    if len(magic) < 6:
+                    magic = read_exact(stream, 6)
+                    if len(magic) == 0:
                         break
+                    if len(magic) < 6:
+                        raise EOFError("Truncated CPIO magic")
                     if magic == b"070707":
-                        h = (magic + stream.read(70)).decode("ascii", "replace")
+                        rest = read_exact(stream, 70)
+                        if len(rest) < 70:
+                            raise EOFError("Truncated 070707 header")
+                        h = (magic + rest).decode("ascii")
                         mode = int(h[18:24], 8)
                         ns = int(h[59:65], 8)
                         fs = int(h[65:76], 8)
-                        name = stream.read(ns).rstrip(b"\\x00").decode("utf-8", "replace")
                         is_newc = False
                     elif magic in (b"070701", b"070702"):
-                        h = (magic + stream.read(104)).decode("ascii", "replace")
+                        rest = read_exact(stream, 104)
+                        if len(rest) < 104:
+                            raise EOFError("Truncated newc header")
+                        h = (magic + rest).decode("ascii")
                         mode = int(h[14:22], 16)
                         fs = int(h[54:62], 16)
                         ns = int(h[94:102], 16)
-                        name = stream.read(ns).rstrip(b"\\x00").decode("utf-8", "replace")
-                        if (110 + ns) % 4 != 0:
-                            stream.read(4 - ((110 + ns) % 4))
                         is_newc = True
                     elif magic == b"070764":
-                        h = (magic + stream.read(96)).decode("ascii", "replace")
+                        rest = read_exact(stream, 96)
+                        if len(rest) < 96:
+                            raise EOFError("Truncated 070764 header")
+                        h = (magic + rest).decode("ascii")
                         mode = int(h[22:30], 16)
                         fs = int(h[70:86], 16)
                         ns = int(h[86:94], 16)
-                        name = stream.read(ns).rstrip(b"\\x00").decode("utf-8", "replace")
                         is_newc = False
                     else:
-                        break
+                        raise ValueError(f"Invalid CPIO magic: {magic!r}")
+
+                    if not (1 <= ns <= 4097):
+                        raise ValueError(f"Invalid CPIO namesize: {ns}")
+                    if fs < 0:
+                        raise ValueError(f"Invalid CPIO filesize: {fs}")
+                    if stream is f:
+                        raw_total_bytes += fs
+                        if raw_total_bytes > MAX_DECOMP:
+                            raise ValueError(f"Raw CPIO stream exceeds limit: {raw_total_bytes}")
+
+                    name_bytes = read_exact(stream, ns)
+                    if len(name_bytes) < ns:
+                        raise EOFError("Truncated CPIO entry name")
+                    name = name_bytes.rstrip(b"\\x00").decode("utf-8", "replace")
+                    if is_newc and (110 + ns) % 4 != 0:
+                        pad = 4 - ((110 + ns) % 4)
+                        if len(read_exact(stream, pad)) < pad:
+                            raise EOFError("Truncated CPIO header padding")
                     if name == "TRAILER!!!":
+                        saw_trailer = True
                         break
                     if (mode & 0o170000) == 0o100000:
                         sn = os.path.basename(name.replace("\\\\", "/")).lstrip(".") or "glidedrop_file"
                         t = (dest / sn).resolve()
-                        if t.parent == dest:
-                            orig_stem = t.stem
-                            orig_suffix = t.suffix
-                            idx = 1
-                            while t.exists():
-                                t = dest / f"{orig_stem}_{idx}{orig_suffix}"
-                                idx += 1
+                        if t.parent != dest:
+                            raise ValueError(f"Path traversal rejected: {name}")
+                        free_bytes = shutil.disk_usage(dest).free
+                        if free_bytes < fs + MIN_FREE_HEADROOM:
+                            raise OSError("Insufficient disk space")
+                        orig_stem = t.stem
+                        orig_suffix = t.suffix
+                        idx = 1
+                        while t.exists() or t.is_symlink():
+                            t = dest / f"{orig_stem}_{idx}{orig_suffix}"
+                            idx += 1
+                        part_t = t.with_name(t.name + ".part")
+                        while part_t.exists() or part_t.is_symlink():
+                            if part_t.is_symlink():
+                                raise ValueError("Refusing symlink staging file")
+                            t = dest / f"{orig_stem}_{idx}{orig_suffix}"
                             part_t = t.with_name(t.name + ".part")
-                            try:
-                                with part_t.open("wb") as out_f:
-                                    rem = fs
-                                    while rem > 0:
-                                        c = stream.read(min(65536, rem))
-                                        if not c:
-                                            break
-                                        out_f.write(c)
-                                        rem -= len(c)
-                                    out_f.flush()
-                                    os.fsync(out_f.fileno())
-                                if rem > 0:
-                                    part_t.unlink(missing_ok=True)
-                                else:
-                                    part_t.rename(t)
-                                    try:
-                                        import subprocess
-                                        subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;GlideDrop;", str(t)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                    except Exception:
-                                        pass
-                                    print(t)
-                            except Exception:
+                            idx += 1
+                        try:
+                            o_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                            fd = os.open(str(part_t), o_flags, 0o644)
+                            with os.fdopen(fd, "wb") as out_f:
+                                rem = fs
+                                while rem > 0:
+                                    c = stream.read(min(65536, rem))
+                                    if not c:
+                                        break
+                                    out_f.write(c)
+                                    rem -= len(c)
+                                out_f.flush()
+                                os.fsync(out_f.fileno())
+                            if rem > 0:
                                 part_t.unlink(missing_ok=True)
+                                raise EOFError(f"Truncated CPIO file data: missing {rem} bytes")
+                            if t.is_symlink():
+                                raise ValueError("Refusing symlink target")
+                            part_t.replace(t)
+                            try:
+                                import subprocess
+                                subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;GlideDrop;", str(t)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            except Exception:
+                                pass
+                            print(t)
+                        except Exception:
+                            part_t.unlink(missing_ok=True)
+                            raise
                     else:
                         rem = fs
                         while rem > 0:
@@ -2284,18 +3224,32 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                             if not c:
                                 break
                             rem -= len(c)
+                        if rem > 0:
+                            raise EOFError("Truncated CPIO non-file entry")
                     if is_newc and fs % 4 != 0:
-                        stream.read(4 - (fs % 4))
+                        dpad = 4 - (fs % 4)
+                        if len(read_exact(stream, dpad)) < dpad:
+                            raise EOFError("Truncated CPIO data padding")
+            if not saw_trailer:
+                raise EOFError("Missing CPIO TRAILER!!!")
             """,
             tmpBin.path,
-            downloads.path
+            downloads.path,
+            String(maxDecompressedBytes)
         ]
         let outPipe = Pipe()
         py.standardOutput = outPipe
-        try? py.run()
+        do {
+            try py.run()
+        } catch {
+            return false
+        }
+        let rawOutData = outPipe.fileHandleForReading.readDataToEndOfFile()
         py.waitUntilExit()
-        try? FileManager.default.removeItem(at: tmpBin)
-        let pyOut = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard py.terminationStatus == 0 else {
+            return false
+        }
+        let pyOut = String(data: rawOutData, encoding: .utf8) ?? ""
         for line in pyOut.split(separator: "\n") {
             let p = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
             if !p.isEmpty {
@@ -2304,6 +3258,11 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
                 savedFiles.append(URL(fileURLWithPath: p).lastPathComponent)
             }
         }
+        guard !savedFiles.isEmpty || handledUrls > 0 else {
+            return false
+        }
+    } else if handledUrls == 0 {
+        return false
     }
 
     let sound = Process()
@@ -2317,6 +3276,7 @@ func extractDvzipCpioToDownloads(archiveData: Data, metaDict: [String: Any]) {
         fflush(stdout)
         safeMacNotification(message: "Saved \(first) to Downloads", title: "GlideDrop from \(sender)")
     }
+    return true
 }
 
 // ============================================================================
@@ -2338,6 +3298,20 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
     var pingStartedAt: TimeInterval = 0
     var lastPingTime: TimeInterval = 0
     var pingTimer: Timer?
+    private let pingStateLock = NSLock()
+    private var pingPeerDisconnected: Bool = false
+
+    func setPingPeerDisconnected(_ val: Bool) {
+        pingStateLock.lock()
+        pingPeerDisconnected = val
+        pingStateLock.unlock()
+    }
+
+    func isPingPeerDisconnected() -> Bool {
+        pingStateLock.lock()
+        defer { pingStateLock.unlock() }
+        return pingPeerDisconnected
+    }
 
     override init() {
         super.init()
@@ -2585,6 +3559,7 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         if activePingPeripheral == nil || activePingPeripheral === peripheral {
+            setPingPeerDisconnected(true)
             isPingingPeer = false
             activePingPeripheral = nil
         }
@@ -2597,11 +3572,16 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
             activePingPeripheral = nil
             return
         }
+        setPingPeerDisconnected(false)
         pingChannel = ch
         let targetPeerId = peripheral.identifier.uuidString
         let currentPsm = Int(discoveredPeerPsm)
         let currentRssi = discoveredPeerRssi
-        let myPsm = Int(publishedPsm > 0 ? publishedPsm : 192)
+        let myPsm = Int(publishedPsm > 0 ? publishedPsm : 0)
+        if myPsm == 0 {
+            print("[BLE-Daemon] Warning: local L2CAP PSM not published yet when sending heartbeat PING")
+            fflush(stdout)
+        }
         let macName = loadMacSettings().deviceName
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -2718,13 +3698,23 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                         _ = writeAll(out, data: Data("NO\n".utf8))
                         return
                     }
-                    let credParts = decStr.split(separator: "\t").map(String.init)
-                    guard credParts.count >= 2 else {
+                    guard let parsedJoin = parseWp2pJoinCredentials(decStr) else {
                         revokeP2pSessionToken(sessionToken)
                         _ = writeAll(out, data: Data("NO\n".utf8))
                         return
                     }
-                    handleIncomingWp2pJoin(ssid: credParts[0], pass: credParts[1], out: out, peerName: targetPeerName, sessionToken: sessionToken)
+                    handleIncomingWp2pJoin(
+                        ssid: parsedJoin.ssid,
+                        pass: parsedJoin.pass,
+                        out: out,
+                        goIp: parsedJoin.goIp,
+                        proxyPort: parsedJoin.proxyPort,
+                        isV2Join: parsedJoin.isV2,
+                        peerName: targetPeerName,
+                        sessionToken: sessionToken,
+                        inp: inp,
+                        isRemoteDisconnected: { [weak self] in self?.isPingPeerDisconnected() ?? false }
+                    )
                     return
                 }
 
@@ -2797,7 +3787,10 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                     let totalAskBytes = filesArr.reduce(Int64(0)) { $0 + Int64(($1["FileSize"] as? Int) ?? 0) }
                     let effectiveBytes = totalAskBytes > 0 ? totalAskBytes : Int64(archLen)
 
-                    if !waitForMacUserAccept(senderName: sender, fileNames: displayNames, totalBytes: effectiveBytes) {
+                    let isCentralAdreAborted: () -> Bool = { [weak self] in
+                        isStreamAborted(inp) || (self?.isPingPeerDisconnected() ?? false)
+                    }
+                    if !waitForMacUserAccept(senderName: sender, fileNames: displayNames, totalBytes: effectiveBytes, isRemoteAborted: isCentralAdreAborted) {
                         _ = writeAll(out, data: Data("NO\r\n".utf8))
                         return
                     }
@@ -2819,8 +3812,11 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                     } else {
                         archData = Data()
                     }
-                    _ = writeAll(out, data: Data("OK\r\n".utf8))
-                    extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict)
+                    if extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict) {
+                        _ = writeAll(out, data: Data("OK\r\n".utf8))
+                    } else {
+                        _ = writeAll(out, data: Data("NO\r\n".utf8))
+                    }
                     return
                 }
                 return
@@ -2931,7 +3927,11 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                         rssi: existingPeer?.rssi ?? peerRssi
                     )
                     let macName = loadMacSettings().deviceName
-                    let myPsm = self?.publishedPsm ?? 192
+                    let myPsm = self?.publishedPsm ?? 0
+                    if myPsm == 0 {
+                        print("[BLE-Daemon] Warning: local L2CAP PSM not published yet when answering PING")
+                        fflush(stdout)
+                    }
                     _ = writeAll(out, data: Data("PONG\t\(macName)\t\(myPsm)\n".utf8))
                     return
                 }
@@ -2997,15 +3997,24 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                         _ = writeAll(out, data: Data("ERR\n".utf8))
                         return
                     }
-                    let credParts = decStr.split(separator: "\t").map(String.init)
-                    guard credParts.count >= 2 else {
+                    guard let parsedJoin = parseWp2pJoinCredentials(decStr) else {
                         revokeP2pSessionToken(sessionToken)
                         _ = writeAll(out, data: Data("ERR\n".utf8))
                         return
                     }
                     let activePeer = loadActivePeersFromDisk(maxAge: 30.0).first
                     let pName = activePeer?.name ?? "Android Peer"
-                    handleIncomingWp2pJoin(ssid: credParts[0], pass: credParts[1], out: out, peerName: pName, sessionToken: sessionToken)
+                    handleIncomingWp2pJoin(
+                        ssid: parsedJoin.ssid,
+                        pass: parsedJoin.pass,
+                        out: out,
+                        goIp: parsedJoin.goIp,
+                        proxyPort: parsedJoin.proxyPort,
+                        isV2Join: parsedJoin.isV2,
+                        peerName: pName,
+                        sessionToken: sessionToken,
+                        inp: inp
+                    )
                     return
                 }
 
@@ -3087,7 +4096,7 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                     rssi: existingPeer?.rssi ?? -52
                 )
 
-                if !waitForMacUserAccept(senderName: sender, fileNames: displayNames, totalBytes: effectiveBytes) {
+                if !waitForMacUserAccept(senderName: sender, fileNames: displayNames, totalBytes: effectiveBytes, isRemoteAborted: { isStreamAborted(inp) }) {
                     _ = writeAll(out, data: Data("NO\r\n".utf8))
                     return
                 }
@@ -3110,8 +4119,11 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                     archData = Data()
                 }
 
-                _ = writeAll(out, data: Data("OK\r\n".utf8))
-                extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict)
+                if extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict) {
+                    _ = writeAll(out, data: Data("OK\r\n".utf8))
+                } else {
+                    _ = writeAll(out, data: Data("NO\r\n".utf8))
+                }
                 return
             }
         }
@@ -3685,7 +4697,7 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
             inp.open()
             out.open()
 
-            func failL2capSession(message: String, clearCancel: Bool = false) -> Never {
+            func failL2capSession(message: String, clearCancel: Bool = false, exitCode: Int32 = 1) -> Never {
                 DispatchQueue.main.async {
                     self.connectState.isTerminalFailure = true
                     self.cm?.cancelPeripheralConnection(peripheral)
@@ -3695,12 +4707,15 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 inp.close()
                 out.close()
                 try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                clearOutgoingP2pToken()
                 if needsMacInternetWifiRestore() {
                     restoreMacInternetWifi()
+                } else {
+                    clearActiveP2pSession()
                 }
                 print(message)
                 fflush(stdout)
-                exit(1)
+                exit(exitCode)
             }
 
             // 5GHz Wi-Fi Direct P2P Negotiation for large files
@@ -3716,7 +4731,7 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
 
                 let macPriv = P256.KeyAgreement.PrivateKey()
                 let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
-                var p2pCreds: (ssid: String, pass: String, host: String, port: String, peerPin: String)? = nil
+                var p2pCreds: (ssid: String, pass: String, host: String, port: String, peerPin: String, proxyPort: Int, sessionToken: String)? = nil
                 var w2p2TimedOut = false
                 var w2p2ReplyLine: String? = nil
 
@@ -3736,16 +4751,21 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                            let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub),
                            let encCreds = Data(base64Encoded: parts[1]) {
                             let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
+                            let sessionToken = deriveSessionToken(sharedSecret: sharedSecret)
                             if let decData = decryptAesGcm(packet: encCreds, using: sessionKey),
                                let decStr = String(data: decData, encoding: .utf8) {
-                                let credParts = decStr.split(separator: "\t").map(String.init)
+                                let credParts = decStr.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
                                 if credParts.count >= 5 && isValidSha256Fingerprint(credParts[4]) {
+                                    let rawProxy = credParts.count >= 6 ? (Int(credParts[5].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0
+                                    let parsedProxyPort = (1...65535).contains(rawProxy) ? rawProxy : 0
                                     p2pCreds = (
                                         credParts[0],
                                         credParts[1],
                                         credParts[2],
                                         credParts[3],
-                                        normalizeSha256Fingerprint(credParts[4])
+                                        normalizeSha256Fingerprint(credParts[4]),
+                                        parsedProxyPort,
+                                        sessionToken
                                     )
                                 }
                             }
@@ -3754,7 +4774,7 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 }
 
                 if isTransferCancelled() {
-                    failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true)
+                    failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true, exitCode: 44)
                 }
                 if !w2p2WriteOk || w2p2ReplyLine == nil {
                     let reason = w2p2TimedOut
@@ -3768,82 +4788,206 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 }
 
                 let ssid = creds.ssid, pass = creds.pass, host = creds.host, port = creds.port, peerPin = creds.peerPin
+                let proxyPort = creds.proxyPort
+                let sessionToken = creds.sessionToken
+                guard isValidP2pGatewayIp(host),
+                      let targetHttpsPort = Int(port.trimmingCharacters(in: .whitespacesAndNewlines)),
+                      (1...65535).contains(targetHttpsPort) else {
+                    failL2capSession(message: "[BLE-Send] Peer supplied invalid Wi-Fi Direct endpoint \(host):\(port)")
+                }
+                let sessionCidr = deriveIpv4Cidr(ip: host) ?? ""
                 try? peerPin.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
-                _ = pauseCloudflareWarpIfNeeded()
-                saveCurrentWifiSsid()
-                self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
-                print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(port))...")
-                fflush(stdout)
+                writeOutgoingP2pToken(sessionToken, host: host, port: targetHttpsPort)
+                writeActiveP2pSession(gatewayIp: host, cidr: sessionCidr, httpsPort: targetHttpsPort, proxyPort: proxyPort)
 
-                let wifiIface = getWifiInterfaceName()
-                if currentWifiP2pIp().isEmpty {
-                    _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", wifiIface, ssid, pass])
+                let warpCleared = pauseCloudflareWarpIfNeeded()
+                if !warpCleared {
+                    if isTcpPortReachable(host: host, port: targetHttpsPort, timeoutMs: 250) {
+                        writeTxInProgressLock()
+                        self.reportSenderConnecting("Connecting over reachable Wi-Fi link (\(host))…")
+                        let peerArg = host.contains(":") ? "[\(host)]:\(targetHttpsPort)" : "\(host):\(targetHttpsPort)"
+                        let txProc = Process()
+                        txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                        txProc.environment = ProcessInfo.processInfo.environment
+                        txProc.environment?["SKIP_BLE_RESTART"] = "1"
+                        txProc.environment?["GLIDEDROP_P2P_TOKEN"] = sessionToken
+                        txProc.arguments = ["send", "--peer", peerArg, "--pin", peerPin] + self.files.map { $0.path } + self.urls
+                        activeChildTxLock.lock()
+                        activeChildTxProcess = txProc
+                        activeChildTxLock.unlock()
+                        try? txProc.run()
+                        txProc.waitUntilExit()
+                        activeChildTxLock.lock()
+                        activeChildTxProcess = nil
+                        activeChildTxLock.unlock()
+                        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
+                        clearActiveP2pSession()
+                        clearOutgoingP2pToken()
 
-                    // Wait up to 25s for macOS DHCP on Wi-Fi interface to assign 192.168.49.x before launching HTTPS transfer
-                    let deadline = Date().addingTimeInterval(25.0)
-                    var lastProgressTouch = Date()
-                    while Date() < deadline {
-                        if isTransferCancelled() { break }
-                        if !currentWifiP2pIp().isEmpty { break }
-                        if Date().timeIntervalSince(lastProgressTouch) >= 2.0 {
-                            lastProgressTouch = Date()
-                            self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
+                        if isTransferCancelled() {
+                            writeProgressJson(active: false)
+                            failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true, exitCode: 44)
                         }
-                        Thread.sleep(forTimeInterval: 0.2)
-                    }
-                }
-
-                if isTransferCancelled() {
-                    failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true)
-                }
-
-                let hasP2pIp = !currentWifiP2pIp().isEmpty
-                if !host.starts(with: "192.168.49.") || hasP2pIp {
-                    writeTxInProgressLock()
-                    self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
-                    enableMacInternetProxy(host: host, port: 1080)
-                    let txProc = Process()
-                    txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
-                    txProc.environment = ProcessInfo.processInfo.environment
-                    txProc.environment?["SKIP_BLE_RESTART"] = "1"
-                    txProc.arguments = ["send", "--peer", "\(host):\(port)", "--pin", peerPin] + self.files.map { $0.path } + self.urls
-                    activeChildTxLock.lock()
-                    activeChildTxProcess = txProc
-                    activeChildTxLock.unlock()
-                    try? txProc.run()
-                    txProc.waitUntilExit()
-                    activeChildTxLock.lock()
-                    activeChildTxProcess = nil
-                    activeChildTxLock.unlock()
-                    restoreMacInternetWifi(ssid: ssid)
-
-                    if isTransferCancelled() || txProc.terminationStatus == 44 {
-                        failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true)
-                    }
-
-                    if txProc.terminationStatus == 0 {
-                        writeProgressJson(active: false)
-                        inp.close()
-                        out.close()
-                        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-                        print("[BLE-Send] Delivered via 5GHz Wi-Fi Direct P2P!")
-                        exit(0)
-                    }
-                    if txProc.terminationStatus == 43 {
-                        failL2capSession(message: "[BLE-Send] Transfer declined by receiver")
-                    }
-                    if txProc.terminationStatus == 46 {
-                        failL2capSession(message: "[BLE-Send] Peer TLS certificate fingerprint pinning mismatch — aborting transfer")
+                        if txProc.terminationStatus == 44 {
+                            writeProgressJson(active: false)
+                            failL2capSession(message: "[BLE-Send] Transfer cancelled by receiver", clearCancel: true, exitCode: 44)
+                        }
+                        if txProc.terminationStatus == 0 {
+                            writeProgressJson(active: false)
+                            inp.close()
+                            out.close()
+                            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                            print("[BLE-Send] Delivered via token-authenticated TLS over reachable Wi-Fi!")
+                            exit(0)
+                        }
+                        if txProc.terminationStatus == 43 {
+                            failL2capSession(message: "[BLE-Send] Transfer declined by receiver", exitCode: 43)
+                        }
+                        if txProc.terminationStatus == 46 {
+                            failL2capSession(message: "[BLE-Send] Peer TLS certificate fingerprint pinning mismatch — aborting transfer", exitCode: 46)
+                        }
+                        print("[BLE-Send] WARP-locked HTTPS probe failed (status=\(txProc.terminationStatus))")
+                        fflush(stdout)
+                    } else {
+                        print("[BLE-Send] Cloudflare WARP switch is locked and \(host):\(targetHttpsPort) unreachable; skipping Wi-Fi Direct switch and using Direct BLE L2CAP")
+                        fflush(stdout)
+                        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
+                        clearActiveP2pSession()
+                        clearOutgoingP2pToken()
                     }
                 } else {
-                    print("[BLE-Send] Failed to obtain 5GHz P2P IP on \(wifiIface); falling back to Direct BLE L2CAP")
+                    saveCurrentWifiSsid()
+                    self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
+                    print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(targetHttpsPort), cidr=\(sessionCidr))...")
                     fflush(stdout)
-                    restoreMacInternetWifi(ssid: ssid)
+
+                    let wifiIface = getWifiInterfaceName()
+                    var lastSendWarpCheck = Date()
+                    let joinedP2p = associateWifiDirectWithRetry(
+                        iface: wifiIface,
+                        ssid: ssid,
+                        pass: pass,
+                        matchingGateway: host,
+                        timeout: 25.0,
+                        logPrefix: "[BLE-Send]",
+                        lastWarpCheck: &lastSendWarpCheck
+                    ) {
+                        self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
+                    }
+
+                    if isTransferCancelled() {
+                        failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true, exitCode: 44)
+                    }
+
+                    let hasP2pIp = !(joinedP2p?.ip.isEmpty ?? true)
+                    let actualCidr = joinedP2p?.cidr ?? sessionCidr
+                    if hasP2pIp {
+                        let localP2pIp = joinedP2p?.ip ?? ""
+                        print("[BLE-Send] Obtained 5GHz P2P IP \(localP2pIp) on \(wifiIface) (cidr=\(actualCidr))")
+                        fflush(stdout)
+                        // Ensure WARP Always-On didn't re-attach and wait briefly for P2P route/ARP settle before spawning HTTPS client
+                        let probeDeadline = Date().addingTimeInterval(4.0)
+                        var p2pReachable = false
+                        while Date() < probeDeadline {
+                            if isTransferCancelled() { break }
+                            keepCloudflareWarpPausedPeriodically(lastChecked: &lastSendWarpCheck)
+                            if isTcpPortReachable(host: host, port: targetHttpsPort, timeoutMs: 400) {
+                                p2pReachable = true
+                                break
+                            }
+                            Thread.sleep(forTimeInterval: 0.2)
+                        }
+                        if !p2pReachable {
+                            print("[BLE-Send] Warning: \(host):\(targetHttpsPort) not yet reachable from Swift probe after 4s; attempting glidedrop.sh connect")
+                            fflush(stdout)
+                        }
+                        writeActiveP2pSession(gatewayIp: host, cidr: actualCidr, httpsPort: targetHttpsPort, proxyPort: proxyPort)
+                        writeTxInProgressLock()
+                        self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
+                        if proxyPort > 0 {
+                            enableMacInternetProxy(host: host, port: proxyPort, cidr: actualCidr)
+                        }
+                        let peerArg = host.contains(":") ? "[\(host)]:\(targetHttpsPort)" : "\(host):\(targetHttpsPort)"
+                        func runP2pTxAttempt() -> Int32 {
+                            let txProc = Process()
+                            txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                            txProc.environment = ProcessInfo.processInfo.environment
+                            txProc.environment?["SKIP_BLE_RESTART"] = "1"
+                            txProc.environment?["GLIDEDROP_P2P_TOKEN"] = sessionToken
+                            txProc.arguments = ["send", "--peer", peerArg, "--pin", peerPin] + self.files.map { $0.path } + self.urls
+                            activeChildTxLock.lock()
+                            activeChildTxProcess = txProc
+                            activeChildTxLock.unlock()
+                            try? txProc.run()
+                            while txProc.isRunning {
+                                if isTransferCancelled() {
+                                    txProc.terminate()
+                                    break
+                                }
+                                keepCloudflareWarpPausedPeriodically(lastChecked: &lastSendWarpCheck)
+                                Thread.sleep(forTimeInterval: 0.25)
+                            }
+                            txProc.waitUntilExit()
+                            activeChildTxLock.lock()
+                            activeChildTxProcess = nil
+                            activeChildTxLock.unlock()
+                            return txProc.terminationStatus
+                        }
+                        let attemptStart = Date()
+                        var txStatus = runP2pTxAttempt()
+                        // Retry once on transient initial connect drop if WARP Always-On flickered and payload shouldn't drop to BLE
+                        if txStatus != 0 &&
+                            shouldAllowBleAutoFallback(fileCount: self.files.count, totalRawBytes: self.totalRawBytes, txExitCode: txStatus) == false &&
+                            txStatus != 43 && txStatus != 44 && txStatus != 46 &&
+                            !isTransferCancelled() &&
+                            Date().timeIntervalSince(attemptStart) < 15.0 {
+                            print("[BLE-Send] Retrying 5 GHz Wi-Fi Direct HTTPS connect once after transient drop (status=\(txStatus))...")
+                            fflush(stdout)
+                            _ = pauseCloudflareWarpIfNeeded()
+                            Thread.sleep(forTimeInterval: 0.5)
+                            txStatus = runP2pTxAttempt()
+                        }
+                        if isTransferCancelled() {
+                            writeProgressJson(active: false)
+                            restoreMacInternetWifi(ssid: ssid)
+                            failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true, exitCode: 44)
+                        }
+                        if txStatus == 44 {
+                            writeProgressJson(active: false)
+                            restoreMacInternetWifi(ssid: ssid)
+                            failL2capSession(message: "[BLE-Send] Transfer cancelled by receiver", clearCancel: true, exitCode: 44)
+                        }
+                        restoreMacInternetWifi(ssid: ssid)
+
+                        if txStatus == 0 {
+                            writeProgressJson(active: false)
+                            inp.close()
+                            out.close()
+                            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                            print("[BLE-Send] Delivered via 5GHz Wi-Fi Direct P2P!")
+                            exit(0)
+                        }
+                        if txStatus == 43 {
+                            failL2capSession(message: "[BLE-Send] Transfer declined by receiver", exitCode: 43)
+                        }
+                        if txStatus == 46 {
+                            failL2capSession(message: "[BLE-Send] Peer TLS certificate fingerprint pinning mismatch — aborting transfer", exitCode: 46)
+                        }
+                    } else {
+                        print("[BLE-Send] Failed to obtain 5GHz P2P IP on \(wifiIface) for \(sessionCidr)")
+                        fflush(stdout)
+                        restoreMacInternetWifi(ssid: ssid)
+                    }
                 }
             }
 
             if isTransferCancelled() {
-                failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true)
+                failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true, exitCode: 44)
+            }
+            if !shouldAllowBleAutoFallback(fileCount: self.files.count, totalRawBytes: self.totalRawBytes) {
+                failL2capSession(
+                    message: "[BLE-Send] 5 GHz Wi-Fi Direct failed for \(formatByteSize(self.totalRawBytes)) transfer — refusing slow Bluetooth LE fallback. Ensure Wi-Fi is enabled and pause Cloudflare WARP if active."
+                )
             }
 
             let preparedPayload: (metaData: Data, gzData: Data)
@@ -3991,12 +5135,12 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
             } else if ok && ackStr == "NO" {
                 if needsMacInternetWifiRestore() { restoreMacInternetWifi() }
                 print("[BLE-Send] Transfer declined by receiver")
-                exit(1)
+                exit(43)
             } else if isTransferCancelled() {
                 clearCancelFlag()
                 if needsMacInternetWifiRestore() { restoreMacInternetWifi() }
                 print("[BLE-Send] Transfer cancelled by user")
-                exit(1)
+                exit(44)
             } else if ok && ackData == nil {
                 if needsMacInternetWifiRestore() { restoreMacInternetWifi() }
                 let msg = ackTimedOut
@@ -4443,7 +5587,7 @@ func resolveAiPillStates(
 }
 
 func defaultClaudeConfigDir() -> URL {
-    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".glidedrop")
+    return STATE_DIR
 }
 
 func readAiSubsystemEnabled(
@@ -4496,7 +5640,6 @@ final class MacGlideDropViewModel: ObservableObject {
     @Published var systemIsDark: Bool = true
     @Published var storage: MacStorageSummary = MacStorageSummary.queryLocalDisk()
     @Published var receiverRunning: Bool = false
-    @Published var mdnsRunning: Bool = false
     @Published var awdlProxyRunning: Bool = false
     @Published var bleRunning: Bool = true
     @Published var autoAccept: Bool = false
@@ -4730,7 +5873,6 @@ final class MacGlideDropViewModel: ObservableObject {
         refreshAiStatus()
         let s = loadMacSettings()
         receiverRunning = s.visible && isPidAlive("daemon.pid")
-        mdnsRunning = isPidAlive("mdns.pid")
         awdlProxyRunning = isPidAlive("awdl-mdns.pid")
         bleRunning = true
 
@@ -4837,7 +5979,7 @@ final class MacGlideDropViewModel: ObservableObject {
                 try? p.run()
                 p.waitUntilExit()
             } else {
-                for pf in ["daemon.pid", "mdns.pid", "awdl-mdns.pid", "ble-daemon.pid"] {
+                for pf in ["daemon.pid", "awdl-mdns.pid", "ble-daemon.pid"] {
                     let f = STATE_DIR.appendingPathComponent(pf)
                     if let s = try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
                        let pid = Int32(s), pid != getpid() {
@@ -5061,6 +6203,10 @@ final class MacGlideDropViewModel: ObservableObject {
 
         clearCancelFlag()
         isTransferring = true
+        let hasFiles = itemsToSend.contains(where: { !$0.isUrl })
+        let connectingPhase = (hasFiles && totalBytes >= 65_536)
+            ? "Connecting to \(targetName) via 5 GHz Wi-Fi Direct…"
+            : "Connecting to \(targetName)…"
         let initialConnecting = MacLiveProgress(
             direction: "Sending",
             fileName: summaryLabel,
@@ -5070,7 +6216,7 @@ final class MacGlideDropViewModel: ObservableObject {
             speedBps: 0,
             etaSeconds: 0,
             percent: 0,
-            phase: "Connecting to \(targetName) via Bluetooth LE…",
+            phase: connectingPhase,
             peerName: targetName,
             isConnecting: true
         )
@@ -5085,7 +6231,7 @@ final class MacGlideDropViewModel: ObservableObject {
             speedBps: 0,
             etaSeconds: 0,
             percent: 0,
-            phase: "Connecting to \(targetName) via Bluetooth LE…",
+            phase: connectingPhase,
             peerName: targetName,
             isConnecting: true
         )
@@ -5117,11 +6263,11 @@ final class MacGlideDropViewModel: ObservableObject {
             try? pipe.fileHandleForReading.close()
             try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
             writeProgressJson(active: false)
-            if needsMacInternetWifiRestore() {
-                restoreMacInternetWifi()
-            }
-            let wasCancelled = isTransferCancelled()
+            let wasCancelled = isTransferCancelled() || p.terminationStatus == 44
+            let wasDeclined = (p.terminationStatus == 43)
             clearCancelFlag()
+            let txLogUrl = STATE_DIR.appendingPathComponent("tx-send.log")
+            try? outData.write(to: txLogUrl, options: [.atomic])
             let out = String(data: outData, encoding: .utf8) ?? ""
             let lastLine = out
                 .split(separator: "\n")
@@ -5134,12 +6280,19 @@ final class MacGlideDropViewModel: ObservableObject {
                 self.liveProgress = nil
                 if wasCancelled {
                     self.transferStatus = "Transfer cancelled"
+                } else if wasDeclined {
+                    self.transferStatus = "Transfer declined by \(targetName)"
                 } else if ok {
                     self.stagedItems.removeAll()
                     self.transferStatus = "Sent \(summaryLabel) to \(targetName)"
                 } else {
                     self.transferStatus = "Transfer failed: \(lastLine.isEmpty ? "Open GlideDrop on the receiving device and try again" : lastLine)"
                 }
+            }
+            if needsMacInternetWifiRestore() {
+                restoreMacInternetWifi()
+            }
+            DispatchQueue.main.async {
                 self.refreshSlow()
             }
         }
@@ -6992,7 +8145,7 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
     private func performCleanShutdown() {
         restoreMacInternetWifi()
         BleGlideDropDaemon.shared?.stopAdvertisingAndScanning()
-        for pf in ["daemon.pid", "mdns.pid", "awdl-mdns.pid"] {
+        for pf in ["daemon.pid", "awdl-mdns.pid"] {
             let f = STATE_DIR.appendingPathComponent(pf)
             if let s = try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
                let pid = Int32(s) {
@@ -7011,6 +8164,13 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
             "prev_proxy_settings.json",
             "proxy_state.lock",
             "p2p_session_token.json",
+            "p2p_outgoing_token.json",
+            "active_p2p_session.json",
+            "awdl_bridge_port",
+            "mac_rx_port",
+            "finder_proxy_port",
+            "finder_proxy_sock",
+            "finder_proxy.sock",
             "pinned_peer_tls_fingerprint.txt",
             "wp2p_authorized_session.json"
         ] {
@@ -7074,32 +8234,94 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
 // AWDL Peer-to-Peer Socket Bridge (unlocks XNU INP_AWDL_UNRESTRICTED on awdl0)
 // ============================================================================
 final class AwdlLoopbackBridge {
-    let listener: NWListener
+    private var listener: NWListener
+    private let params: NWParameters
+    private let sockPathOverride: String?
+    private let stateDir: URL
+    private var triedEphemeralFallback = false
+    private let queue = DispatchQueue(label: "com.glidedrop.awdl-bridge", qos: .userInitiated)
 
-    init(listenPort: UInt16 = 8774, targetPort: UInt16 = 8773) throws {
-        let params = NWParameters.tcp
-        params.includePeerToPeer = true
-        // Restrict port 8774 strictly to peer-to-peer (AWDL); prohibit LAN interfaces
-        params.prohibitedInterfaceTypes = [.wifi, .wiredEthernet, .cellular]
-        listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: listenPort)!)
-        listener.stateUpdateHandler = { state in
-            print("[AWDL-Bridge] NWListener(\(listenPort) -> 127.0.0.1:\(targetPort)) state: \(state)")
-            fflush(stdout)
+    init(
+        listenPort: UInt16 = DEFAULT_AWDL_BRIDGE_PORT,
+        sockPath: String? = nil,
+        stateDir: URL = STATE_DIR
+    ) throws {
+        let p = NWParameters.tcp
+        p.includePeerToPeer = true
+        // Restrict strictly to AWDL (.other + awdl* interface name); prohibit LAN/cellular/loopback interfaces
+        p.prohibitedInterfaceTypes = [.wifi, .wiredEthernet, .cellular, .loopback]
+        self.params = p
+        self.sockPathOverride = sockPath
+        self.stateDir = stateDir
+        let nwPort = NWEndpoint.Port(rawValue: listenPort) ?? .any
+        self.listener = try NWListener(using: p, on: nwPort)
+        configureAndStart(listener: self.listener, requestedPort: listenPort)
+    }
+
+    private func configureAndStart(listener activeListener: NWListener, requestedPort: UInt16) {
+        activeListener.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                let boundPort = activeListener.port?.rawValue ?? requestedPort
+                if boundPort > 0 {
+                    writeAwdlBridgePortFile(port: Int(boundPort), stateDir: self.stateDir)
+                }
+                print("[AWDL-Bridge] NWListener ready on port \(boundPort)")
+                fflush(stdout)
+            case .failed(let err):
+                print("[AWDL-Bridge] NWListener(\(requestedPort)) failed: \(err)")
+                fflush(stdout)
+                if !self.triedEphemeralFallback && requestedPort != 0 {
+                    self.triedEphemeralFallback = true
+                    do {
+                        let fallback = try NWListener(using: self.params, on: .any)
+                        activeListener.cancel()
+                        self.listener = fallback
+                        self.configureAndStart(listener: fallback, requestedPort: 0)
+                    } catch {
+                        print("[AWDL-Bridge] Fallback NWListener failed: \(error)")
+                        fflush(stdout)
+                    }
+                }
+            default:
+                print("[AWDL-Bridge] NWListener(\(requestedPort)) state: \(state)")
+                fflush(stdout)
+            }
         }
-        listener.newConnectionHandler = { incoming in
-            // Reject any unauthenticated connection from LAN interfaces
+        activeListener.newConnectionHandler = { [weak self] incoming in
+            guard let self = self else {
+                incoming.cancel()
+                return
+            }
             incoming.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    if let path = incoming.currentPath {
-                        let isLan = path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet) || path.usesInterfaceType(.cellular)
-                        if isLan {
-                            print("[AWDL-Bridge] Dropping unauthorized connection on LAN interface")
-                            incoming.cancel()
-                            return
-                        }
+                    guard let path = incoming.currentPath else {
+                        incoming.cancel()
+                        return
                     }
-                    let outgoing = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: targetPort)!, using: .tcp)
+                    let isProhibited = path.usesInterfaceType(.wifi) ||
+                        path.usesInterfaceType(.wiredEthernet) ||
+                        path.usesInterfaceType(.cellular) ||
+                        path.usesInterfaceType(.loopback)
+                    let ifNames = path.availableInterfaces.map { $0.name }
+                    let endpointsAllowed = isAllowedAwdlEndpoint(path.localEndpoint) &&
+                        isAllowedAwdlEndpoint(path.remoteEndpoint)
+                    if isProhibited || !isAllowedAwdlInterfaceNames(ifNames) || !endpointsAllowed {
+                        print("[AWDL-Bridge] Dropping unauthorized connection on non-AWDL path (interfaces=\(ifNames))")
+                        fflush(stdout)
+                        incoming.cancel()
+                        return
+                    }
+                    let resolvedSockPath = self.sockPathOverride ?? readFinderProxySockPath(stateDir: self.stateDir)
+                    guard FileManager.default.fileExists(atPath: resolvedSockPath) else {
+                        print("[AWDL-Bridge] Finder proxy Unix socket missing at \(resolvedSockPath)")
+                        fflush(stdout)
+                        incoming.cancel()
+                        return
+                    }
+                    let outgoing = NWConnection(to: .unix(path: resolvedSockPath), using: .tcp)
                     outgoing.stateUpdateHandler = { outState in
                         switch outState {
                         case .failed(_), .cancelled:
@@ -7108,7 +8330,7 @@ final class AwdlLoopbackBridge {
                             break
                         }
                     }
-                    outgoing.start(queue: .global(qos: .userInitiated))
+                    outgoing.start(queue: self.queue)
                     Self.pump(from: incoming, to: outgoing)
                     Self.pump(from: outgoing, to: incoming)
                 case .failed(_), .cancelled:
@@ -7117,9 +8339,9 @@ final class AwdlLoopbackBridge {
                     break
                 }
             }
-            incoming.start(queue: .global(qos: .userInitiated))
+            incoming.start(queue: self.queue)
         }
-        listener.start(queue: .global(qos: .userInitiated))
+        activeListener.start(queue: self.queue)
     }
 
     static func pump(from src: NWConnection, to dst: NWConnection) {
@@ -7193,9 +8415,20 @@ func runGlideDropMain() throws {
         exit(0)
     } else if args.count >= 2 && args[1] == "send" {
         installSafeSignalHandlers()
+        var filteredArgs: [String] = []
         let rawArgs = Array(args.dropFirst(2))
-        let urls = rawArgs.filter { $0.hasPrefix("http://") || $0.hasPrefix("https://") }
-        let fileUrls = rawArgs
+        var idx = 0
+        while idx < rawArgs.count {
+            let cur = rawArgs[idx]
+            if cur == "--pin" || cur == "--peer" {
+                idx += 2
+                continue
+            }
+            filteredArgs.append(cur)
+            idx += 1
+        }
+        let urls = filteredArgs.filter { $0.hasPrefix("http://") || $0.hasPrefix("https://") }
+        let fileUrls = filteredArgs
             .filter { !$0.hasPrefix("http://") && !$0.hasPrefix("https://") }
             .map { URL(fileURLWithPath: $0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
@@ -7218,8 +8451,11 @@ func runGlideDropMain() throws {
             DispatchQueue.global().asyncAfter(deadline: .now() + 300.0) {
                 writeProgressJson(active: false)
                 try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
+                clearOutgoingP2pToken()
                 if needsMacInternetWifiRestore() {
                     restoreMacInternetWifi()
+                } else {
+                    clearActiveP2pSession()
                 }
                 print("[BLE-Send] Timed out waiting for BLE L2CAP transfer")
                 exit(1)
@@ -7288,7 +8524,13 @@ func runGlideDropMain() throws {
         let daemon = BleGlideDropDaemon()
         let bar = StatusBarController(openWindowOnLaunch: !isBackgroundDaemon)
         app.delegate = bar
-        let awdlBridge = try? AwdlLoopbackBridge(listenPort: 8774, targetPort: 8773)
+        var awdlBridge: AwdlLoopbackBridge? = nil
+        do {
+            awdlBridge = try AwdlLoopbackBridge()
+        } catch {
+            print("[AWDL-Bridge] Warning: failed to start AWDL loopback bridge: \(error)")
+            fflush(stdout)
+        }
         withExtendedLifetime((daemon, bar, awdlBridge)) {
             app.run()
         }

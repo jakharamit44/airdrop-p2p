@@ -19,17 +19,33 @@ class EmbeddedProxyServerTest {
 
     @Test
     fun testClientIpWhitelist() {
-        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("127.0.0.1")))
-        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("::1")))
-        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("192.168.49.1")))
-        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("192.168.49.100")))
-        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("::ffff:192.168.49.50")))
+        // Default production mode with no active P2P subnet denies loopback and any non-active P2P IP
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("127.0.0.1")))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("::1")))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("192.168.49.1")))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("192.168.49.100")))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("::ffff:192.168.49.50")))
+        assertFalse(EmbeddedProxyServer.isP2pSubnetAddress(InetAddress.getByName("192.168.49.1")))
 
-        assertFalse(EmbeddedProxyServer.isClientAllowed(null))
-        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("192.168.1.1")))
-        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("10.0.0.1")))
-        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("172.16.0.5")))
-        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("8.8.8.8")))
+        // Explicit loopback test mode permits loopback even with no active P2P subnet
+        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("127.0.0.1"), allowLoopbackClients = true))
+        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("::1"), allowLoopbackClients = true))
+
+        // Dynamic P2P subnet list enforces only the active OS-resolved subnet
+        val dynamicSubnet = listOf(byteArrayOf(192.toByte(), 168.toByte(), 73, 0) to 24)
+        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("192.168.73.44"), dynamicSubnet))
+        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("::ffff:192.168.73.50"), dynamicSubnet))
+        assertTrue(EmbeddedProxyServer.isP2pSubnetAddress(InetAddress.getByName("192.168.73.44"), dynamicSubnet))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("192.168.49.100"), dynamicSubnet))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("127.0.0.1"), dynamicSubnet))
+        assertTrue(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("127.0.0.1"), dynamicSubnet, allowLoopbackClients = true))
+
+        assertFalse(EmbeddedProxyServer.isClientAllowed(null, dynamicSubnet))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("192.168.1.1"), dynamicSubnet))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("10.0.0.1"), dynamicSubnet))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("172.16.0.5"), dynamicSubnet))
+        assertFalse(EmbeddedProxyServer.isClientAllowed(InetAddress.getByName("8.8.8.8"), dynamicSubnet))
+        assertFalse(EmbeddedProxyServer.matchesCidr(byteArrayOf(10, 0, 0, 1), byteArrayOf(0, 0, 0, 0), 0))
     }
 
     private fun newRelayTestProxy(mockPort: Int): EmbeddedProxyServer {
@@ -50,7 +66,8 @@ class EmbeddedProxyServerTest {
                 } else {
                     sock.connect(InetSocketAddress(addr, port), timeoutMs)
                 }
-            }
+            },
+            allowLoopbackClients = true
         )
     }
 
@@ -101,8 +118,9 @@ class EmbeddedProxyServerTest {
         assertFalse(EmbeddedProxyServer.isTargetSafe("172.16.0.1", 80))
         assertFalse(EmbeddedProxyServer.isTargetSafe("172.31.255.254", 8080))
         assertFalse(EmbeddedProxyServer.isTargetSafe("192.168.1.1", 80))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("192.168.49.1", 8771))
-        assertFalse(EmbeddedProxyServer.isTargetSafe("192.168.49.1", 1080))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("192.168.73.1", 8771))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("192.168.73.1", 1080))
+        assertFalse(EmbeddedProxyServer.isTargetSafe("192.168.73.1", 8771, listOf(byteArrayOf(192.toByte(), 168.toByte(), 73, 0) to 24)))
         assertFalse(EmbeddedProxyServer.isTargetSafe("::ffff:192.168.1.1", 80))
         assertFalse(EmbeddedProxyServer.isTargetSafe("::ffff:10.0.0.1", 443))
 
@@ -356,7 +374,7 @@ class EmbeddedProxyServerTest {
 
     @Test
     fun testHttpConnectHeaderTooLarge() {
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = EmbeddedProxyServer(context = null, port = 0, allowLoopbackClients = true)
         assertTrue(proxy.start())
 
         try {
@@ -384,7 +402,7 @@ class EmbeddedProxyServerTest {
 
     @Test
     fun testSocks5NoAcceptableMethods() {
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = EmbeddedProxyServer(context = null, port = 0, allowLoopbackClients = true)
         assertTrue(proxy.start())
 
         try {
@@ -409,7 +427,7 @@ class EmbeddedProxyServerTest {
 
     @Test
     fun testServerLifecycle() {
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = EmbeddedProxyServer(context = null, port = 0, allowLoopbackClients = true)
         assertFalse(proxy.running)
         assertTrue(proxy.start())
         assertTrue(proxy.running)
@@ -544,7 +562,7 @@ class EmbeddedProxyServerTest {
 
     @Test
     fun testForwardTargetAndAuthorityParsingEdgeCases() {
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = EmbeddedProxyServer(context = null, port = 0, allowLoopbackClients = true)
 
         // Unencoded query characters like |, [, ] must not fail with empty host / 403
         val (h1, p1, path1) = proxy.parseForwardHttpTarget(
@@ -573,7 +591,7 @@ class EmbeddedProxyServerTest {
 
     @Test
     fun testMalformedPortAndPostDnsSelfSsrfBlocked() {
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = EmbeddedProxyServer(context = null, port = 0, allowLoopbackClients = true)
         assertTrue(proxy.start())
         val proxyPort = proxy.actualPort
 
@@ -738,7 +756,7 @@ class EmbeddedProxyServerTest {
 
     @Test
     fun testSocks5DomainAndIpv4SsrfBlocked() {
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = EmbeddedProxyServer(context = null, port = 0, allowLoopbackClients = true)
         assertTrue(proxy.start())
         val proxyPort = proxy.actualPort
 
@@ -798,7 +816,7 @@ class EmbeddedProxyServerTest {
 
     @Test
     fun testSsrfBlockedAcrossAllPortsAndAddressClassesOverHttpAndSocks5() {
-        val proxy = EmbeddedProxyServer(context = null, port = 0)
+        val proxy = EmbeddedProxyServer(context = null, port = 0, allowLoopbackClients = true)
         assertTrue(proxy.start())
         val proxyPort = proxy.actualPort
 
@@ -904,7 +922,8 @@ class EmbeddedProxyServerTest {
             port = 0,
             outboundAddressResolver = { _, host ->
                 arrayOf(InetAddress.getByAddress(host, InetAddress.getByName(rebindIps[currentIdx]).address))
-            }
+            },
+            allowLoopbackClients = true
         )
         assertTrue(proxy.start())
         try {
@@ -1026,6 +1045,125 @@ class EmbeddedProxyServerTest {
         assertFalse(EmbeddedProxyServer.hasInvalidHttpHeaderSyntax("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
         assertTrue(EmbeddedProxyServer.hasUpgradeHeader("GET / HTTP/1.1\rUpgrade: websocket\r\nHost: example.com\r\n\r\n"))
         assertTrue(EmbeddedProxyServer.hasUpgradeHeader("GET / HTTP/1.1\r\nProxy-Connection: keep-alive, Upgrade\r\n\r\n"))
+    }
+
+    @Test
+    fun testExpandedSsrfAndHostnameBlocks() {
+        val blockedTargets = listOf(
+            "100.64.0.1",         // CGNAT RFC 6598
+            "192.0.0.1",          // IETF protocol assignments
+            "192.0.2.1",          // TEST-NET-1
+            "192.88.99.1",        // 6to4 relay anycast
+            "198.18.0.1",         // Benchmarking
+            "198.51.100.1",       // TEST-NET-2
+            "203.0.113.1",        // TEST-NET-3
+            "2002::1",            // 6to4 IPv6
+            "2001::1",            // Teredo
+            "2001:2::1",          // Benchmarking / ORCHID
+            "2001:db8::1",        // Documentation
+            "100::1",             // Discard-only
+            "router.home.arpa",
+            "nas.lan",
+            "metadata.goog",
+            "metadata.google.internal"
+        )
+        for (target in blockedTargets) {
+            assertFalse("Expected SSRF target $target to be blocked", EmbeddedProxyServer.isTargetSafe(target, 80))
+        }
+
+        val customSubnets = listOf(byteArrayOf(10, 99, 0, 0) to 16)
+        assertFalse(
+            "Instance target filter must block active custom P2P subnet",
+            EmbeddedProxyServer.isTargetSafe("10.99.12.34", 80, customSubnets)
+        )
+    }
+
+    @Test
+    fun testDefaultDeniesLoopbackAndBindExceptionFallsBackToEphemeralPort() {
+        val prodProxy = EmbeddedProxyServer(context = null, port = 0)
+        assertTrue(prodProxy.start())
+        try {
+            Socket("127.0.0.1", prodProxy.actualPort).use { client ->
+                client.soTimeout = 1000
+                val denied = try {
+                    val out = client.getOutputStream()
+                    out.write("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+                    readLine(client.getInputStream()) == null
+                } catch (_: java.net.SocketException) {
+                    // Immediate server-side client.close() causes TCP RST when CONNECT bytes arrive
+                    true
+                }
+                assertTrue("Loopback client must be denied when allowLoopbackClients=false", denied)
+            }
+        } finally {
+            prodProxy.stop()
+        }
+
+        // Verify BindException fallback when desired port is already occupied on wildcard interface
+        ServerSocket().use { occupier ->
+            occupier.reuseAddress = false
+            occupier.bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0), 5)
+            val busyPort = occupier.localPort
+            val fallbackProxy = EmbeddedProxyServer(context = null, port = busyPort, allowLoopbackClients = true)
+            assertTrue("Proxy must bind ephemerally when desired port $busyPort is in use", fallbackProxy.start())
+            try {
+                assertTrue(fallbackProxy.actualPort > 0)
+                assertTrue("Expected fallback port != $busyPort, got ${fallbackProxy.actualPort}", fallbackProxy.actualPort != busyPort)
+            } finally {
+                fallbackProxy.stop()
+            }
+        }
+    }
+
+    @Test
+    fun testHttpForwardProxyRejectsRequestSmugglingFramingHeaders() {
+        val mockServer = ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"))
+        val mockPort = mockServer.localPort
+        val proxy = newRelayTestProxy(mockPort)
+        assertTrue(proxy.start())
+
+        try {
+            val smugglingPayloads = listOf(
+                // TE.CL request smuggling
+                "POST http://relay.example.test:$mockPort/submit HTTP/1.1\r\n" +
+                    "Host: relay.example.test:$mockPort\r\n" +
+                    "Content-Length: 4\r\n" +
+                    "Transfer-Encoding: chunked\r\n\r\n" +
+                    "0\r\n\r\n",
+                // Conflicting CL.CL request smuggling
+                "POST http://relay.example.test:$mockPort/submit HTTP/1.1\r\n" +
+                    "Host: relay.example.test:$mockPort\r\n" +
+                    "Content-Length: 5\r\n" +
+                    "Content-Length: 10\r\n\r\n" +
+                    "hello",
+                // Duplicate identical Content-Length
+                "POST http://relay.example.test:$mockPort/submit HTTP/1.1\r\n" +
+                    "Host: relay.example.test:$mockPort\r\n" +
+                    "Content-Length: 5\r\n" +
+                    "Content-Length: 5\r\n\r\n" +
+                    "hello",
+                // Negative / non-numeric Content-Length
+                "POST http://relay.example.test:$mockPort/submit HTTP/1.1\r\n" +
+                    "Host: relay.example.test:$mockPort\r\n" +
+                    "Content-Length: -1\r\n\r\n"
+            )
+
+            for (payload in smugglingPayloads) {
+                Socket("127.0.0.1", proxy.actualPort).use { client ->
+                    client.soTimeout = 2000
+                    client.getOutputStream().apply {
+                        write(payload.toByteArray(StandardCharsets.US_ASCII))
+                        flush()
+                    }
+                    val status = readLine(client.getInputStream()).orEmpty()
+                    assertTrue("Expected 400 Bad Request for smuggling payload, got: $status", status.contains("400 Bad Request"))
+                }
+            }
+        } finally {
+            proxy.stop()
+            mockServer.close()
+        }
     }
 
     private fun readFully(inp: InputStream, buf: ByteArray) {

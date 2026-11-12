@@ -84,6 +84,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.Lifecycle
@@ -106,6 +107,9 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -123,6 +127,7 @@ import ds.tokens.DsMotion
 import ds.tokens.LocalDsColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
@@ -204,6 +209,8 @@ private fun rememberAnimatorsEnabled(): Boolean {
 private fun Modifier.pressableScale(
     enabled: Boolean = true,
     pressedScale: Float = DsMotion.scalePress,
+    role: Role? = Role.Button,
+    contentDesc: String? = null,
     onClick: () -> Unit
 ): Modifier = composed {
     val animatorsEnabled = rememberAnimatorsEnabled()
@@ -220,17 +227,25 @@ private fun Modifier.pressableScale(
     } else {
         targetScale
     }
-    this
+    val base = this
         .graphicsLayer {
             scaleX = scale
             scaleY = scale
         }
-        .clickable(
-            interactionSource = interactionSource,
-            indication = null,
-            enabled = enabled,
-            onClick = onClick
-        )
+        .let { mod ->
+            if (contentDesc != null) {
+                mod.semantics { contentDescription = contentDesc }
+            } else {
+                mod
+            }
+        }
+    base.clickable(
+        interactionSource = interactionSource,
+        indication = null,
+        enabled = enabled,
+        role = role,
+        onClick = onClick
+    )
 }
 
 private fun timeOfDayGreeting(): String {
@@ -406,6 +421,7 @@ fun GlideDropScreen(
     val deviceName by node.deviceNameFlow.collectAsState()
     val autoAccept by node.autoAcceptFlow.collectAsState()
     val shareCellularInternet by node.shareCellularInternetFlow.collectAsState()
+    val proxyActualPort by node.proxyActualPortFlow.collectAsState()
     val btEnabled by node.bluetoothEnabled.collectAsState()
     val wifiEnabled by node.wifiEnabled.collectAsState()
     val permsGranted by node.permissionsGranted.collectAsState()
@@ -431,9 +447,11 @@ fun GlideDropScreen(
         }
     }
 
+    val appScope = rememberCoroutineScope()
+
     fun stageUris(uris: List<Uri>) {
         if (uris.isEmpty()) return
-        var added = 0
+        val toResolve = ArrayList<Uri>(uris.size)
         for (uri in uris) {
             runCatching {
                 context.contentResolver.takePersistableUriPermission(
@@ -443,22 +461,34 @@ fun GlideDropScreen(
             }
             val key = uri.toString()
             if (stagedItems.none { it.id == key }) {
-                val (name, size) = node.inspectUriMeta(uri)
-                stagedItems.add(
+                toResolve.add(uri)
+            }
+        }
+        activeTab = 0
+        if (toResolve.isEmpty()) return
+        appScope.launch {
+            val resolved = withContext(Dispatchers.IO) {
+                toResolve.map { uri ->
+                    val (name, size) = node.inspectUriMeta(uri)
                     StagedFileItem(
-                        id = key,
+                        id = uri.toString(),
                         uri = uri,
                         name = name,
                         sizeBytes = size,
                         category = categoryForFileName(name)
                     )
-                )
-                added++
+                }
             }
-        }
-        activeTab = 0
-        if (added > 0) {
-            Toast.makeText(context, "${stagedItems.size} file(s) staged — tap Send when ready", Toast.LENGTH_SHORT).show()
+            var added = 0
+            for (item in resolved) {
+                if (stagedItems.none { it.id == item.id }) {
+                    stagedItems.add(item)
+                    added++
+                }
+            }
+            if (added > 0) {
+                Toast.makeText(context, "${stagedItems.size} file(s) staged — tap Send when ready", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -526,6 +556,9 @@ fun GlideDropScreen(
             } else {
                 add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
+            if (Build.VERSION.SDK_INT >= 37) {
+                add("android.permission.ACCESS_LOCAL_NETWORK")
+            }
         }.toTypedArray()
     }
 
@@ -549,7 +582,7 @@ fun GlideDropScreen(
                 id = "ble-mac",
                 name = "Nearby Mac",
                 host = "ble://mac",
-                port = 192,
+                port = 0,
                 rssi = -55,
                 transport = "BLE + 5GHz P2P"
             )
@@ -935,6 +968,7 @@ fun GlideDropScreen(
                     themeMode = themeMode,
                     autoAccept = autoAccept,
                     shareCellularInternet = shareCellularInternet,
+                    proxyActualPort = proxyActualPort,
                     p2pStatus = p2pStatus,
                     endpoints = endpoints,
                     logs = logs,
@@ -1046,7 +1080,10 @@ private fun QuickShareTopBar(
                     border = BorderStroke(1.dp, c.borderSubtle),
                     modifier = Modifier
                         .size(40.dp)
-                        .pressableScale(onClick = onToggleTheme)
+                        .pressableScale(
+                            contentDesc = if (isDark) "Switch to light theme" else "Switch to dark theme",
+                            onClick = onToggleTheme
+                        )
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         QuickVectorIcon(
@@ -1064,7 +1101,10 @@ private fun QuickShareTopBar(
                     border = BorderStroke(1.dp, c.borderSubtle),
                     modifier = Modifier
                         .size(40.dp)
-                        .pressableScale(onClick = onRescanClick)
+                        .pressableScale(
+                            contentDesc = "Rescan nearby devices",
+                            onClick = onRescanClick
+                        )
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         QuickVectorIcon(
@@ -1164,7 +1204,10 @@ private fun LiveConnectionBridgeCard(
                     shape = CircleShape,
                     modifier = Modifier
                         .size(32.dp)
-                        .pressableScale(onClick = onCancel)
+                        .pressableScale(
+                            contentDesc = "Cancel active transfer",
+                            onClick = onCancel
+                        )
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         QuickVectorIcon(kind = QuickIconKind.CLOSE, tint = c.textSecondary, size = 14.dp)
@@ -2262,7 +2305,10 @@ private fun ReceiveRadarTab(
                             shadowElevation = 6.dp,
                             modifier = Modifier
                                 .size(62.dp)
-                                .pressableScale(onClick = onRescan)
+                                .pressableScale(
+                                    contentDesc = "Scan for nearby devices",
+                                    onClick = onRescan
+                                )
                         ) {
                             Box(contentAlignment = Alignment.Center) {
                                 QuickVectorIcon(kind = QuickIconKind.BLUETOOTH, tint = Color.White, size = 26.dp)
@@ -2735,6 +2781,7 @@ private fun SettingsScreenTab(
     themeMode: String,
     autoAccept: Boolean,
     shareCellularInternet: Boolean,
+    proxyActualPort: Int,
     p2pStatus: String,
     endpoints: List<String>,
     logs: List<String>,
@@ -2851,7 +2898,7 @@ private fun SettingsScreenTab(
             }
         }
 
-        // 3. Internet Sharing Proxy (Port 1080 SOCKS5 + HTTP CONNECT)
+        // 3. Internet Sharing Proxy (SOCKS5 + HTTP CONNECT, default port 1080 / dynamic fallback)
         item {
             Surface(
                 color = c.surfaceRaised,
@@ -2886,9 +2933,14 @@ private fun SettingsScreenTab(
                             modifier = Modifier.weight(1f)
                         )
                     }
+                    val proxyPortLabel = if (proxyActualPort > 0) {
+                        "active on port $proxyActualPort"
+                    } else {
+                        "default port ${EmbeddedProxyServer.DEFAULT_PROXY_PORT}"
+                    }
                     Text(
                         text = if (shareCellularInternet) {
-                            "Runs an embedded Dual-Protocol Proxy (SOCKS5 + HTTP CONNECT on port 1080). When Mac connects to 5GHz Wi-Fi Direct, it can route internet traffic through your phone's cellular connection."
+                            "Runs an embedded Dual-Protocol Proxy (SOCKS5 + HTTP CONNECT, $proxyPortLabel). When Mac connects to 5GHz Wi-Fi Direct, it can route internet traffic through your phone's cellular connection."
                         } else {
                             "Proxy disabled. Mac will not route internet traffic through this phone during P2P transfers."
                         },

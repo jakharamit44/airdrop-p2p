@@ -1,6 +1,8 @@
 import Foundation
 import Security
 import CryptoKit
+import Network
+import Darwin
 
 @main
 struct GlideDropDaemonTests {
@@ -399,12 +401,12 @@ struct GlideDropDaemonTests {
             ), "Must skip duplicate restoreMacInternetWifi when already clean")
 
             check(hasPendingWifiRestoreState(
-                wifiP2pIp: "192.168.49.55",
+                wifiP2pIp: "192.168.73.55",
                 wifiSsid: "HomeWiFi",
                 hasPrevProxy: false,
                 hasPrevWifi: false,
                 hasWarpPaused: false
-            ), "Must trigger fallback restore when 192.168.49.x IP is still bound")
+            ), "Must trigger fallback restore when active P2P IP is still bound")
 
             check(hasPendingWifiRestoreState(
                 wifiP2pIp: "",
@@ -676,6 +678,395 @@ struct GlideDropDaemonTests {
             let aiPerms2 = (aiAttrs2[.posixPermissions] as? NSNumber)?.intValue ?? 0
             check((aiPerms2 & 0o777) == 0o600, "claude_config.json permissions must stay 0600 after update")
             print("[PASS] Phase 3 Settings AI runtime pills & script detection")
+        }
+
+        // 10. Dynamic P2P CIDR, active_p2p_session.json, v2 vs legacy JOIN, and AWDL bridge validation
+        do {
+            cleanTestState()
+            check(deriveIpv4Cidr(ip: "192.168.73.1", prefixLen: 24) == "192.168.73.0/24", "deriveIpv4Cidr must compute /24 network")
+            check(deriveIpv4Cidr(ip: "192.168.73.130", prefixLen: 25) == "192.168.73.128/25", "deriveIpv4Cidr must compute /25 network")
+            check(deriveIpv4Cidr(ip: "192.168.73.1", prefixLen: 0) == nil, "deriveIpv4Cidr must reject prefixLen 0")
+            check(deriveIpv4Cidr(ip: "192.168.73.1", prefixLen: -1) == nil, "deriveIpv4Cidr must reject negative prefixLen")
+            check(deriveIpv4Cidr(ip: "192.168.73.1", prefixLen: 33) == nil, "deriveIpv4Cidr must reject prefixLen > 32")
+            check(parseIpv4Cidr("0.0.0.0/0") == nil, "parseIpv4Cidr must reject /0 wildcard CIDR")
+            check(cidrContains(cidr: "192.168.73.128/25", ip: "192.168.73.200"), "cidrContains must match dynamic /25 peer")
+            check(!cidrContains(cidr: "192.168.73.128/25", ip: "192.168.73.10"), "cidrContains must reject out-of-range host")
+
+            check(!isRfc1918Ipv4("172.15.255.255"), "172.15.x must NOT be treated as RFC1918")
+            check(isRfc1918Ipv4("172.16.0.1"), "172.16.0.1 must be RFC1918")
+            check(isRfc1918Ipv4("172.31.255.254"), "172.31.255.254 must be RFC1918")
+            check(!isRfc1918Ipv4("172.32.0.1"), "172.32.x must NOT be treated as RFC1918")
+            check(isCgnatIpv4("100.64.0.5"), "100.64.0.5 must be CGNAT")
+            check(!isCgnatIpv4("100.128.0.5"), "100.128.0.5 must NOT be CGNAT")
+
+            check(isValidP2pGatewayIp("192.168.73.1"), "RFC1918 P2P gateway must be valid")
+            check(isValidP2pGatewayIp("fe80::1%p2p0"), "IPv6 link-local gateway must be valid")
+            check(!isValidP2pGatewayIp("127.0.0.1"), "Loopback must NOT be valid P2P gateway")
+            check(!isValidP2pGatewayIp("8.8.8.8"), "Public IP must NOT be valid P2P gateway")
+
+            check(isNormalWifiIpv4("192.168.1.50", activeP2pCidr: "192.168.73.0/24"), "Normal LAN IP accepted")
+            check(isNormalWifiIpv4("100.64.5.10", activeP2pCidr: "192.168.73.0/24"), "CGNAT ISP Wi-Fi IP accepted")
+            check(isNormalWifiIpv4("172.15.20.1", activeP2pCidr: "192.168.73.0/24"), "Public Wi-Fi IP accepted")
+            check(isNormalWifiIpv4("192.168.49.55", activeP2pCidr: "192.168.73.0/24"), "Unrelated subnet must NOT be treated as P2P without an active matching session")
+            check(!isNormalWifiIpv4("192.168.49.55", activeP2pCidr: "192.168.49.0/24"), "Active P2P CIDR must exclude matching IP from normal Wi-Fi")
+            check(!isNormalWifiIpv4("192.168.1.50", activeP2pCidr: "192.168.73.0/24", rawWifiSsid: "DIRECT-XY-GlideDrop"), "DIRECT-* SSID must never be treated as normal Wi-Fi")
+            check(!isNormalWifiIpv4("192.168.73.55", activeP2pCidr: "192.168.73.0/24"), "Active dynamic P2P IP excluded from normal Wi-Fi")
+            check(!isNormalWifiIpv4("169.254.1.2", activeP2pCidr: "192.168.73.0/24"), "Link-local IP excluded from normal Wi-Fi")
+            check(!isNormalWifiIpv4("127.0.0.1", activeP2pCidr: "192.168.73.0/24"), "Loopback excluded from normal Wi-Fi")
+
+            writeActiveP2pSession(
+                gatewayIp: "192.168.73.1",
+                cidr: "192.168.73.0/24",
+                httpsPort: 9443,
+                proxyPort: 1081,
+                macRxPort: 9772,
+                udpKeepalivePort: 9774,
+                stateDir: testStateDir,
+                now: 1000.0
+            )
+            let loadedSess = loadActiveP2pSession(stateDir: testStateDir, maxAge: 60.0, now: 1010.0)
+            check(loadedSess?.gatewayIp == "192.168.73.1", "active_p2p_session gatewayIp mismatch")
+            check(loadedSess?.cidr == "192.168.73.0/24", "active_p2p_session cidr mismatch")
+            check(loadedSess?.httpsPort == 9443, "active_p2p_session httpsPort mismatch")
+            check(loadedSess?.proxyPort == 1081, "active_p2p_session proxyPort mismatch")
+            check(loadedSess?.macRxPort == 9772, "active_p2p_session macRxPort mismatch")
+            check(loadedSess?.udpKeepalivePort == 9774, "active_p2p_session udpKeepalivePort mismatch")
+            check(loadActiveP2pSession(stateDir: testStateDir, maxAge: 60.0, now: 1100.0) == nil, "Expired active_p2p_session must not load")
+            clearActiveP2pSession(stateDir: testStateDir)
+            check(loadActiveP2pSession(stateDir: testStateDir, maxAge: 60.0, now: 1010.0) == nil, "Cleared active_p2p_session must be removed")
+
+            let legacyJoin = parseWp2pJoinCredentials("DIRECT-XY-Test\tsecretpass")
+            check(legacyJoin?.isV2 == false && legacyJoin?.goIp == "" && legacyJoin?.proxyPort == 0, "Legacy 2-field JOIN must leave goIp empty without guessing a hardcoded IP")
+            check(formatWp2pJoinReply(macIp: "192.168.73.8", isV2: false, macRxPort: 8772, udpKeepalivePort: 8774) == "OK 192.168.73.8\n", "Legacy JOIN reply must keep 1-field format")
+
+            let invalidGoJoin = parseWp2pJoinCredentials("DIRECT-XY-Test\tsecretpass\t8.8.8.8\t2080")
+            check(invalidGoJoin?.isV2 == true && invalidGoJoin?.goIp == "" && invalidGoJoin?.proxyPort == 2080, "Invalid goIp in JOIN must remain empty rather than substituting a default")
+
+            let v2Join = parseWp2pJoinCredentials("DIRECT-XY-Test\tsecretpass\t192.168.73.1\t2080")
+            check(v2Join?.isV2 == true && v2Join?.goIp == "192.168.73.1" && v2Join?.proxyPort == 2080, "v2 4-field JOIN must extract goIp and proxyPort")
+            let v2NoProxy = parseWp2pJoinCredentials("DIRECT-XY-Test\tsecretpass\t192.168.73.1\t0")
+            check(v2NoProxy?.isV2 == true && v2NoProxy?.proxyPort == 0, "v2 JOIN with proxyPort=0 must stay 0")
+            check(formatWp2pJoinReply(macIp: "192.168.73.8", isV2: true, macRxPort: 9772, udpKeepalivePort: 9774) == "OK 192.168.73.8\t9772\t9774\n", "v2 JOIN reply must include negotiated ports")
+
+            check(isAllowedAwdlInterfaceNames(["awdl0"]), "awdl0 must be allowed on AWDL bridge")
+            check(!isAllowedAwdlInterfaceNames(["en0"]), "en0 must be rejected by AWDL bridge")
+            check(!isAllowedAwdlInterfaceNames(["lo0"]), "lo0 must be rejected by AWDL bridge")
+            check(!isAllowedAwdlInterfaceNames([]), "empty interface list must be rejected by AWDL bridge")
+
+            let daemonSource = try! String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("glidedrop-daemon.swift"), encoding: .utf8)
+            check(!daemonSource.contains("publishedPsm > 0 ? publishedPsm : 192"), "Daemon must not substitute fake 192 PSM fallback")
+            check(!daemonSource.contains("self?.publishedPsm ?? 192"), "Daemon PING reply must not substitute fake 192 PSM fallback")
+            check(!daemonSource.contains("DEFAULT_P2P_") && !daemonSource.contains("192.168.49"), "Daemon must not contain hardcoded DEFAULT_P2P_ or 192.168.49 references")
+            check(daemonSource.contains("prohibitedInterfaceTypes = [.wifi, .wiredEthernet, .cellular, .loopback]"), "AwdlLoopbackBridge must prohibit loopback while allowing .other (awdl0)")
+
+            // Interface P2P matching must not match stale/other subnet IPs when targeting an explicit P2P CIDR
+            check(
+                matchWifiP2pInterfaceAddress(
+                    ip: "192.168.49.8",
+                    netmask: "255.255.255.0",
+                    rawSsidIsDirect: true,
+                    matchingGateway: "192.168.73.1",
+                    matchingCidr: "192.168.73.0/24"
+                ) == nil,
+                "Unrelated subnet IP must NOT match explicit 192.168.73.0/24 target even when rawSsidIsDirect is true"
+            )
+            check(
+                matchWifiP2pInterfaceAddress(
+                    ip: "192.168.49.8",
+                    netmask: "255.255.255.0",
+                    rawSsidIsDirect: false,
+                    matchingGateway: nil,
+                    matchingCidr: nil,
+                    activeSession: nil
+                ) == nil,
+                "Without active session, explicit target, or DIRECT-* SSID, no IP may match as P2P"
+            )
+            let dynMatch = matchWifiP2pInterfaceAddress(
+                ip: "192.168.73.200",
+                netmask: "255.255.255.128",
+                rawSsidIsDirect: false, // redacted SSID must still work
+                matchingGateway: "192.168.73.129",
+                matchingCidr: "192.168.73.0/24"
+            )
+            check(dynMatch?.ip == "192.168.73.200" && dynMatch?.cidr == "192.168.73.128/25", "Dynamic P2P IP must match even when SSID is redacted")
+            let genericSess = ActiveP2pSession(gatewayIp: "192.168.73.1", cidr: "192.168.73.0/24", httpsPort: 9443, proxyPort: 2080, updatedAt: 1000.0)
+            check(
+                matchWifiP2pInterfaceAddress(ip: "192.168.73.55", netmask: "255.255.255.0", rawSsidIsDirect: false, activeSession: genericSess)?.ip == "192.168.73.55",
+                "Generic cleanup probe must detect active dynamic session P2P IP"
+            )
+            check(
+                matchWifiP2pInterfaceAddress(ip: "192.168.1.50", netmask: "255.255.255.0", rawSsidIsDirect: false, activeSession: genericSess) == nil,
+                "Normal HomeWiFi IP must NOT match P2P probe"
+            )
+            let broad16Match = matchWifiP2pInterfaceAddress(
+                ip: "172.16.5.20",
+                netmask: "255.255.0.0",
+                rawSsidIsDirect: true,
+                matchingGateway: "172.16.0.1",
+                matchingCidr: "172.16.0.0/24"
+            )
+            check(broad16Match?.ip == "172.16.5.20" && broad16Match?.cidr == "172.16.0.0/16", "DIRECT-* /16 P2P subnet must match via OS netmask containing gateway")
+            check(
+                matchWifiP2pInterfaceAddress(
+                    ip: "192.168.73.10",
+                    netmask: "255.255.255.128",
+                    rawSsidIsDirect: false,
+                    matchingGateway: "192.168.73.129",
+                    matchingCidr: "192.168.73.0/24"
+                ) == nil,
+                "OS /25 netmask contradicting gateway must NOT falsely match guessed /24 CIDR"
+            )
+            check(
+                matchWifiP2pInterfaceAddress(
+                    ip: "192.168.73.55",
+                    netmask: "255.255.255.0",
+                    rawSsidIsDirect: false,
+                    matchingGateway: "10.99.1.1",
+                    matchingCidr: nil,
+                    activeSession: genericSess
+                ) == nil,
+                "Stale activeSession CIDR must NOT match when targeting a different gateway"
+            )
+            check(
+                matchWifiP2pInterfaceAddress(
+                    ip: "192.168.73.1",
+                    netmask: nil,
+                    rawSsidIsDirect: false,
+                    matchingGateway: "192.168.73.1",
+                    matchingCidr: "192.168.73.0/24"
+                ) == nil,
+                "Interface IP equal to P2P gateway IP must NOT match as Mac P2P IP"
+            )
+
+            // Fallback proxy cleanup must clear dynamic session proxy, router IP on DIRECT-*, & tracked loopback proxy, but preserve unrelated proxies
+            check(shouldClearFallbackP2pProxy(ProxyEndpointConfig(enabled: true, server: "192.168.73.1", port: 2080, authenticated: false), session: genericSess), "Dynamic session proxy server must be cleared on fallback")
+            check(shouldClearFallbackP2pProxy(ProxyEndpointConfig(enabled: true, server: "10.88.0.1", port: 1080, authenticated: false), session: nil, currentRouterIp: "10.88.0.1"), "Active DIRECT-* router proxy server must be cleared on fallback even when session expired")
+            check(shouldClearFallbackP2pProxy(ProxyEndpointConfig(enabled: true, server: "127.0.0.1", port: 2080, authenticated: false), session: genericSess), "Tracked loopback proxy port must be cleared on fallback")
+            check(!shouldClearFallbackP2pProxy(ProxyEndpointConfig(enabled: true, server: "127.0.0.1", port: 9999, authenticated: false), session: genericSess), "Unrelated loopback proxy port must be preserved")
+            check(!shouldClearFallbackP2pProxy(ProxyEndpointConfig(enabled: true, server: "192.168.1.10", port: 8080, authenticated: false), session: genericSess), "Unrelated LAN proxy must be preserved")
+            print("[PASS] Dynamic P2P CIDR, active_p2p_session.json, v2 JOIN compatibility, and AWDL bridge guards")
+        }
+
+        // 11. extractDvzipCpioToDownloads bounds, forcePrompt=true, WARP-locked session wait, & AWDL Unix socket bridge
+        do {
+            cleanTestState()
+            let rxDir = testRoot.appendingPathComponent("extract_rx")
+            let srcDir = testRoot.appendingPathComponent("extract_src")
+            try! FileManager.default.createDirectory(at: rxDir, withIntermediateDirectories: true)
+            try! FileManager.default.createDirectory(at: srcDir, withIntermediateDirectories: true)
+
+            // 11a. Valid DVZip/CPIO extraction returns true and writes file
+            let sampleIn = srcDir.appendingPathComponent("ble_ok.txt")
+            try! Data("hello-ble-extract".utf8).write(to: sampleIn)
+            let (validGz, _) = try! buildDvzipCpio(files: [sampleIn])
+            let okExtract = extractDvzipCpioToDownloads(
+                archiveData: validGz,
+                metaDict: ["SenderComputerName": "PixelTest"],
+                downloadsDir: rxDir
+            )
+            check(okExtract, "Valid archive must return true from extractDvzipCpioToDownloads")
+            check(FileManager.default.fileExists(atPath: rxDir.appendingPathComponent("ble_ok.txt").path),
+                  "Extracted file must exist in downloadsDir")
+
+            // 11b. Truncated / corrupt archive must return false (never swallow failure)
+            let truncated = Data(validGz.prefix(max(1, validGz.count / 2)))
+            check(!extractDvzipCpioToDownloads(archiveData: truncated, metaDict: [:], downloadsDir: rxDir),
+                  "Truncated archive must return false")
+            check(!extractDvzipCpioToDownloads(archiveData: Data("NOT_A_CPIO".utf8), metaDict: [:], downloadsDir: rxDir),
+                  "Corrupt archive must return false")
+
+            // 11c. CPIO namesize overflow (> 4097) must return false
+            let badNsHeader = String(format: "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o", 0, 2, 0o100644, 0, 0, 1, 0, 0, 5000, 0)
+            check(!extractDvzipCpioToDownloads(archiveData: Data(badNsHeader.utf8), metaDict: [:], downloadsDir: rxDir),
+                  "CPIO namesize > 4097 must return false")
+
+            // 11d. Zip-bomb protection: compressed payload expanding past maxDecompressedBytes must return false
+            let bombFile = srcDir.appendingPathComponent("zeros.bin")
+            try! Data(repeating: 0, count: 256 * 1024).write(to: bombFile)
+            let (bombGz, _) = try! buildDvzipCpio(files: [bombFile])
+            check(!extractDvzipCpioToDownloads(archiveData: bombGz, metaDict: [:], downloadsDir: rxDir, maxDecompressedBytes: 65_536),
+                  "Archive exceeding maxDecompressedBytes must fail closed with false")
+
+            // 11e. forcePrompt: true ignores autoAccept: true and writes pending_ask.json
+            saveMacSettings(autoAccept: true, visible: true, deviceName: "TestMac")
+            let pendingAskFile = STATE_DIR.appendingPathComponent("pending_ask.json")
+            let askDecisionFile = STATE_DIR.appendingPathComponent("ask_decision.json")
+            let askWatcher = DispatchQueue.global(qos: .userInitiated)
+            var sawPendingAsk = false
+            askWatcher.async {
+                let deadline = Date().addingTimeInterval(3.0)
+                while Date() < deadline {
+                    if let d = try? Data(contentsOf: pendingAskFile),
+                       let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+                       let reqId = obj["id"] as? String {
+                        sawPendingAsk = true
+                        let dec = try! JSONSerialization.data(withJSONObject: ["id": reqId, "accepted": true])
+                        try? dec.write(to: askDecisionFile, options: [.atomic])
+                        return
+                    }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+            let promptAccepted = waitForMacUserAccept(senderName: "NearbyPeer", fileNames: ["5 GHz Wi-Fi Direct Connection (DIRECT-TEST)"], totalBytes: 0, forcePrompt: true)
+            check(sawPendingAsk && promptAccepted, "waitForMacUserAccept(forcePrompt: true) must prompt even when autoAccept is true")
+
+            // 11f. WARP-locked LAN fallback session keeps wp2p_authorized_session.json alive until upload_completed.flag
+            let authSessionFile = STATE_DIR.appendingPathComponent("wp2p_authorized_session.json")
+            let uploadDoneFile = STATE_DIR.appendingPathComponent("upload_completed.flag")
+            try? Data("{\"senderName\":\"Peer\"}".utf8).write(to: authSessionFile)
+            try? Data(String(Date().timeIntervalSince1970).utf8).write(to: LAN_FALLBACK_FILE)
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) {
+                try? Data("1".utf8).write(to: uploadDoneFile)
+            }
+            let lanDone = waitForLanFallbackSession(stateDir: testStateDir, initialStartTimeout: 2.0, idleTimeout: 1.0, maxDuration: 5.0, pollInterval: 0.05)
+            check(lanDone, "waitForLanFallbackSession must return true when upload_completed.flag appears")
+            check(FileManager.default.fileExists(atPath: authSessionFile.path),
+                  "wp2p_authorized_session.json must stay alive during waitForLanFallbackSession until outer defer cleans up")
+            check(!FileManager.default.fileExists(atPath: uploadDoneFile.path),
+                  "waitForLanFallbackSession must consume upload_completed.flag")
+
+            // Stale transfer_progress.json (>30s old) must NOT trigger transferDetected
+            let txProgressFile = STATE_DIR.appendingPathComponent("transfer_progress.json")
+            let staleObj: [String: Any] = ["active": true, "updatedAt": Date().timeIntervalSince1970 - 120.0]
+            try? JSONSerialization.data(withJSONObject: staleObj).write(to: txProgressFile)
+            let staleLanDone = waitForLanFallbackSession(stateDir: testStateDir, initialStartTimeout: 0.2, idleTimeout: 0.2, maxDuration: 0.5, pollInterval: 0.05)
+            check(!staleLanDone, "waitForLanFallbackSession must ignore stale transfer_progress.json and time out false")
+            try? FileManager.default.removeItem(at: txProgressFile)
+
+            // Multi-file raw uncompressed CPIO exceeding maxDecompressedBytes cumulatively must fail closed
+            func makeRawOdcEntry(name: String, payload: Data) -> Data {
+                let nameBytes = Data((name + "\0").utf8)
+                let hdrStr = String(format: "070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o", 0, 2, 0o100644, 0, 0, 1, 0, 0, nameBytes.count, payload.count)
+                var d = Data(hdrStr.utf8)
+                d.append(nameBytes)
+                d.append(payload)
+                return d
+            }
+            var rawMultiCpio = makeRawOdcEntry(name: "./part1.bin", payload: Data(repeating: 0x41, count: 40_000))
+            rawMultiCpio.append(makeRawOdcEntry(name: "./part2.bin", payload: Data(repeating: 0x42, count: 40_000)))
+            rawMultiCpio.append(makeRawOdcEntry(name: "TRAILER!!!", payload: Data()))
+            check(!extractDvzipCpioToDownloads(archiveData: rawMultiCpio, metaDict: [:], downloadsDir: rxDir, maxDecompressedBytes: 60_000),
+                  "Multi-file raw CPIO exceeding cumulative maxDecompressedBytes must fail closed")
+
+            // 11g. Source invariants for ADRE ordering, forcePrompt: true, and Unix socket bridge
+            let daemonSource = try! String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("glidedrop-daemon.swift"), encoding: .utf8)
+            check(daemonSource.contains("if !waitForMacUserAccept(senderName: incomingPeerName, fileNames: [\"5 GHz Wi-Fi Direct Connection (\\(ssid))\"], totalBytes: 0, forcePrompt: true, isRemoteAborted: isRemoteAbortedNow)"),
+                  "handleIncomingWp2pJoin must always enforce forcePrompt: true and check isRemoteAborted")
+            check(daemonSource.contains("if extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict) {\n                        _ = writeAll(out, data: Data(\"OK\\r\\n\".utf8))"),
+                  "ADRE must extract before sending OK")
+            check(daemonSource.contains("NWConnection(to: .unix(path: resolvedSockPath), using: .tcp)"),
+                  "AwdlLoopbackBridge must forward to Finder proxy over Unix domain socket")
+
+            // 11h. AwdlLoopbackBridge endpoint validation & real AF_UNIX NWConnection round-trip
+            check(!isAllowedAwdlEndpoint(.hostPort(host: .ipv4(IPv4Address("127.0.0.1")!), port: 8774)),
+                  "isAllowedAwdlEndpoint must reject IPv4 loopback")
+            check(!isAllowedAwdlEndpoint(.hostPort(host: .ipv6(IPv6Address("2001:db8::1")!), port: 8774)),
+                  "isAllowedAwdlEndpoint must reject non-link-local IPv6")
+            check(isAllowedAwdlEndpoint(.hostPort(host: .ipv6(IPv6Address("fe80::1")!), port: 8774)),
+                  "isAllowedAwdlEndpoint must accept link-local IPv6")
+
+            let unixSockPath = "/tmp/gd_unix_bridge_\(getpid()).sock"
+            unlink(unixSockPath)
+            defer { unlink(unixSockPath) }
+            let srvFd = socket(AF_UNIX, SOCK_STREAM, 0)
+            check(srvFd >= 0, "AF_UNIX socket creation must succeed")
+            if srvFd >= 0 {
+                var addr = sockaddr_un()
+                addr.sun_family = sa_family_t(AF_UNIX)
+                let pathBytes = Array(unixSockPath.utf8CString)
+                withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+                    ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dst in
+                        for (i, b) in pathBytes.enumerated() { dst[i] = b }
+                    }
+                }
+                let oldMask = umask(0o177)
+                let bindRes = withUnsafePointer(to: &addr) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        bind(srvFd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    }
+                }
+                umask(oldMask)
+                check(bindRes == 0 && listen(srvFd, 4) == 0, "AF_UNIX bind/listen must succeed")
+
+                let srvSem = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    var cliAddr = sockaddr()
+                    var cliLen: socklen_t = socklen_t(MemoryLayout<sockaddr>.size)
+                    let cliFd = accept(srvFd, &cliAddr, &cliLen)
+                    if cliFd >= 0 {
+                        var buf = [UInt8](repeating: 0, count: 16)
+                        let n = recv(cliFd, &buf, buf.count, 0)
+                        if n > 0 && String(bytes: buf.prefix(n), encoding: .utf8) == "PING" {
+                            let reply = Array("PONG".utf8)
+                            _ = send(cliFd, reply, reply.count, 0)
+                        }
+                        close(cliFd)
+                    }
+                    close(srvFd)
+                    srvSem.signal()
+                }
+
+                let nwDone = DispatchSemaphore(value: 0)
+                var gotPong = false
+                let nwConn = NWConnection(to: .unix(path: unixSockPath), using: .tcp)
+                nwConn.stateUpdateHandler = { st in
+                    if case .ready = st {
+                        nwConn.send(content: Data("PING".utf8), completion: .contentProcessed { _ in
+                            nwConn.receive(minimumIncompleteLength: 4, maximumLength: 16) { data, _, _, _ in
+                                if let d = data, String(data: d, encoding: .utf8) == "PONG" {
+                                    gotPong = true
+                                }
+                                nwConn.cancel()
+                                nwDone.signal()
+                            }
+                        })
+                    } else if case .failed(_) = st {
+                        nwDone.signal()
+                    }
+                }
+                nwConn.start(queue: DispatchQueue.global(qos: .userInitiated))
+                _ = nwDone.wait(timeout: .now() + 3.0)
+                _ = srvSem.wait(timeout: .now() + 3.0)
+                check(gotPong, "NWConnection(.unix) must round-trip PING/PONG to 0600 AF_UNIX listener")
+            }
+
+            print("[PASS] extractDvzipCpioToDownloads bounds, forcePrompt=true, WARP-locked session wait, & Unix socket bridge")
+        }
+
+        // 12. Cancel-sync & P2P large-file BLE fallback guard tests
+        do {
+            cleanTestState()
+            check(shouldAllowBleAutoFallback(fileCount: 0, totalRawBytes: 0, txExitCode: nil),
+                  "URL-only transfer may use BLE channel")
+            check(shouldAllowBleAutoFallback(fileCount: 1, totalRawBytes: BLE_AUTO_FALLBACK_MAX_RAW_BYTES, txExitCode: 1),
+                  "Small <=5MB file may fall back to BLE on P2P connect error")
+            check(!shouldAllowBleAutoFallback(fileCount: 1, totalRawBytes: BLE_AUTO_FALLBACK_MAX_RAW_BYTES + 1, txExitCode: 1),
+                  "Large >5MB file must refuse slow automatic BLE fallback")
+            for blockedCode: Int32 in [43, 44, 45, 46] {
+                check(!shouldAllowBleAutoFallback(fileCount: 1, totalRawBytes: 1024, txExitCode: blockedCode),
+                      "Exit code \(blockedCode) must never fall back to BLE even for small files")
+            }
+
+            // waitForMacUserAccept must abort immediately (<1.5s vs 60s) and clear pending_ask.json when sender aborts
+            let askFile = STATE_DIR.appendingPathComponent("pending_ask.json")
+            var remoteAborted = false
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.2) {
+                remoteAborted = true
+            }
+            let startedWait = Date()
+            let accepted = waitForMacUserAccept(
+                senderName: "PixelCancelTest",
+                fileNames: ["large.mov"],
+                totalBytes: 25_000_000,
+                forcePrompt: true,
+                isRemoteAborted: { remoteAborted }
+            )
+            let elapsedWait = Date().timeIntervalSince(startedWait)
+            check(!accepted, "waitForMacUserAccept must return false when remote sender aborts")
+            check(elapsedWait < 2.5, "waitForMacUserAccept must dismiss promptly on remote abort (took \(elapsedWait)s)")
+            check(!FileManager.default.fileExists(atPath: askFile.path), "pending_ask.json must be removed on remote abort")
+
+            print("[PASS] Cancel-sync prompt dismissal & large-file BLE fallback policy")
         }
 
         if failures > 0 {

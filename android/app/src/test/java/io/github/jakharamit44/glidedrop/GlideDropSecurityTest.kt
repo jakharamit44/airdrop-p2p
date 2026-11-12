@@ -599,4 +599,393 @@ class GlideDropSecurityTest {
             GlideDropNode.ADRE_ACK_TIMEOUT_MS >= 60_000L
         )
     }
+
+    @Test
+    fun validPeerTransferIpAndCidrValidationHandlesRfc1918AndDynamicSubnets() {
+        // Exact RFC 1918 172.16.0.0/12 boundaries
+        assertFalse(GlideDropNode.isValidPeerTransferIp("172.15.255.255"))
+        assertTrue(GlideDropNode.isValidPeerTransferIp("172.16.0.1"))
+        assertTrue(GlideDropNode.isValidPeerTransferIp("172.31.255.254"))
+        assertFalse(GlideDropNode.isValidPeerTransferIp("172.32.0.1"))
+
+        // Reject loopback, unspecified, multicast, public IPv4/IPv6
+        assertFalse(GlideDropNode.isValidPeerTransferIp("127.0.0.1"))
+        assertFalse(GlideDropNode.isValidPeerTransferIp("::1"))
+        assertFalse(GlideDropNode.isValidPeerTransferIp("8.8.8.8"))
+        assertFalse(GlideDropNode.isValidPeerTransferIp("2606:4700:4700::1111"))
+
+        // Accept IPv6 link-local & ULA
+        assertTrue(GlideDropNode.isValidPeerTransferIp("fe80::1%awdl0"))
+        assertTrue(GlideDropNode.isValidPeerTransferIp("fd12:3456::1"))
+
+        // Dynamic P2P subnet CIDR check & fail-closed invalid/zero prefix handling
+        val cidr = GlideDropNode.computeNetworkCidr("192.168.73.129", 25)
+        assertEquals("192.168.73.128/25", cidr)
+        assertNull(GlideDropNode.computeNetworkCidr("192.168.73.129", 0))
+        assertNull(GlideDropNode.computeNetworkCidr("192.168.73.129", -1))
+        assertNull(GlideDropNode.computeNetworkCidr("192.168.73.129", 33))
+        assertNull(GlideDropNode.computeNetworkCidr("", 24))
+        assertNull(GlideDropNode.computeNetworkCidr("not-an-ip", 24))
+        assertNull(GlideDropNode.parseCidr("0.0.0.0/0"))
+        assertNull(GlideDropNode.parseCidr("::/0"))
+        val parsed = listOf(GlideDropNode.parseCidr(cidr!!)!!)
+        assertTrue(GlideDropNode.isIpInCidrList("192.168.73.200", parsed))
+        assertFalse(GlideDropNode.isIpInCidrList("192.168.73.10", parsed))
+    }
+
+    @Test
+    fun receiverClientAllowedEnforcesActiveP2pCidrAndDeniesLoopbackByDefault() {
+        // With no active P2P subnet (emptyList), no P2P IP is allowed by default
+        assertFalse(GlideDropNode.isReceiverClientAllowed("192.168.49.1"))
+        assertFalse(GlideDropNode.isReceiverClientAllowed("192.168.73.42"))
+        assertFalse(GlideDropNode.isReceiverRequestClientAllowed("192.168.49.1", hasActiveSessionToken = false))
+
+        val dynamicSubnets = listOf(GlideDropNode.parseCidr("192.168.73.0/24")!!)
+        assertTrue(GlideDropNode.isReceiverClientAllowed("192.168.73.42", dynamicSubnets))
+        assertFalse(GlideDropNode.isReceiverClientAllowed("192.168.49.42", dynamicSubnets))
+        assertFalse(GlideDropNode.isReceiverClientAllowed("127.0.0.1", dynamicSubnets))
+        assertFalse(GlideDropNode.isReceiverClientAllowed("::1", dynamicSubnets))
+        assertTrue(GlideDropNode.isReceiverClientAllowed("127.0.0.1", dynamicSubnets, allowLoopback = true))
+
+        // Token-gated LAN fallback via isReceiverRequestClientAllowed:
+        assertFalse(GlideDropNode.isReceiverRequestClientAllowed("192.168.1.42", dynamicSubnets, hasActiveSessionToken = false))
+        assertTrue(GlideDropNode.isReceiverRequestClientAllowed("192.168.1.42", dynamicSubnets, hasActiveSessionToken = true))
+        assertFalse(GlideDropNode.isReceiverRequestClientAllowed("8.8.8.8", dynamicSubnets, hasActiveSessionToken = true))
+        assertFalse(GlideDropNode.isReceiverRequestClientAllowed("127.0.0.1", dynamicSubnets, hasActiveSessionToken = true))
+    }
+
+    @Test
+    fun productionAndroidSourcesContainNoHardcodedP2pIpDefaults() {
+        val cwd = File(System.getProperty("user.dir") ?: ".")
+        val androidMainDir = listOf(
+            File(cwd, "src/main/java/io/github/jakharamit44/glidedrop"),
+            File(cwd, "app/src/main/java/io/github/jakharamit44/glidedrop"),
+            File(cwd, "android/app/src/main/java/io/github/jakharamit44/glidedrop")
+        ).firstOrNull { it.isDirectory }
+        assertTrue("Expected Android main source directory under ${cwd.absolutePath}", androidMainDir != null)
+        val prodFiles = listOf(
+            File(androidMainDir!!, "GlideDropNode.kt"),
+            File(androidMainDir, "EmbeddedProxyServer.kt")
+        )
+        val forbidden = Regex("DEFAULT_P2P_|192\\.168\\.49|defaultP2pSubnets")
+        for (f in prodFiles) {
+            assertTrue("Expected production file to exist: ${f.absolutePath}", f.isFile)
+            val content = f.readText(StandardCharsets.UTF_8)
+            assertFalse(
+                "Forbidden hardcoded P2P default found in ${f.name}",
+                forbidden.containsMatchIn(content)
+            )
+        }
+    }
+
+    @Test
+    fun parseJoinReplyHandlesV2ThreeFieldsAndLegacyOneField() {
+        val v2 = GlideDropNode.parseJoinReply("OK 192.168.73.9\t9772\t9774\n")!!
+        assertEquals("192.168.73.9", v2.macIp)
+        assertEquals(9772, v2.macRxPort)
+        assertEquals(9774, v2.udpKeepalivePort)
+
+        val legacy = GlideDropNode.parseJoinReply("OK 192.168.49.5")!!
+        assertEquals("192.168.49.5", legacy.macIp)
+        assertEquals(GlideDropNode.DEFAULT_MAC_RX_PORT, legacy.macRxPort)
+        assertEquals(GlideDropNode.DEFAULT_UDP_KEEPALIVE_PORT, legacy.udpKeepalivePort)
+
+        val tabDelim = GlideDropNode.parseJoinReply("OK\t192.168.73.11\t9775\t9776")!!
+        assertEquals("192.168.73.11", tabDelim.macIp)
+        assertEquals(9775, tabDelim.macRxPort)
+        assertEquals(9776, tabDelim.udpKeepalivePort)
+        assertNull(GlideDropNode.parseJoinReply("OKAY 192.168.49.5"))
+    }
+
+    @Test
+    fun bleScanParserRejectsSpoofedStandalone0xADxxWithoutVerifiedMacService() {
+        val spoofedUuid = java.util.UUID.fromString("0000ad42-0000-1000-8000-00805f9b34fb")
+        val unverified = GlideDropNode.parseMacBleAdvertisement(
+            serviceUuids = listOf(spoofedUuid),
+            macDataBytes = null,
+            deviceName = "AD-42-Attacker"
+        )
+        assertFalse(unverified.hasMacService)
+        assertEquals(0, unverified.psm)
+
+        // Full 16-bit PSM > 255 in MAC_BLE_DATA_UUID payload (0x0123 LE = 291) with MAC_BLE_SERVICE_UUID
+        val psmBytes = byteArrayOf(0x23, 0x01) + "Studio Mac".toByteArray(StandardCharsets.UTF_8)
+        val verified = GlideDropNode.parseMacBleAdvertisement(
+            serviceUuids = listOf(GlideDropNode.MAC_BLE_SERVICE_UUID, spoofedUuid),
+            macDataBytes = psmBytes,
+            deviceName = "IgnoredName"
+        )
+        assertTrue(verified.hasMacService)
+        assertEquals(291, verified.psm)
+        assertEquals("Studio Mac", verified.displayName)
+
+        // Non-SIG 128-bit UUID with ADxx in upper bits must NOT be parsed as a 16-bit PSM
+        val nonSigUuid = java.util.UUID.fromString("1234ad42-5678-1000-8000-00805f9b34fb")
+        val noPsmFromRandom128 = GlideDropNode.parseMacBleAdvertisement(
+            serviceUuids = listOf(GlideDropNode.MAC_BLE_SERVICE_UUID, nonSigUuid),
+            macDataBytes = null,
+            deviceName = ""
+        )
+        assertTrue(noPsmFromRandom128.hasMacService)
+        assertEquals(0, noPsmFromRandom128.psm)
+
+        // Valid Bluetooth SIG 16-bit 0xADxx UUID alongside MAC_BLE_SERVICE_UUID extracts PSM
+        val sigPsm = GlideDropNode.parseMacBleAdvertisement(
+            serviceUuids = listOf(GlideDropNode.MAC_BLE_SERVICE_UUID, spoofedUuid),
+            macDataBytes = null,
+            deviceName = ""
+        )
+        assertTrue(sigPsm.hasMacService)
+        assertEquals(0x42, sigPsm.psm)
+    }
+
+    @Test
+    fun sessionBearerTokenValidationEnforcesMatchAndExpiry() {
+        val tok = "a1b2c3d4".repeat(8)
+        val now = 1_700_000_000_000L
+        val active = mapOf(tok to (now + 60_000L))
+        assertTrue(GlideDropNode.isValidSessionBearerToken(tok, active, now))
+        assertTrue(GlideDropNode.isValidSessionBearerToken("  ${tok.uppercase()}  ", active, now))
+        assertFalse(GlideDropNode.isValidSessionBearerToken("f".repeat(64), active, now))
+        assertFalse(GlideDropNode.isValidSessionBearerToken(tok, active, now + 60_001L))
+        assertFalse(GlideDropNode.isValidSessionBearerToken("short", active, now))
+    }
+
+    @Test
+    fun httpChunkedReaderRejectsNegativeAndMalformedChunkSizes() {
+        val valid = "5\r\nhello\r\n0\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
+        val validBody = GlideDropNode.readHttpBodyBytesBounded(
+            ByteArrayInputStream(valid),
+            mapOf("transfer-encoding" to "chunked")
+        )
+        assertEquals("hello", String(validBody, StandardCharsets.US_ASCII))
+
+        // Negative hex chunk size "-1" must throw HttpFramingException(400) (subclass of IOException, never IndexOutOfBoundsException)
+        val negChunk = "-1\r\nhello\r\n0\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
+        try {
+            GlideDropNode.openHttpBodyStream(
+                ByteArrayInputStream(negChunk),
+                mapOf("transfer-encoding" to "chunked")
+            ).readBytes()
+            fail("Negative chunk size '-1' must be rejected")
+        } catch (e: GlideDropNode.HttpFramingException) {
+            assertEquals(400, e.statusCode)
+        }
+
+        // Non-hex chunk size must throw HttpFramingException(400)
+        val badHex = "xyz\r\n0\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
+        try {
+            GlideDropNode.openHttpBodyStream(
+                ByteArrayInputStream(badHex),
+                mapOf("transfer-encoding" to "chunked")
+            ).readBytes()
+            fail("Malformed chunk size 'xyz' must be rejected")
+        } catch (e: GlideDropNode.HttpFramingException) {
+            assertEquals(400, e.statusCode)
+        }
+
+        // Missing CRLF after chunk payload must throw HttpFramingException(400)
+        val badTerminator = "5\r\nhelloXX0\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
+        try {
+            GlideDropNode.openHttpBodyStream(
+                ByteArrayInputStream(badTerminator),
+                mapOf("transfer-encoding" to "chunked")
+            ).readBytes()
+            fail("Missing CRLF after chunk must be rejected")
+        } catch (e: GlideDropNode.HttpFramingException) {
+            assertEquals(400, e.statusCode)
+        }
+    }
+
+    @Test
+    fun httpRequestHeadEnforcesHeaderLimitsAndNumericValidation() {
+        // 1. > 64 header lines -> 431
+        val tooManyHeaders = buildString {
+            append("POST /Discover HTTP/1.1\r\n")
+            for (i in 1..65) append("X-H$i: val\r\n")
+            append("\r\n")
+        }.toByteArray(StandardCharsets.US_ASCII)
+        try {
+            GlideDropNode.readHttpRequestHead(ByteArrayInputStream(tooManyHeaders))
+            fail("Expected 431 for >64 headers")
+        } catch (e: GlideDropNode.HttpFramingException) {
+            assertEquals(431, e.statusCode)
+        }
+
+        // 2. > 16,384 cumulative header bytes -> 431
+        val oversizedHeaders = buildString {
+            append("POST /Discover HTTP/1.1\r\n")
+            for (i in 1..4) append("X-Big-$i: ${"A".repeat(4500)}\r\n")
+            append("\r\n")
+        }.toByteArray(StandardCharsets.US_ASCII)
+        try {
+            GlideDropNode.readHttpRequestHead(ByteArrayInputStream(oversizedHeaders))
+            fail("Expected 431 for >16KB headers")
+        } catch (e: GlideDropNode.HttpFramingException) {
+            assertEquals(431, e.statusCode)
+        }
+
+        // 3. > 8,192 single line -> 431
+        val longLine = "POST /Discover HTTP/1.1\r\nX-Long: ${"B".repeat(8200)}\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
+        try {
+            GlideDropNode.readHttpRequestHead(ByteArrayInputStream(longLine))
+            fail("Expected 431 for >8KB line")
+        } catch (e: GlideDropNode.HttpFramingException) {
+            assertEquals(431, e.statusCode)
+        }
+
+        // 4. Invalid Content-Length, TotalBytes, duplicate Content-Length, CL+TE -> 400
+        val badRequests = listOf(
+            "POST /Discover HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+            "POST /Upload HTTP/1.1\r\nTotalBytes: -5\r\n\r\n",
+            "POST /Ask HTTP/1.1\r\nContent-Length: 10\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST /Ask HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\n",
+            "POST /Ask HTTP/1.1\r\nBad Header: 1\r\n\r\n"
+        )
+        for (req in badRequests) {
+            try {
+                GlideDropNode.readHttpRequestHead(ByteArrayInputStream(req.toByteArray(StandardCharsets.US_ASCII)))
+                fail("Expected 400 Bad Request for: $req")
+            } catch (e: GlideDropNode.HttpFramingException) {
+                assertEquals(400, e.statusCode)
+            }
+        }
+    }
+
+    @Test
+    fun httpMetaBodyReadCapsNonUploadPayloadsAtOneMebibyte() {
+        val exactMax = ByteArray(GlideDropNode.MAX_HTTP_META_BODY_BYTES) { 0x41 }
+        val ok = GlideDropNode.readHttpBodyBytesBounded(
+            ByteArrayInputStream(exactMax),
+            mapOf("content-length" to exactMax.size.toString())
+        )
+        assertEquals(GlideDropNode.MAX_HTTP_META_BODY_BYTES, ok.size)
+
+        try {
+            GlideDropNode.readHttpBodyBytesBounded(
+                ByteArrayInputStream(ByteArray(0)),
+                mapOf("content-length" to (GlideDropNode.MAX_HTTP_META_BODY_BYTES + 1).toString())
+            )
+            fail("Declared Content-Length > 1 MiB must fail with 413")
+        } catch (e: GlideDropNode.HttpFramingException) {
+            assertEquals(413, e.statusCode)
+        }
+
+        val chunkPayload = "A".repeat(GlideDropNode.MAX_HTTP_META_BODY_BYTES + 1)
+        val chunkedWire = (Integer.toHexString(chunkPayload.length) + "\r\n" + chunkPayload + "\r\n0\r\n\r\n")
+            .toByteArray(StandardCharsets.US_ASCII)
+        try {
+            GlideDropNode.readHttpBodyBytesBounded(
+                ByteArrayInputStream(chunkedWire),
+                mapOf("transfer-encoding" to "chunked")
+            )
+            fail("Chunked body > 1 MiB must fail with 413")
+        } catch (e: GlideDropNode.HttpFramingException) {
+            assertEquals(413, e.statusCode)
+        }
+    }
+
+    @Test
+    fun pendingMacTxAtomicClaimAllowsOnlySingleWinnerUnderConcurrency() {
+        val tx = GlideDropNode.PendingMacTx(
+            metaBytes = ByteArray(4),
+            archiveBytes = ByteArray(0),
+            entries = emptyList(),
+            url = "https://example.com",
+            label = "test",
+            fileCount = 1,
+            totalRawBytes = 0L,
+            result = kotlinx.coroutines.CompletableDeferred()
+        )
+        val threads = 8
+        val startGate = java.util.concurrent.CountDownLatch(1)
+        val doneGate = java.util.concurrent.CountDownLatch(threads)
+        val wins = java.util.concurrent.atomic.AtomicInteger(0)
+        val pool = Executors.newFixedThreadPool(threads)
+        try {
+            repeat(threads) {
+                pool.submit {
+                    startGate.await()
+                    if (tx.tryClaim()) wins.incrementAndGet()
+                    doneGate.countDown()
+                }
+            }
+            startGate.countDown()
+            assertTrue(doneGate.await(5, TimeUnit.SECONDS))
+            assertEquals(1, wins.get())
+            assertTrue(tx.isClaimed)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    @Test
+    fun wifiDirectPostTransferActionPreservesReuseOnSuccessAndCleansOrphanedLanGroup() {
+        assertEquals(
+            GlideDropNode.WifiDirectPostTransferAction.PRESERVE_FOR_REUSE_AND_SCHEDULE_TEARDOWN,
+            GlideDropNode.resolveWifiDirectPostTransferAction(
+                txSuccess = true,
+                transferCancelled = false,
+                isP2pHost = true,
+                hasWifiDirectCreds = true
+            )
+        )
+        assertEquals(
+            GlideDropNode.WifiDirectPostTransferAction.CLEAR_AND_STOP_GROUP_NOW,
+            GlideDropNode.resolveWifiDirectPostTransferAction(
+                txSuccess = false,
+                transferCancelled = false,
+                isP2pHost = true,
+                hasWifiDirectCreds = true
+            )
+        )
+        assertEquals(
+            GlideDropNode.WifiDirectPostTransferAction.CLEAR_AND_STOP_GROUP_NOW,
+            GlideDropNode.resolveWifiDirectPostTransferAction(
+                txSuccess = true,
+                transferCancelled = true,
+                isP2pHost = true,
+                hasWifiDirectCreds = true
+            )
+        )
+        assertEquals(
+            GlideDropNode.WifiDirectPostTransferAction.CLEAR_AND_STOP_GROUP_NOW,
+            GlideDropNode.resolveWifiDirectPostTransferAction(
+                txSuccess = true,
+                transferCancelled = false,
+                isP2pHost = false,
+                hasWifiDirectCreds = true
+            )
+        )
+        assertEquals(
+            GlideDropNode.WifiDirectPostTransferAction.CLEAR_ONLY,
+            GlideDropNode.resolveWifiDirectPostTransferAction(
+                txSuccess = true,
+                transferCancelled = false,
+                isP2pHost = false,
+                hasWifiDirectCreds = false
+            )
+        )
+    }
+
+    @Test
+    fun receiverClientAllowedRejectsMappedLoopbackAndRestrictedIpsEvenWithSessionToken() {
+        val dynamicSubnets = listOf(GlideDropNode.parseCidr("192.168.73.0/24")!!)
+        for (blocked in listOf("::ffff:127.0.0.1", "::", "0.0.0.0", "100.64.0.1", "169.254.169.254")) {
+            assertFalse(
+                "Expected $blocked to be rejected even with active session token",
+                GlideDropNode.isReceiverRequestClientAllowed(blocked, dynamicSubnets, hasActiveSessionToken = true)
+            )
+        }
+    }
+
+    @Test
+    fun largeFilesRefuseAutomaticBleFallbackAndKeepProtocolWireCap() {
+        assertEquals(30_000_000L, GlideDropNode.MAX_ENCRYPTED_BLE_ARCHIVE_BYTES)
+        assertEquals(5_000_000L, GlideDropNode.MAX_BLE_AUTO_FALLBACK_BYTES)
+        assertTrue(GlideDropNode.shouldAllowBleAutoFallback(0L, hasEntries = false))
+        assertTrue(GlideDropNode.shouldAllowBleAutoFallback(5_000_000L, hasEntries = true))
+        assertFalse(GlideDropNode.shouldAllowBleAutoFallback(5_000_001L, hasEntries = true))
+        assertFalse(GlideDropNode.shouldAllowBleAutoFallback(25_000_000L, hasEntries = true))
+    }
 }

@@ -20,10 +20,10 @@ GlideDrop transfers files, links, and text notes directly between Android (API 3
        |     * Transfers encrypted 5 GHz Wi-Fi Direct SSID + key     |
        |                                                             |
        |  3. Wi-Fi Direct Association & Address Assignment           |
-       |     * Mac prompts user before joining DIRECT-* SSID         |
-       |       (unless Auto-Accept is enabled in macOS settings)     |
+       |     * Mac always prompts before joining DIRECT-* SSID       |
+       |       (`forcePrompt: true`, even when Auto-Accept is on)    |
        |     * Mac associates via CoreWLAN / networksetup            |
-       |     * Mac receives P2P DHCP IP (192.168.49.x)               |
+       |     * Mac receives dynamic OS P2P DHCP IP (active CIDR)     |
        |     * Optional: Mac points SOCKS5/HTTP proxy to :1080       |
        |                                                             |
        |  4. Pinned TLS HTTPS Stream (/Discover, /Ask, /Upload)      |
@@ -31,7 +31,7 @@ GlideDrop transfers files, links, and text notes directly between Android (API 3
        |     * POST /Ask (bplist00 file/URL metadata & approval)     |
        |     * POST /Upload (DVZip/CPIO chunked archive stream)      |
        |<===========================================================>| (45+ MB/s)
-       |     * 2.0s UDP ARP keepalive over 192.168.49.x              |
+       |     * 2.0s UDP ARP keepalive over active P2P subnet         |
        |                                                             |
        |  5. Clean Teardown & Network Restore                        |
        |     * Mac restores snapshot proxy settings (no sudo)        |
@@ -56,7 +56,7 @@ GlideDrop transfers files, links, and text notes directly between Android (API 3
 
 * **Autonomous 5 GHz Group**: Android creates a temporary Wi-Fi Direct Group Owner (GO) on 5 GHz (Band 4 / UNII-3) with a per-session random 12-hex-character WPA2 passphrase.
 * **DVZip + Extended 64-bit CPIO**: Archives stream directly from source file descriptors over HTTP/1.1 chunked encoding to `/Upload` (`port 8772` on macOS, `port 8771` on Android). Files up to 8 GiB use standard POSIX `070707` headers; files 8 GiB and larger switch to extended `070764` headers with 64-bit hex sizes, writing safely via `.part` staging and canonical destination checks.
-* **macOS Finder Share Proxy (`awdl0`)**: When an Android peer is nearby, macOS advertises internal `_airdrop._tcp` on `awdl0:8774` (`glidedrop.local.`), receives drops on `127.0.0.1:8773`, and forwards them to the Android peer.
+* **macOS Finder Share Proxy (`awdl0`)**: When an Android peer is nearby, macOS advertises internal `_airdrop._tcp` on `awdl0:8774` (`glidedrop.local.`), verifies `awdl*` interface/endpoint provenance in `AwdlLoopbackBridge`, forwards over a mode-`0600` Unix domain socket (`~/.glidedrop/finder_proxy.sock`) inside `0700` `~/.glidedrop`, and dispatches received items to the Android peer.
 
 ### C. Kernel Neighbor Cache Keepalive
 
@@ -66,8 +66,8 @@ Unidirectional HTTP uploads at 45+ MB/s can starve reverse ARP traffic, causing 
 
 When macOS switches Wi-Fi to the offline `DIRECT-*` SSID, [`EmbeddedProxyServer.kt`](../android/app/src/main/java/io/github/jakharamit44/glidedrop/EmbeddedProxyServer.kt) can serve SOCKS5 (RFC 1928) and HTTP `CONNECT`/Forward traffic on port `1080`, binding outbound sockets to Android's active validated internet network or cellular fallback (`ConnectivityManager`).
 
-* Only `192.168.49.0/24` and loopback clients are accepted (opt-in setting, off by default).
-* Pre- and post-DNS SSRF checks reject loopback, wildcard, RFC 1918 private LAN, link-local (`169.254.0.0/16`, `fe80::/10`), IPv6 ULA (`fc00::/7`), NAT64, `.localdomain`, and multicast destinations across all ports, while header filtering strips `Proxy-Authorization` and blocks `Upgrade` smuggling.
+* Only active OS-resolved Wi-Fi Direct P2P subnet clients are accepted (opt-in setting, off by default; loopback denied in production).
+* Pre- and post-DNS SSRF checks reject loopback, wildcard, RFC 1918 private LAN, link-local (`169.254.0.0/16`, `fe80::/10`), IPv6 ULA (`fc00::/7`), NAT64, `.localdomain`, and multicast destinations across all ports, while header filtering rejects `TE.CL`/`CL.CL` request smuggling (`400 Bad Request`), strips `Proxy-Authorization`, and blocks `Upgrade` smuggling.
 * On macOS, `glidedrop-daemon.swift` serializes snapshot and restore operations under an advisory file lock (`proxy_state.lock`) via `networksetup`, preserving existing proxy settings and bypass domains without `sudo`.
 
 ### E. macOS Wi-Fi & VPN Recovery
@@ -76,4 +76,4 @@ Before joining a Wi-Fi Direct SSID, macOS records the active Wi-Fi network, paus
 
 ### F. Optional AI Sidecar Processor (`claude_processor.py`)
 
-When explicitly enabled, received files on macOS pass through a local Privacy Guard (blocking private keys, `.pem`, `.key`, `.env*`, and API tokens by filename and regex inspection). Benign files can be summarized offline via macOS Apple Vision OCR and a local Ollama instance (`http://localhost:11434`), or via Anthropic's Messages API (`claude-sonnet-4-6` with fallback to `claude-haiku-4-5` / `claude-opus-4-6`).
+When explicitly enabled, received files on macOS pass through a streaming full-file Privacy Guard (blocking private keys, `.pem`, `.key`, `.env*`, and API tokens by filename, regex inspection across text/code extensions, and Vision OCR pre-scanning on images). Benign files can be summarized offline via macOS Apple Vision OCR and a local Ollama instance (`http://localhost:11434`), or via Anthropic's Messages API (`claude-sonnet-4-6` with fallback to `claude-haiku-4-5` / `claude-opus-4-6`) with `<untrusted_file_content>` prompt-injection delimiters.

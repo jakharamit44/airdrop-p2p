@@ -12,6 +12,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.PushbackInputStream
+import java.net.BindException
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -33,17 +34,19 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Dual-Protocol Embedded Proxy Server (SOCKS5 + HTTP CONNECT & Forward Proxy) on port 1080.
+ * Dual-Protocol Embedded Proxy Server (SOCKS5 + HTTP CONNECT & Forward Proxy), default port 1080.
  *
  * Runs on Android during Wi-Fi Direct P2P transfers so connected macOS peers
  * can route internet traffic through Android's active upstream cellular connection.
  *
  * Security & Reliability features:
- * - Listens on wildcard 0.0.0.0:1080 to avoid EADDRNOTAVAIL during async P2P IP allocation.
- * - Client IP Whitelist: strictly accepts connections only from 192.168.49.0/24, 127.0.0.1, ::1.
+ * - Listens on wildcard 0.0.0.0:<port> (falling back to ephemeral port on BindException)
+ *   to avoid EADDRNOTAVAIL during async P2P IP allocation.
+ * - Client IP Whitelist: strictly accepts connections only from active P2P subnets
+ *   (empty when no P2P subnet is active; loopback clients denied unless allowLoopbackClients=true).
  * - SSRF Protection: blocks loopback, wildcard, link-local/cloud metadata, RFC 1918 private LAN,
- *   IPv6 ULA/site-local, and multicast targets across all destination ports (1-65535), both
- *   pre-DNS (including obfuscated numeric/hex/octal IPv4 and IPv6 literals) and post-DNS.
+ *   CGNAT, TEST-NET, benchmarking, 6to4/Teredo, IPv6 ULA/site-local, and multicast targets across
+ *   all destination ports (1-65535), both pre-DNS and post-DNS.
  * - Dual-Protocol parser multiplexing SOCKS5 (0x05) and HTTP (CONNECT, GET, POST, HEAD, etc.).
  * - Constant-memory sliding-window HTTP header parser (bounded at 8 KB), strips hop-by-hop and
  *   proxy credential headers, blocks Upgrade protocol-switch requests, and enforces Connection: close.
@@ -56,14 +59,16 @@ class EmbeddedProxyServer internal constructor(
     val port: Int = DEFAULT_PROXY_PORT,
     private val logger: ((String) -> Unit)? = null,
     private val outboundAddressResolver: ((Network?, String) -> Array<InetAddress>)? = null,
-    private val outboundSocketConnectHook: ((Socket, InetAddress, Int, Int) -> Unit)? = null
+    private val outboundSocketConnectHook: ((Socket, InetAddress, Int, Int) -> Unit)? = null,
+    private val allowedP2pSubnetsProvider: () -> List<Pair<ByteArray, Int>> = { emptyList() },
+    private val allowLoopbackClients: Boolean = false
 ) : Closeable {
 
     constructor(
         context: Context? = null,
         port: Int = DEFAULT_PROXY_PORT,
         logger: ((String) -> Unit)? = null
-    ) : this(context, port, logger, null, null)
+    ) : this(context, port, logger, null, null, { emptyList() }, false)
 
     companion object {
         const val DEFAULT_PROXY_PORT = 1080
@@ -93,32 +98,64 @@ class EmbeddedProxyServer internal constructor(
         private const val SOCKS_REP_CMD_NOT_SUPPORTED = 0x07
         private const val SOCKS_REP_ADDR_NOT_SUPPORTED = 0x08
 
-        fun isClientAllowed(addr: InetAddress?): Boolean {
-            if (addr == null) return false
-            if (addr.isLoopbackAddress) return true
-            val host = addr.hostAddress ?: return false
-            val normalized = if (host.startsWith("::ffff:")) host.removePrefix("::ffff:") else host
-            if (normalized == "127.0.0.1" || normalized == "::1") return true
-            if (addr is Inet4Address || (normalized.contains('.') && !normalized.contains(':'))) {
-                val parts = normalized.split('.')
-                if (parts.size == 4 && parts[0] == "192" && parts[1] == "168" && parts[2] == "49") {
-                    val last = parts[3].toIntOrNull()
-                    if (last != null && last in 0..255) return true
-                }
+        internal fun unwrapMappedIpv4Bytes(raw: ByteArray): ByteArray {
+            if (raw.size == 16 &&
+                (0 until 10).all { raw[it] == 0.toByte() } &&
+                raw[10] == 0xFF.toByte() &&
+                raw[11] == 0xFF.toByte()
+            ) {
+                return raw.copyOfRange(12, 16)
             }
-            return false
+            return raw
         }
 
-        fun isP2pSubnetAddress(addr: InetAddress?): Boolean {
-            if (addr == null) return false
-            val host = addr.hostAddress ?: return false
-            val normalized = if (host.startsWith("::ffff:")) host.removePrefix("::ffff:") else host
-            val parts = normalized.split('.')
-            if (parts.size == 4 && parts[0] == "192" && parts[1] == "168" && parts[2] == "49") {
-                val last = parts[3].toIntOrNull()
-                if (last != null && last in 0..255) return true
+        internal fun matchesCidr(addrBytes: ByteArray, networkBytes: ByteArray, prefixLen: Int): Boolean {
+            val a = unwrapMappedIpv4Bytes(addrBytes)
+            val n = unwrapMappedIpv4Bytes(networkBytes)
+            if (a.size != n.size) return false
+            val maxBits = a.size * 8
+            if (prefixLen !in 1..maxBits) return false
+            val fullBytes = prefixLen / 8
+            for (i in 0 until fullBytes) {
+                if (a[i] != n[i]) return false
             }
-            return false
+            val remBits = prefixLen % 8
+            if (remBits > 0) {
+                val mask = (0xFF shl (8 - remBits)) and 0xFF
+                if ((a[fullBytes].toInt() and mask) != (n[fullBytes].toInt() and mask)) return false
+            }
+            return true
+        }
+
+        internal fun isLoopbackBytes(raw: ByteArray): Boolean {
+            val b = unwrapMappedIpv4Bytes(raw)
+            return when (b.size) {
+                4 -> (b[0].toInt() and 0xFF) == 127
+                16 -> (0 until 15).all { b[it] == 0.toByte() } && b[15] == 1.toByte()
+                else -> false
+            }
+        }
+
+        fun isClientAllowed(
+            addr: InetAddress?,
+            allowedSubnets: List<Pair<ByteArray, Int>> = emptyList(),
+            allowLoopbackClients: Boolean = false
+        ): Boolean {
+            if (addr == null) return false
+            val raw = addr.address ?: return false
+            if (addr.isLoopbackAddress || isLoopbackBytes(raw)) {
+                return allowLoopbackClients
+            }
+            return isP2pSubnetAddress(addr, allowedSubnets)
+        }
+
+        fun isP2pSubnetAddress(
+            addr: InetAddress?,
+            allowedSubnets: List<Pair<ByteArray, Int>> = emptyList()
+        ): Boolean {
+            if (addr == null) return false
+            val raw = addr.address ?: return false
+            return allowedSubnets.any { (net, prefix) -> matchesCidr(raw, net, prefix) }
         }
 
         private val STRIPPED_HOP_BY_HOP_HEADERS = setOf(
@@ -287,12 +324,20 @@ class EmbeddedProxyServer internal constructor(
             if (b.size != 4) return true
             val b0 = b[0].toInt() and 0xFF
             val b1 = b[1].toInt() and 0xFF
+            val b2 = b[2].toInt() and 0xFF
             if (b0 == 0) return true                              // 0.0.0.0/8 (wildcard / "this" network)
             if (b0 == 10) return true                             // 10.0.0.0/8 (RFC 1918)
+            if (b0 == 100 && b1 in 64..127) return true           // 100.64.0.0/10 (CGNAT / RFC 6598)
             if (b0 == 127) return true                            // 127.0.0.0/8 (loopback)
             if (b0 == 169 && b1 == 254) return true               // 169.254.0.0/16 (link-local / cloud metadata)
             if (b0 == 172 && b1 in 16..31) return true            // 172.16.0.0/12 (RFC 1918)
-            if (b0 == 192 && b1 == 168) return true               // 192.168.0.0/16 (RFC 1918, incl. 192.168.49.0/24)
+            if (b0 == 192 && b1 == 0 && b2 == 0) return true      // 192.0.0.0/24 (IETF protocol assignments)
+            if (b0 == 192 && b1 == 0 && b2 == 2) return true      // 192.0.2.0/24 (TEST-NET-1)
+            if (b0 == 192 && b1 == 88 && b2 == 99) return true    // 192.88.99.0/24 (6to4 relay anycast)
+            if (b0 == 192 && b1 == 168) return true               // 192.168.0.0/16 (RFC 1918)
+            if (b0 == 198 && b1 in 18..19) return true            // 198.18.0.0/15 (benchmarking)
+            if (b0 == 198 && b1 == 51 && b2 == 100) return true   // 198.51.100.0/24 (TEST-NET-2)
+            if (b0 == 203 && b1 == 0 && b2 == 113) return true    // 203.0.113.0/24 (TEST-NET-3)
             if (b0 >= 224) return true                            // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved/broadcast
             return false
         }
@@ -306,10 +351,19 @@ class EmbeddedProxyServer internal constructor(
 
             val b0 = b[0].toInt() and 0xFF
             val b1 = b[1].toInt() and 0xFF
+            val b2 = b[2].toInt() and 0xFF
+            val b3 = b[3].toInt() and 0xFF
+            val b4 = b[4].toInt() and 0xFF
+            val b5 = b[5].toInt() and 0xFF
             if (b0 == 0xFE && (b1 and 0xC0) == 0x80) return true  // fe80::/10 (link-local)
             if (b0 == 0xFE && (b1 and 0xC0) == 0xC0) return true  // fec0::/10 (site-local)
             if ((b0 and 0xFE) == 0xFC) return true                // fc00::/7 (ULA: fc00::/8 & fd00::/8)
             if (b0 == 0xFF) return true                           // ff00::/8 (multicast)
+            if (b0 == 0x20 && b1 == 0x02) return true             // 2002::/16 (6to4)
+            if (b0 == 0x20 && b1 == 0x01 && b2 == 0x00 && b3 == 0x00) return true // 2001::/32 (Teredo)
+            if (b0 == 0x20 && b1 == 0x01 && b2 == 0x00 && b3 == 0x02 && b4 == 0x00 && b5 == 0x00) return true // 2001:2::/48 (benchmarking)
+            if (b0 == 0x20 && b1 == 0x01 && b2 == 0x0D && b3 == 0xB8) return true // 2001:db8::/32 (documentation)
+            if (b0 == 0x01 && b1 == 0x00 && (2 until 8).all { b[it] == 0.toByte() }) return true // 100::/64 (discard-only)
 
             // IPv4-mapped (::ffff:0:0/96) and IPv4-compatible (::/96)
             val prefixZeros0to9 = (0 until 10).all { b[it] == 0.toByte() }
@@ -335,7 +389,10 @@ class EmbeddedProxyServer internal constructor(
             return false
         }
 
-        fun isBlockedInetAddress(addr: InetAddress?): Boolean {
+        fun isBlockedInetAddress(
+            addr: InetAddress?,
+            allowedP2pSubnets: List<Pair<ByteArray, Int>> = emptyList()
+        ): Boolean {
             if (addr == null) return true
             if (addr.isAnyLocalAddress ||
                 addr.isLoopbackAddress ||
@@ -345,7 +402,7 @@ class EmbeddedProxyServer internal constructor(
             ) {
                 return true
             }
-            if (isP2pSubnetAddress(addr)) return true
+            if (isP2pSubnetAddress(addr, allowedP2pSubnets)) return true
             val raw = addr.address ?: return true
             return when (raw.size) {
                 4 -> isBlockedIpv4Bytes(raw)
@@ -354,7 +411,11 @@ class EmbeddedProxyServer internal constructor(
             }
         }
 
-        fun isTargetSafe(host: String, port: Int): Boolean {
+        fun isTargetSafe(
+            host: String,
+            port: Int,
+            allowedP2pSubnets: List<Pair<ByteArray, Int>> = emptyList()
+        ): Boolean {
             if (port !in 1..65535) return false
             val trimmed = host.trim()
             if (trimmed.isEmpty()) return false
@@ -374,7 +435,7 @@ class EmbeddedProxyServer internal constructor(
             val cleanHost = unwrapped.lowercase(java.util.Locale.US).trimEnd('.')
             if (cleanHost.isEmpty()) return false
 
-            // Block local, loopback, mDNS, and internal/cloud metadata hostnames across all ports
+            // Block local, loopback, mDNS, LAN suffixes, and internal/cloud metadata hostnames across all ports
             if (cleanHost == "localhost" ||
                 cleanHost.endsWith(".localhost") ||
                 cleanHost == "localhost.localdomain" ||
@@ -383,9 +444,16 @@ class EmbeddedProxyServer internal constructor(
                 cleanHost == "ip6-loopback" ||
                 cleanHost == "local" ||
                 cleanHost.endsWith(".local") ||
+                cleanHost == "home.arpa" ||
+                cleanHost.endsWith(".home.arpa") ||
+                cleanHost == "lan" ||
+                cleanHost.endsWith(".lan") ||
                 cleanHost == "internal" ||
                 cleanHost.endsWith(".internal") ||
                 cleanHost == "metadata" ||
+                cleanHost == "metadata.goog" ||
+                cleanHost.endsWith(".metadata.goog") ||
+                cleanHost == "metadata.google.internal" ||
                 cleanHost == "instance-data"
             ) {
                 return false
@@ -393,13 +461,17 @@ class EmbeddedProxyServer internal constructor(
 
             // Block restricted IPv4 literals (including decimal/hex/octal/shortened forms) across all ports
             parseIpv4Literal(cleanHost)?.let { ipv4Bytes ->
-                return !isBlockedIpv4Bytes(ipv4Bytes)
+                if (isBlockedIpv4Bytes(ipv4Bytes)) return false
+                if (allowedP2pSubnets.any { (net, prefix) -> matchesCidr(ipv4Bytes, net, prefix) }) return false
+                return true
             }
 
             // Block restricted IPv6 literals across all ports
             if (cleanHost.contains(':')) {
                 val ipv6Bytes = parseIpv6Literal(cleanHost) ?: return false
-                return !isBlockedIpv6Bytes(ipv6Bytes)
+                if (isBlockedIpv6Bytes(ipv6Bytes)) return false
+                if (allowedP2pSubnets.any { (net, prefix) -> matchesCidr(ipv6Bytes, net, prefix) }) return false
+                return true
             }
 
             return true
@@ -416,6 +488,33 @@ class EmbeddedProxyServer internal constructor(
                     return true
                 }
             }
+            return false
+        }
+
+        internal fun hasConflictingFramingHeaders(rawHeaderBlock: String): Boolean {
+            val allLines = rawHeaderBlock.split(Regex("\\r\\n|\\n|\\r"))
+            var contentLengthCount = 0
+            var hasTransferEncoding = false
+            for (i in 1 until allLines.size) {
+                val line = allLines[i]
+                if (line.isEmpty()) continue
+                val colonIdx = line.indexOf(':')
+                if (colonIdx <= 0) return true
+                val rawName = line.substring(0, colonIdx)
+                if (rawName.any { it.isWhitespace() }) return true
+                val name = rawName.trim().lowercase(java.util.Locale.US)
+                val value = line.substring(colonIdx + 1).trim()
+                if (name == "content-length") {
+                    contentLengthCount++
+                    if (value.isEmpty() || !value.all { it in '0'..'9' }) {
+                        return true
+                    }
+                } else if (name == "transfer-encoding") {
+                    hasTransferEncoding = true
+                }
+            }
+            if (hasTransferEncoding && contentLengthCount > 0) return true
+            if (contentLengthCount > 1) return true
             return false
         }
 
@@ -536,13 +635,30 @@ class EmbeddedProxyServer internal constructor(
     val running: Boolean
         get() = isRunning.get()
 
+    private fun isClientAddressAllowed(addr: InetAddress?): Boolean {
+        return isClientAllowed(addr, allowedP2pSubnetsProvider(), allowLoopbackClients)
+    }
+
+    private fun isDestinationSafe(host: String, port: Int): Boolean {
+        return isTargetSafe(host, port, allowedP2pSubnetsProvider())
+    }
+
     @Synchronized
     fun start(): Boolean {
         if (isRunning.getAndSet(true)) return true
         try {
-            val srv = ServerSocket()
-            srv.reuseAddress = true
-            srv.bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), port))
+            var srv = ServerSocket()
+            try {
+                srv.reuseAddress = true
+                srv.bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), port))
+            } catch (be: BindException) {
+                runCatching { srv.close() }
+                if (port == 0) throw be
+                logger?.invoke("EmbeddedProxyServer: preferred port $port busy (${be.message}), falling back to ephemeral port")
+                srv = ServerSocket()
+                srv.reuseAddress = true
+                srv.bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0))
+            }
             serverSocket = srv
             actualPort = srv.localPort
             requestCellularUpstreamNetwork()
@@ -561,7 +677,7 @@ class EmbeddedProxyServer internal constructor(
                     }
 
                     // 1. Client IP Whitelist Check
-                    if (!isClientAllowed(client.inetAddress)) {
+                    if (!isClientAddressAllowed(client.inetAddress)) {
                         logger?.invoke("EmbeddedProxyServer: rejected unauthorized client ${client.remoteSocketAddress}")
                         runCatching { client.close() }
                         continue
@@ -727,7 +843,7 @@ class EmbeddedProxyServer internal constructor(
         if (portHi == -1 || portLo == -1) return
         val targetPort = ((portHi and 0xFF) shl 8) or (portLo and 0xFF)
 
-        if (!isTargetSafe(targetHost, targetPort)) {
+        if (!isDestinationSafe(targetHost, targetPort)) {
             sendSocksReply(output, SOCKS_REP_NOT_ALLOWED)
             return
         }
@@ -791,7 +907,7 @@ class EmbeddedProxyServer internal constructor(
         }
 
         val headerStr = headerBytes.toString("US-ASCII")
-        if (hasInvalidHttpHeaderSyntax(headerStr)) {
+        if (hasInvalidHttpHeaderSyntax(headerStr) || hasConflictingFramingHeaders(headerStr)) {
             sendHttpResponse(output, 400, "Bad Request")
             return
         }
@@ -813,7 +929,7 @@ class EmbeddedProxyServer internal constructor(
         if (method == "CONNECT") {
             // HTTP CONNECT Tunneling (HTTPS)
             val (targetHost, targetPort) = parseAuthority(uriStr)
-            if (!isTargetSafe(targetHost, targetPort)) {
+            if (!isDestinationSafe(targetHost, targetPort)) {
                 sendHttpResponse(output, 403, "Forbidden")
                 return
             }
@@ -833,7 +949,7 @@ class EmbeddedProxyServer internal constructor(
         } else {
             // Standard HTTP Forward Proxy (GET, POST, HEAD, PUT, DELETE, etc.)
             val (targetHost, targetPort, rewrittenUri) = parseForwardHttpTarget(uriStr, headerStr)
-            if (targetHost.isEmpty() || !isTargetSafe(targetHost, targetPort)) {
+            if (targetHost.isEmpty() || !isDestinationSafe(targetHost, targetPort)) {
                 sendHttpResponse(output, 403, "Forbidden")
                 return
             }
@@ -1104,8 +1220,9 @@ class EmbeddedProxyServer internal constructor(
 
         // Post-DNS SSRF validation across ALL destination ports (1-65535):
         // reject loopback, wildcard, link-local/metadata, RFC 1918 private LAN, IPv6 ULA/site-local, and multicast.
+        val p2pSubnets = allowedP2pSubnetsProvider()
         for (addr in addresses) {
-            if (isBlockedInetAddress(addr)) {
+            if (isBlockedInetAddress(addr, p2pSubnets)) {
                 throw SecurityException("SSRF blocked: target $host resolves to restricted address ${addr.hostAddress}:$port")
             }
         }
