@@ -2189,6 +2189,41 @@ func waitForLanFallbackSession(
 /// Attempts one association pass to an ephemeral Wi-Fi Direct SoftAP. Returns true if the OS
 /// accepted the join request (even though DHCP may still take a moment to assign a P2P IP).
 func joinWifiDirectNetwork(iface: String, ssid: String, pass: String, logPrefix: String, attempt: Int = 1) -> Bool {
+    if let cwIface = CWWiFiClient.shared().interface(withName: iface) ?? CWWiFiClient.shared().interface() {
+        // 1. Fast directed scan first in case the channel cache already knows the SoftAP;
+        // if empty (common when phone is on another 5 GHz channel like Ch 161 / 5805 MHz), run a full wildcard sweep.
+        var matchedNet: CWNetwork? = nil
+        if let fastNets = try? cwIface.scanForNetworks(withName: ssid),
+           let best = fastNets.max(by: { $0.rssiValue < $1.rssiValue }) {
+            matchedNet = best
+        } else {
+            let wildNets: Set<CWNetwork>
+            if let hiddenSweep = try? cwIface.scanForNetworks(withName: nil, includeHidden: true) {
+                wildNets = hiddenSweep
+            } else {
+                wildNets = (try? cwIface.scanForNetworks(withName: nil)) ?? []
+            }
+            let matching = wildNets.filter { $0.ssid == ssid }
+            matchedNet = matching.max(by: { $0.rssiValue < $1.rssiValue })
+            if matchedNet == nil {
+                print("\(logPrefix) CoreWLAN full-channel sweep scanned \(wildNets.count) BSS(s), 0 matching \(ssid) (attempt \(attempt))")
+                fflush(stdout)
+            }
+        }
+        if let targetNet = matchedNet {
+            do {
+                try cwIface.associate(to: targetNet, password: pass)
+                print("\(logPrefix) CoreWLAN associated to \(ssid) (ch \(targetNet.wlanChannel?.channelNumber ?? 0), rssi \(targetNet.rssiValue))")
+                fflush(stdout)
+                return true
+            } catch {
+                print("\(logPrefix) CoreWLAN associate failed for \(ssid) (attempt \(attempt)): \(error.localizedDescription)")
+                fflush(stdout)
+            }
+        }
+    }
+
+    // Fallback to networksetup after the CoreWLAN sweep refreshed airportd's scan cache
     let (joinRc, joinOut) = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", iface, ssid, pass])
     let cleanJoinOut = joinOut.trimmingCharacters(in: .whitespacesAndNewlines)
     let lowerOut = cleanJoinOut.lowercased()
@@ -2202,24 +2237,6 @@ func joinWifiDirectNetwork(iface: String, ssid: String, pass: String, logPrefix:
     }
     print("\(logPrefix) networksetup join \(ssid) on \(iface) (attempt \(attempt)) rc=\(joinRc)\(cleanJoinOut.isEmpty ? "" : ": \(cleanJoinOut)")")
     fflush(stdout)
-
-    // Actively scan via CoreWLAN to warm macOS channel cache when SoftAP beacons are newly started
-    if let cwIface = CWWiFiClient.shared().interface(withName: iface) ?? CWWiFiClient.shared().interface() {
-        do {
-            let nets = try cwIface.scanForNetworks(withName: ssid)
-            if let targetNet = nets.max(by: { $0.rssiValue < $1.rssiValue }) {
-                try cwIface.associate(to: targetNet, password: pass)
-                print("\(logPrefix) CoreWLAN associated to \(ssid) (ch \(targetNet.wlanChannel?.channelNumber ?? 0))")
-                fflush(stdout)
-                return true
-            }
-            print("\(logPrefix) CoreWLAN scan found 0 networks for \(ssid) (attempt \(attempt))")
-            fflush(stdout)
-        } catch {
-            print("\(logPrefix) CoreWLAN scan/join assist failed for \(ssid) (attempt \(attempt)): \(error.localizedDescription)")
-            fflush(stdout)
-        }
-    }
     return false
 }
 
@@ -2426,7 +2443,7 @@ func handleIncomingWp2pJoin(
         ssid: ssid,
         pass: pass,
         matchingGateway: matchGwArg,
-        timeout: 25.0,
+        timeout: 38.0,
         logPrefix: "[BLE-Daemon]",
         lastWarpCheck: &lastWarpCheck,
         isAborted: isRemoteAbortedNow
@@ -4868,7 +4885,7 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                         ssid: ssid,
                         pass: pass,
                         matchingGateway: host,
-                        timeout: 25.0,
+                        timeout: 38.0,
                         logPrefix: "[BLE-Send]",
                         lastWarpCheck: &lastSendWarpCheck
                     ) {

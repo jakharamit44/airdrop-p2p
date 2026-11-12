@@ -1327,6 +1327,8 @@ class GlideDropNode(private val context: Context) {
     @Volatile
     private var lastWifiGroupReadyAtMs: Long = 0L
     @Volatile
+    private var lastIncomingDiscoverAtMs: Long = 0L
+    @Volatile
     private var trackedP2pNetwork: Network? = null
     private var p2pNetworkCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -2314,6 +2316,7 @@ class GlideDropNode(private val context: Context) {
             activeP2pInterfaceName = null
             hasResolvedActualGoIp = false
             lastWifiGroupReadyAtMs = 0L
+            lastIncomingDiscoverAtMs = 0L
         }
         clearLastMacSessionState()
         clearIncomingSessionTokens()
@@ -2837,12 +2840,14 @@ class GlideDropNode(private val context: Context) {
                                     )
                                     wifiTeardownJob?.cancel()
                                     wifiTeardownJob = scope.launch {
-                                        kotlinx.coroutines.delay(30_000L)
-                                        if (_transferProgress.value?.isConnecting == true && activeTransferSocket == null) {
+                                        kotlinx.coroutines.delay(40_000L)
+                                        val recentDiscover = (System.currentTimeMillis() - lastIncomingDiscoverAtMs) < 35_000L
+                                        if (!recentDiscover && _transferProgress.value?.isConnecting == true && activeTransferSocket == null) {
                                             clearProgressNotification()
                                         }
-                                        kotlinx.coroutines.delay(20_000L)
-                                        if (!isTransferInProgress && lastMacP2pIp.isEmpty() && activeTransferSocket == null) {
+                                        kotlinx.coroutines.delay(25_000L)
+                                        val stillRecentDiscover = (System.currentTimeMillis() - lastIncomingDiscoverAtMs) < 35_000L
+                                        if (!isTransferInProgress && !stillRecentDiscover && lastMacP2pIp.isEmpty() && activeTransferSocket == null) {
                                             stopWifiDirectGroup()
                                         }
                                     }
@@ -3908,6 +3913,7 @@ class GlideDropNode(private val context: Context) {
                         writeHttpResponse(out, 200, "OK", ByteArray(0))
                     }
                     method == "POST" && path == "/Discover" -> {
+                        lastIncomingDiscoverAtMs = System.currentTimeMillis()
                         try {
                             readHttpBodyBytesBounded(inp, headers, MAX_HTTP_META_BODY_BYTES)
                         } catch (e: HttpFramingException) {
