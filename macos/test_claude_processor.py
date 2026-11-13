@@ -465,6 +465,8 @@ class TestClaudeProcessor(unittest.TestCase):
 
         state_dir = self.dir_path / "state"
         state_dir.mkdir(exist_ok=True)
+        self._seed_sender_token(state_dir, port)
+        send_script = self._with_loopback_sender_route(send_script, port)
         env = {**os.environ, "GLIDEDROP_STATE_DIR": str(state_dir)}
 
         try:
@@ -490,7 +492,7 @@ class TestClaudeProcessor(unittest.TestCase):
                 env=env,
                 timeout=10,
             )
-            self.assertNotEqual(res_bad_pin.returncode, 0)
+            self.assertEqual(res_bad_pin.returncode, 46, res_bad_pin.stderr)
             self.assertEqual(http_requests, [], "Mismatched pin must abort before any HTTP request")
 
             # 3. Malformed pin must fail closed immediately
@@ -502,7 +504,7 @@ class TestClaudeProcessor(unittest.TestCase):
                 env=env,
                 timeout=10,
             )
-            self.assertNotEqual(res_malformed.returncode, 0)
+            self.assertEqual(res_malformed.returncode, 45, res_malformed.stderr)
             self.assertEqual(http_requests, [])
 
             # 4. Unpinned self-signed cert must fail closed (no CERT_NONE bypass)
@@ -514,12 +516,45 @@ class TestClaudeProcessor(unittest.TestCase):
                 env=env,
                 timeout=10,
             )
-            self.assertNotEqual(res_unpinned.returncode, 0)
+            self.assertEqual(res_unpinned.returncode, 46, res_unpinned.stderr)
             self.assertEqual(http_requests, [], "Unpinned connection to self-signed cert must fail closed")
         finally:
             stop_event.set()
             srv_sock.close()
             srv_thread.join(timeout=2)
+
+    def _with_loopback_sender_route(self, source: str, port: int, host: str = "127.0.0.1") -> str:
+        """Mock only OS route/interface handling in a temporary sender; retain real TLS/token logic."""
+        marker = "\ntransfer_succeeded ="
+        self.assertEqual(source.count(marker), 1, "Sender entry point must be unique")
+        harness = f'''
+# Test-only route adapter: never installed in the production script.
+def validate_peer_route(host, port):
+    if (host, port) != ({host!r}, {port!r}):
+        raise ValueError("Unexpected test peer endpoint")
+    return {{"interface": "lo0"}}
+
+_test_socket_base = socket.socket
+class _LoopbackSenderSocket(_test_socket_base):
+    def setsockopt(self, level, option, *values):
+        if (level, option) in ((socket.IPPROTO_IP, getattr(socket, "IP_BOUND_IF", 25)),
+                               (socket.IPPROTO_IPV6, getattr(socket, "IPV6_BOUND_IF", 125))):
+            return
+        return super().setsockopt(level, option, *values)
+    def connect(self, address):
+        if address[:2] != ({host!r}, {port!r}):
+            raise ValueError("Unexpected test socket destination")
+        return super().connect(("127.0.0.1", {port!r}))
+socket.socket = _LoopbackSenderSocket
+os.environ.pop("GLIDEDROP_P2P_TOKEN", None)
+'''
+        return source.replace(marker, harness + marker, 1)
+
+    def _seed_sender_token(self, state_dir: Path, port: int, token: str = "ab" * 32,
+                           host: str = "127.0.0.1"):
+        (state_dir / "p2p_outgoing_token.json").write_text(json.dumps({
+            "token": token, "host": host, "port": port, "expires_at": time.time() + 120,
+        }), encoding="utf-8")
 
     def _extract_send_python_script(self) -> str:
         sh_path = Path(__file__).resolve().parent / "glidedrop.sh"
@@ -676,6 +711,8 @@ class TestClaudeProcessor(unittest.TestCase):
 
         state_dir = self.dir_path / "state_clear"
         state_dir.mkdir(exist_ok=True)
+        self._seed_sender_token(state_dir, port)
+        send_script = self._with_loopback_sender_route(send_script, port)
         prog_file = state_dir / "transfer_progress.json"
         env = {**os.environ, "GLIDEDROP_STATE_DIR": str(state_dir)}
         sample = self.dir_path / "upload_test.bin"
@@ -770,7 +807,7 @@ class TestClaudeProcessor(unittest.TestCase):
         self.assertIn("clearP2pSessionTokens", swift_src)
         self.assertIn("isValidSha256Fingerprint", swift_src)
         self.assertIn("BLEK", swift_src)
-        self.assertIn("txProc.terminationStatus == 46", swift_src)
+        self.assertIn("txStatus == 46", swift_src)
         self.assertIn("currentRawWifiSsid()", swift_src)
         self.assertTrue(
             "Date().addingTimeInterval(25.0)" in swift_src
@@ -835,17 +872,8 @@ class TestClaudeProcessor(unittest.TestCase):
             '  BLE_BIN="$STATE_DIR/glidedrop-daemon"\n'
             'fi',
             f'BLE_BIN="{stub_ble}"',
-        ).replace(
-            '    for cand_host, cand_port in candidates:\n'
-            '        try:\n'
-            '            with socket.create_connection((cand_host, cand_port), timeout=0.25):\n'
-            '                return cand_host, cand_port\n'
-            '        except Exception:\n'
-            '            pass',
-            '    raise OSError("unit test P2P unreachable")',
         )
         self.assertIn(f'BLE_BIN="{stub_ble}"', patched_sh)
-        self.assertIn('unit test P2P unreachable', patched_sh)
         test_sh.write_text(patched_sh, encoding="utf-8")
         test_sh.chmod(0o755)
 
@@ -918,10 +946,13 @@ class TestClaudeProcessor(unittest.TestCase):
         t = threading.Thread(target=_tls_srv, daemon=True)
         t.start()
         try:
-            patched_p2p_sh = test_sh.read_text(encoding="utf-8").replace(
-                '    raise OSError("unit test P2P unreachable")',
-                f'    return "127.0.0.1", {srv_port}',
-            )
+            gateway = "192.168.73.1"
+            (state_dir / "active_p2p_session.json").write_text(json.dumps({
+                "gatewayIp": gateway, "cidr": "192.168.73.0/24", "ssid": "DIRECT-test",
+                "interface": "lo0", "httpsPort": srv_port, "updatedAt": time.time(),
+            }), encoding="utf-8")
+            self._seed_sender_token(state_dir, srv_port, host=gateway)
+            patched_p2p_sh = self._with_loopback_sender_route(test_sh.read_text(encoding="utf-8"), srv_port, gateway)
             test_sh_tls = tls_script_dir / "glidedrop_tls_test.sh"
             test_sh_tls.write_text(patched_p2p_sh, encoding="utf-8")
             test_sh_tls.chmod(0o755)
@@ -936,10 +967,7 @@ class TestClaudeProcessor(unittest.TestCase):
 
             # 5. Unpinned send without --peer/--pin even when an active session listener exists MUST NOT crash into exit 46;
             #    it must defer immediately to BLE fallback while preserving transfer_progress.json.
-            (state_dir / "active_p2p_session.json").write_text(
-                json.dumps({"gatewayIp": "127.0.0.1", "cidr": "127.0.0.0/8", "httpsPort": srv_port, "proxyPort": 0, "updatedAt": time.time()}),
-                encoding="utf-8",
-            )
+            # Keep the schema-valid session and live TLS listener from the pinned case.
             prog_file.write_text(json.dumps({"active": True, "updatedAt": time.time()}), encoding="utf-8")
             r5 = subprocess.run(
                 ["bash", str(test_sh_tls), "send", str(sample)],
@@ -979,8 +1007,8 @@ class TestClaudeProcessor(unittest.TestCase):
                 "glidedrop_rx_test",
                 str(rx_state / "cert.pem"),
                 str(rx_state / "key.pem"),
-                "8772",
-                "8773",
+                "0",
+                "0",
                 str(mac_dir / "glidedrop.sh"),
             ]
             exec(compile(py_part, "glidedrop_rx_extract.py", "exec"), ns)
@@ -1079,7 +1107,7 @@ class TestClaudeProcessor(unittest.TestCase):
         self.assertLessEqual(len(recent_map), 256, "RECENT_UPLOADS must be bounded to <= 256 entries")
 
     def test_glidedrop_receiver_cidr_rfc1918_and_multi_peer(self):
-        """Verify ipaddress-based peer authorization, dynamic session CIDR, exact 172.16/12, and multi-peer retention."""
+        """Verify confirmed P2P endpoint/route authorization, no LAN bypass, and multi-peer retention."""
         mac_dir = Path(__file__).resolve().parent
         sh_src = (mac_dir / "glidedrop.sh").read_text(encoding="utf-8")
         start_marker = 'nohup python3 -u - "$STATE_DIR/cert.pem" "$STATE_DIR/key.pem" "$PORT" "$PROXY_PORT" "$SCRIPT_DIR/glidedrop.sh" >"$LOG_FILE" 2>&1 << \'PYEOF\' &\n'
@@ -1101,8 +1129,8 @@ class TestClaudeProcessor(unittest.TestCase):
                 "glidedrop_rx_cidr_test",
                 str(rx_state / "cert.pem"),
                 str(rx_state / "key.pem"),
-                "8772",
-                "8773",
+                "0",
+                "0",
                 str(mac_dir / "glidedrop.sh"),
             ]
             exec(compile(full_src, "glidedrop_rx_cidr.py", "exec"), ns)
@@ -1114,38 +1142,47 @@ class TestClaudeProcessor(unittest.TestCase):
         rec_peer = ns["record_active_peer"]
         get_peers = ns["get_active_peers"]
 
-        # Without active_p2p_session.json or lan_fallback_active.flag: only loopback and fe80:: allowed; NO hardcoded 192.168.49.0/24
+        # No active P2P subnet means deny; Finder's authenticated local path is separate.
         self.assertEqual(get_nets(), [])
-        self.assertTrue(is_auth("127.0.0.1"))
-        self.assertTrue(is_auth("::1"))
+        self.assertFalse(is_auth("127.0.0.1"))
+        self.assertFalse(is_auth("::1"))
         self.assertFalse(is_auth("192.168.49.10"))
-        self.assertTrue(is_auth("fe80::abc1:2%awdl0"))
+        self.assertFalse(is_auth("fe80::abc1:2%awdl0"))
         self.assertFalse(is_auth("192.168.73.55"))
         self.assertFalse(is_auth("172.16.0.5"))
         self.assertFalse(is_auth("8.8.8.8"))
 
         # Wildcard /0 CIDR in active_p2p_session.json must be rejected
         (rx_state / "active_p2p_session.json").write_text(
-            json.dumps({"gatewayIp": "192.168.73.1", "cidr": "0.0.0.0/0", "httpsPort": 9443, "proxyPort": 0, "updatedAt": time.time()}),
+            json.dumps({"gatewayIp": "192.168.73.1", "cidr": "0.0.0.0/0", "interface": "en7", "ssid": "DIRECT-test", "httpsPort": 9443, "proxyPort": 0, "updatedAt": time.time()}),
             encoding="utf-8",
         )
         self.assertEqual(get_nets(), [])
         self.assertFalse(is_auth("8.8.8.8"))
 
-        # Active dynamic P2P CIDR (192.168.73.0/24) in active_p2p_session.json unlocks only that subnet
+        # Only the confirmed gateway on the confirmed interface is authorized, not the whole subnet.
         (rx_state / "active_p2p_session.json").write_text(
-            json.dumps({"gatewayIp": "192.168.73.1", "cidr": "192.168.73.0/24", "httpsPort": 9443, "proxyPort": 0, "updatedAt": time.time()}),
+            json.dumps({"gatewayIp": "192.168.73.1", "cidr": "192.168.73.0/24", "interface": "en7", "ssid": "DIRECT-test", "httpsPort": 9443, "proxyPort": 0, "updatedAt": time.time()}),
             encoding="utf-8",
         )
-        self.assertTrue(is_auth("192.168.73.55"))
+        self.assertEqual([str(net) for net in get_nets()], ["192.168.73.0/24"])
+        with patch.object(ns["subprocess"], "check_output", return_value="interface: en7\n") as route:
+            self.assertTrue(is_auth("192.168.73.1"))
+            route.assert_called_once_with(["/sbin/route", "-n", "get", "-inet", "192.168.73.1"], text=True, timeout=3.0)
+        with patch.object(ns["subprocess"], "check_output", return_value="interface: en0\n"):
+            self.assertFalse(is_auth("192.168.73.1"))
+        self.assertFalse(is_auth("192.168.73.55"))
         self.assertFalse(is_auth("192.168.49.10"))
         self.assertFalse(is_auth("192.168.74.55"))
 
-        # Fresh lan_fallback_active.flag allows exact RFC1918 (172.16/12) but rejects 172.15/172.32/8.8.8.8
+        # A legacy LAN flag must not widen the active P2P subnet allowlist.
         (rx_state / "lan_fallback_active.flag").write_text(str(time.time()), encoding="utf-8")
-        self.assertTrue(is_auth("172.16.0.5"))
-        self.assertTrue(is_auth("172.31.255.254"))
-        self.assertTrue(is_auth("10.0.0.15"))
+        with patch.object(ns["subprocess"], "check_output", return_value="interface: en7\n"):
+            self.assertTrue(is_auth("192.168.73.1"))
+        self.assertFalse(is_auth("192.168.73.55"))
+        self.assertFalse(is_auth("172.16.0.5"))
+        self.assertFalse(is_auth("172.31.255.254"))
+        self.assertFalse(is_auth("10.0.0.15"))
         self.assertFalse(is_auth("172.15.255.255"))
         self.assertFalse(is_auth("172.32.0.1"))
         self.assertFalse(is_auth("8.8.8.8"))
@@ -1169,10 +1206,11 @@ class TestClaudeProcessor(unittest.TestCase):
 
         self.assertEqual(parse_peer("[::1]:8771"), ("::1", 8771))
         self.assertEqual(parse_peer("[fe80::1%awdl0]:9443"), ("fe80::1%awdl0", 9443))
-        self.assertEqual(parse_peer("[::1]"), ("::1", 8771))
-        self.assertEqual(parse_peer("::1"), ("::1", 8771))
+        # Runtime-assigned ports only: a peer target without a port is an error, never a default.
+        for portless in ("[::1]", "::1", "192.168.73.1"):
+            with self.assertRaises(ValueError):
+                parse_peer(portless)
         self.assertEqual(parse_peer("192.168.73.1:9443"), ("192.168.73.1", 9443))
-        self.assertEqual(parse_peer("192.168.73.1"), ("192.168.73.1", 8771))
         with self.assertRaises(ValueError):
             parse_peer("[::1")
 
@@ -1273,41 +1311,21 @@ class TestClaudeProcessor(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ns["discover_android"](None)
 
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(4)
-        srv_port = srv.getsockname()[1]
-        stop_ev = threading.Event()
-
-        def accept_loop():
-            srv.settimeout(0.2)
-            while not stop_ev.is_set():
-                try:
-                    c, _ = srv.accept()
-                    c.close()
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
-
-        t = threading.Thread(target=accept_loop, daemon=True)
-        t.start()
-        try:
-            (disc_state / "active_p2p_session.json").write_text(
-                json.dumps({
-                    "gatewayIp": "127.0.0.1",
-                    "cidr": "127.0.0.0/8",
-                    "httpsPort": srv_port,
-                    "proxyPort": 0,
-                    "updatedAt": time.time(),
-                }),
-                encoding="utf-8",
-            )
-            host, port = ns["discover_android"]("a" * 64)
-            self.assertEqual((host, port), ("127.0.0.1", srv_port))
-        finally:
-            stop_ev.set()
-            srv.close()
+        (disc_state / "active_p2p_session.json").write_text(json.dumps({
+            "gatewayIp": "192.168.73.1", "cidr": "192.168.73.0/24",
+            "ssid": "DIRECT-test", "interface": "en7", "httpsPort": 9443,
+            "updatedAt": time.time(),
+        }), encoding="utf-8")
+        with patch.object(ns["subprocess"], "check_output", return_value="interface: en7\n") as route, \
+             patch.object(socket, "create_connection") as connect:
+            self.assertEqual(ns["discover_android"]("a" * 64), ("192.168.73.1", 9443))
+            route.assert_called_once_with(["/sbin/route", "-n", "get", "-inet", "192.168.73.1"], text=True, timeout=3.0)
+            connect.assert_not_called()
+        with patch.object(ns["subprocess"], "check_output", return_value="interface: en0\n"), \
+             patch.object(socket, "create_connection") as connect:
+            with self.assertRaises(RuntimeError):
+                ns["discover_android"]("a" * 64)
+            connect.assert_not_called()
 
     def test_glidedrop_send_sends_bearer_token_and_verifies_pin_end_to_end(self):
         """Exercise real glidedrop.sh send against a TLS-pinned receiver verifying X-GlideDrop-Token on all requests."""
@@ -1350,10 +1368,6 @@ class TestClaudeProcessor(unittest.TestCase):
         test_sh.chmod(0o755)
 
         expected_tok = "ef" * 32
-        (state_dir / "p2p_outgoing_token.json").write_text(
-            json.dumps({"token": expected_tok, "host": "127.0.0.1", "port": 8771, "expires_at": time.time() + 120}),
-            encoding="utf-8",
-        )
         sample = e2e_dir / "hello.txt"
         sample.write_text("hello-glidedrop-e2e", encoding="utf-8")
 
@@ -1364,6 +1378,8 @@ class TestClaudeProcessor(unittest.TestCase):
         srv_sock.bind(("127.0.0.1", 0))
         srv_sock.listen(8)
         srv_port = srv_sock.getsockname()[1]
+        self._seed_sender_token(state_dir, srv_port, expected_tok)
+        test_sh.write_text(self._with_loopback_sender_route(test_sh.read_text(), srv_port), encoding="utf-8")
         stop_ev = threading.Event()
 
         def serve():
@@ -1431,7 +1447,8 @@ class TestClaudeProcessor(unittest.TestCase):
                 self.assertEqual(tok, expected_tok, f"Missing/wrong X-GlideDrop-Token on {method} {path}")
                 self.assertEqual(host_hdr, f"127.0.0.1:{srv_port}")
 
-            # Wrong token must fail with 401 (non-zero exit) and clear progress
+            # Wrong token must reach the real TLS receiver, fail with 401, and clear progress.
+            seen_requests.clear()
             (state_dir / "p2p_outgoing_token.json").write_text(
                 json.dumps({"token": "00" * 32, "host": "127.0.0.1", "port": srv_port, "expires_at": time.time() + 120}),
                 encoding="utf-8",
@@ -1441,6 +1458,8 @@ class TestClaudeProcessor(unittest.TestCase):
                 capture_output=True, text=True, env=env, timeout=15,
             )
             self.assertNotEqual(bad.returncode, 0, "Invalid bearer token must fail send")
+            self.assertIn("peer rejected X-GlideDrop-Token (401)", bad.stdout + bad.stderr)
+            self.assertEqual([(r[1], r[2]) for r in seen_requests], [("/Discover", "00" * 32)])
             self.assertFalse((state_dir / "transfer_progress.json").exists())
         finally:
             stop_ev.set()
@@ -1556,26 +1575,22 @@ class TestClaudeProcessor(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             discover_android(expected_fp)
 
-        # With active_p2p_session.json pointing to a live ephemeral listener: discovers dynamic endpoint
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(2)
-        dyn_port = srv.getsockname()[1]
-        try:
-            (state_dir / "active_p2p_session.json").write_text(
-                json.dumps({
-                    "gatewayIp": "127.0.0.1",
-                    "cidr": "127.0.0.0/8",
-                    "httpsPort": dyn_port,
-                    "proxyPort": 0,
-                    "updatedAt": time.time(),
-                }),
-                encoding="utf-8",
-            )
-            host, port = discover_android(expected_fp)
-            self.assertEqual((host, port), ("127.0.0.1", dyn_port))
-        finally:
-            srv.close()
+        # A confirmed dynamic endpoint is selected only when its OS route matches.
+        (state_dir / "active_p2p_session.json").write_text(json.dumps({
+            "gatewayIp": "192.168.88.1", "cidr": "192.168.88.0/24",
+            "ssid": "DIRECT-test", "interface": "en8", "httpsPort": 9444,
+            "updatedAt": time.time(),
+        }), encoding="utf-8")
+        with patch.object(ns["subprocess"], "check_output", return_value="interface: en8\n") as route, \
+             patch.object(socket, "create_connection") as connect:
+            self.assertEqual(discover_android(expected_fp), ("192.168.88.1", 9444))
+            route.assert_called_once_with(["/sbin/route", "-n", "get", "-inet", "192.168.88.1"], text=True, timeout=3.0)
+            connect.assert_not_called()
+        with patch.object(ns["subprocess"], "check_output", return_value="interface: en0\n"), \
+             patch.object(socket, "create_connection") as connect:
+            with self.assertRaises(RuntimeError):
+                discover_android(expected_fp)
+            connect.assert_not_called()
 
     def _load_receiver_namespace(self, state_dir: Path, prepare_cert: bool = False):
         mac_dir = Path(__file__).resolve().parent
@@ -1608,8 +1623,8 @@ class TestClaudeProcessor(unittest.TestCase):
                 "glidedrop_rx_unit",
                 str(state_dir / "cert.pem"),
                 str(state_dir / "key.pem"),
-                "8772",
-                "8773",
+                "0",
+                "0",
                 str(mac_dir / "glidedrop.sh"),
             ]
             exec(compile(rx_body, "glidedrop_rx_unit.py", "exec"), ns)
@@ -1920,12 +1935,13 @@ class TestClaudeProcessor(unittest.TestCase):
                 th.join(timeout=3)
 
         # 1. Valid chunked /Upload (proves stream_upload_to_dir does not hit NameError on is_chunked)
-        cpio_data = build_cpio("hello_chunked.txt", b"chunked-payload-ok")
+        payload = b"chunked-payload-ok"
+        cpio_data = build_cpio("hello_chunked.txt", payload)
         dvzip_body = struct.pack(">I", 0x80000000 | len(cpio_data)) + cpio_data + struct.pack(">I", 0)
         chunked_upload = f"{len(dvzip_body):x}\r\n".encode("ascii") + dvzip_body + b"\r\n0\r\n\r\n"
         ask_body = plistlib.dumps({
             "SenderComputerName": "PixelTest",
-            "Files": [{"FileName": "hello_chunked.txt", "FileSize": len(cpio_data)}],
+            "Files": [{"FileName": "hello_chunked.txt", "FileSize": len(payload)}],
         }, fmt=plistlib.FMT_BINARY)
         disc_body = plistlib.dumps({"DeviceSupportFlags": 111611}, fmt=plistlib.FMT_BINARY)
 
@@ -1934,7 +1950,7 @@ class TestClaudeProcessor(unittest.TestCase):
             + disc_body
             + f"POST /Ask HTTP/1.1\r\nHost: 127.0.0.1:8772\r\nX-GlideDrop-Token: {tok}\r\nContent-Length: {len(ask_body)}\r\n\r\n".encode("ascii")
             + ask_body
-            + f"POST /Upload HTTP/1.1\r\nHost: 127.0.0.1:8772\r\nX-GlideDrop-Token: {tok}\r\nTotalBytes: {len(cpio_data)}\r\nTransfer-Encoding: chunked\r\n\r\n".encode("ascii")
+            + f"POST /Upload HTTP/1.1\r\nHost: 127.0.0.1:8772\r\nX-GlideDrop-Token: {tok}\r\nTotalBytes: {len(payload)}\r\nTransfer-Encoding: chunked\r\n\r\n".encode("ascii")
             + chunked_upload
         )
         resp_all = run_session(session_wire)
@@ -1984,14 +2000,6 @@ class TestClaudeProcessor(unittest.TestCase):
             '  BLE_BIN="$STATE_DIR/glidedrop-daemon"\n'
             'fi',
             f'BLE_BIN="{stub_ble}"',
-        ).replace(
-            '    for cand_host, cand_port in candidates:\n'
-            '        try:\n'
-            '            with socket.create_connection((cand_host, cand_port), timeout=0.25):\n'
-            '                return cand_host, cand_port\n'
-            '        except Exception:\n'
-            '            pass',
-            '    raise OSError("unit test P2P unreachable")',
         )
         test_sh.write_text(patched_sh, encoding="utf-8")
         test_sh.chmod(0o755)
@@ -2024,6 +2032,8 @@ class TestClaudeProcessor(unittest.TestCase):
         srv_sock.bind(("127.0.0.1", 0))
         srv_sock.listen(2)
         srv_port = srv_sock.getsockname()[1]
+        self._seed_sender_token(state_dir, srv_port)
+        test_sh.write_text(self._with_loopback_sender_route(test_sh.read_text(), srv_port), encoding="utf-8")
         sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         sctx.load_cert_chain(str(cert_pem), str(key_pem))
 
@@ -2072,6 +2082,137 @@ class TestClaudeProcessor(unittest.TestCase):
         finally:
             srv_sock.close()
             t.join(timeout=2)
+
+
+    def test_processor_ocr_generated_script_parses(self):
+        with patch("claude_processor.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            claude_processor.extract_local_apple_vision_ocr(self.dir_path / "image.png")
+            script = run.call_args.kwargs["input"]
+        if not Path("/usr/bin/swift").exists():
+            self.skipTest("Swift parser unavailable")
+        result = subprocess.run(["/usr/bin/swift", "-frontend", "-parse", "-"],
+                                input=script, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_processor_ocr_failures_block_cloud(self):
+        image = self.dir_path / "image.png"
+        image.write_bytes(b"fake image")
+        failures = [subprocess.CompletedProcess([], 1, "", "compile failure"),
+                    subprocess.TimeoutExpired("swift", 15), OSError("swift unavailable")]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), \
+                 patch("claude_processor.is_claude_enabled", return_value=True), \
+                 patch("claude_processor.get_api_key", return_value="test-key"), \
+                 patch("claude_processor.subprocess.run") as run, \
+                 patch("claude_processor.optimize_image_for_vision", return_value=(b"image", "image/png")), \
+                 patch("claude_processor.call_claude_api", return_value="Must not upload") as api:
+                if isinstance(failure, Exception):
+                    run.side_effect = failure
+                else:
+                    run.return_value = failure
+                sidecar = claude_processor.process_dropped_file(image)
+                api.assert_not_called()
+                self.assertIsNotNone(sidecar)
+                self.assertIn("Privacy Safeguard Notice", sidecar.read_text())
+
+    def test_processor_audit_handles_rejected_ocr_input(self):
+        output = io.StringIO()
+        with patch("claude_processor.subprocess.run", return_value=subprocess.CompletedProcess([], 1, "", "invalid image")), \
+             patch("claude_processor.query_ollama_local", return_value=None), \
+             patch("claude_processor.is_claude_enabled", return_value=False), redirect_stdout(output):
+            self.assertIsInstance(claude_processor.run_subsystem_audit(), bool)
+        self.assertIn("Audit Summary:", output.getvalue())
+
+    def test_processor_successful_empty_ocr_allows_image_analysis(self):
+        with patch("claude_processor.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+             patch("claude_processor.optimize_image_for_vision", return_value=(b"image", "image/png")), \
+             patch("claude_processor.call_claude_api", return_value="Image summary"):
+            self.assertEqual(claude_processor.analyze_image_file(self.dir_path / "image.png", api_key="test-key"),
+                             "Image summary")
+
+    def test_processor_current_tokens_block_full_ingestion(self):
+        tokens = ["sk-proj-" + "A" * 80, "sk-svcacct-" + "B" * 80,
+                  "github_pat_" + "C" * 82]
+        for token in tokens:
+            with self.subTest(prefix=token[:12]):
+                path = self.dir_path / "notes.txt"
+                path.write_text("Public text\n" + token)
+                with patch("claude_processor.is_claude_enabled", return_value=True), \
+                     patch("claude_processor.get_api_key", return_value="test-key"), \
+                     patch("claude_processor.call_claude_api", return_value="Must not upload") as api:
+                    sidecar = claude_processor.process_dropped_file(path)
+                    api.assert_not_called()
+                    self.assertIn("Privacy Safeguard Notice", sidecar.read_text())
+
+    def test_processor_automatic_pdf_cloud_is_blocked(self):
+        path = self.dir_path / "report.pdf"
+        path.write_bytes(b"%PDF-1.4\nBT (sk-ant-api03-" + b"A" * 40 + b") Tj ET\n%%EOF")
+        with patch("claude_processor.is_claude_enabled", return_value=True), \
+             patch("claude_processor.get_api_key", return_value="test-key"), \
+             patch("claude_processor.call_claude_api", return_value="Must not upload") as api:
+            sidecar = claude_processor.process_dropped_file(path)
+            api.assert_not_called()
+            self.assertIn("Privacy Safeguard Notice", sidecar.read_text())
+            self.assertIn("PDF", sidecar.read_text())
+
+    def test_processor_sidecar_symlinks_never_clobber_targets(self):
+        for mode in ("local", "cloud", "sensitive", "fallback", "pdf"):
+            with self.subTest(mode=mode):
+                path = self.dir_path / ("report.pdf" if mode == "pdf" else "notes.txt")
+                path.write_text("sk-proj-" + "A" * 80 if mode == "sensitive" else "Benign report")
+                victim = self.dir_path / "victim.txt"
+                victim.write_text("ORIGINAL")
+                sidecar = path.with_name(path.name + ".claude.md")
+                sidecar.unlink(missing_ok=True)
+                sidecar.symlink_to(victim)
+                with patch("claude_processor.is_claude_enabled", return_value=True), \
+                     patch("claude_processor.get_api_key", return_value=None if mode == "local" else "test-key"), \
+                     patch("claude_processor.run_local_offline_analysis", return_value="Local summary"), \
+                     patch("claude_processor.call_claude_api", return_value="Cloud summary") as api:
+                    if mode == "fallback":
+                        api.side_effect = RuntimeError("API unavailable")
+                    self.assertIsNone(claude_processor.process_dropped_file(path))
+                self.assertEqual(victim.read_text(), "ORIGINAL")
+                self.assertTrue(sidecar.is_symlink())
+
+    def test_processor_text_analysis_uses_bounded_reads_and_keeps_head_tail(self):
+        path = self.dir_path / "large.txt"
+        path.write_text("HEAD_MARKER\n" + "word\n" * 80000 + "TAIL_MARKER\n")
+        real_open = Path.open
+        reads = []
+
+        class BoundedReader:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.wrapped.close()
+            def read(self, size=-1):
+                if size < 0 or size > 4 * 120000:
+                    raise AssertionError("Unbounded file read")
+                reads.append(size)
+                return self.wrapped.read(size)
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+        def bounded_open(target, *args, **kwargs):
+            return BoundedReader(real_open(target, *args, **kwargs))
+
+        with patch.object(Path, "open", bounded_open), \
+             patch("claude_processor.call_claude_api", return_value="Summary") as api, \
+             patch("claude_processor.query_ollama_local", return_value=None):
+            claude_processor.analyze_text_file(path, api_key="test-key")
+            local = claude_processor.run_local_offline_analysis(path)
+        content = api.call_args.args[0][0]["content"]
+        self.assertIn("HEAD_MARKER", content)
+        self.assertIn("TAIL_MARKER", content)
+        self.assertIn("Truncated", content)
+        self.assertIn("Text Overview", local)
+        self.assertNotIn("Read error", local)
+        self.assertIn("bounded sample", local)
+        self.assertTrue(reads)
+        self.assertLess(sum(reads), path.stat().st_size)
 
 
 if __name__ == "__main__":

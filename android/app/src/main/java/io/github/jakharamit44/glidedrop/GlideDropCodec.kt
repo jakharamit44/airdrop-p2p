@@ -8,13 +8,16 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.EOFException
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.nio.file.FileAlreadyExistsException
+import java.nio.file.FileSystemException
+import java.nio.file.LinkOption
+import java.nio.file.StandardOpenOption
 import java.util.zip.Deflater
 import java.util.zip.GZIPInputStream
 import java.util.zip.Inflater
@@ -229,101 +232,135 @@ object GlideDropCodec {
         require(bytes.size >= 40 && String(bytes, 0, 8, StandardCharsets.US_ASCII) == "bplist00") {
             "Not a valid binary plist"
         }
+        val trailerStart = bytes.size - 32
         val trailer = ByteBuffer.wrap(bytes, bytes.size - 26, 26)
         val offsetSize = trailer.get().toInt() and 0xFF
         val refSize = trailer.get().toInt() and 0xFF
-        val numObjects = trailer.long.toInt()
-        val topObject = trailer.long.toInt()
-        val offsetTableOffset = trailer.long.toInt()
-        require(offsetSize in 1..8 && refSize in 1..8 && numObjects in 1..65536) {
+        val objectCount = trailer.long
+        val rootIndex = trailer.long
+        val tableOffset = trailer.long
+        require(offsetSize in 1..8 && refSize in 1..8 && objectCount in 1..65536L) {
             "Invalid bplist trailer"
         }
+        require(rootIndex in 0 until objectCount && tableOffset in 8L..trailerStart.toLong()) {
+            "Invalid bplist root or offset table"
+        }
+        require(objectCount * offsetSize <= trailerStart - tableOffset) { "Truncated bplist offset table" }
+        val numObjects = objectCount.toInt()
+        val table = tableOffset.toInt()
 
-        fun readUint(pos: Int, len: Int): Long {
-            if (pos < 0 || len <= 0 || pos + len > bytes.size) return 0L
+        fun readUint(pos: Int, len: Int, end: Int): Long {
+            require(len in 1..8 && pos >= 8 && pos.toLong() + len <= end) { "Truncated bplist value" }
             var v = 0L
-            for (i in 0 until len) {
-                v = (v shl 8) or (bytes[pos + i].toLong() and 0xFF)
-            }
+            for (i in 0 until len) v = (v shl 8) or (bytes[pos + i].toLong() and 0xFF)
             return v
         }
-
-        val offsets = IntArray(numObjects) { i ->
-            readUint(offsetTableOffset + i * offsetSize, offsetSize).toInt()
+        fun index(value: Long, end: Int): Int {
+            require(value >= 0 && value < end.toLong()) { "Invalid bplist index or length" }
+            return value.toInt()
         }
-
-        fun parseAt(objIdx: Int, depth: Int): Any? {
-            if (depth > 32 || objIdx !in 0 until numObjects) return null
-            var pos = offsets[objIdx]
-            if (pos !in bytes.indices) return null
-            val marker = bytes[pos++].toInt() and 0xFF
-            val high = (marker ushr 4) and 0x0F
-            val low = marker and 0x0F
-
-            fun readCount(): Int {
-                if (low != 0x0F) return low
-                if (pos !in bytes.indices) return 0
-                val intMarker = bytes[pos++].toInt() and 0xFF
-                val intBytes = 1 shl (intMarker and 0x0F)
-                if (pos + intBytes > bytes.size) return 0
-                val count = readUint(pos, intBytes).toInt()
-                pos += intBytes
-                return count.coerceAtLeast(0)
+        val offsets = IntArray(numObjects) { i ->
+            index(readUint(table + i * offsetSize, offsetSize, trailerStart), table).also {
+                require(it >= 8) { "Invalid bplist object offset" }
             }
-
-            return when (high) {
-                0x0 -> when (low) {
-                    0x8 -> false
-                    0x9 -> true
-                    else -> null
+        }
+        val memo = arrayOfNulls<Any?>(numObjects)
+        val state = ByteArray(numObjects)
+        val heights = IntArray(numObjects)
+        val expansionCosts = LongArray(numObjects) { 1L }
+        val maxCost = 4L * 1024 * 1024
+        // Bound both materialized decoding and logical expansion by downstream consumers.
+        var budget = maxCost
+        fun charge(amount: Long) {
+            require(amount >= 0 && amount <= budget) { "Bplist decode budget exceeded" }
+            budget -= amount
+        }
+        fun parseAt(objIdx: Int, depth: Int): Any? {
+            require(depth <= 32 && state[objIdx] != 1.toByte()) { "Bplist cycle or excessive depth" }
+            if (state[objIdx] == 2.toByte()) {
+                require(depth + heights[objIdx] <= 32) { "Bplist excessive depth" }
+                return memo[objIdx]
+            }
+            state[objIdx] = 1
+            charge(1)
+            var pos = offsets[objIdx]
+            val marker = bytes[pos++].toInt() and 0xFF
+            val high = marker ushr 4
+            val low = marker and 0x0F
+            fun readCount(): Int {
+                if (low != 15) return low
+                require(pos < table) { "Missing bplist length" }
+                val intMarker = bytes[pos++].toInt() and 0xFF
+                require(intMarker in 0x10..0x13) { "Invalid bplist length marker" }
+                val width = 1 shl (intMarker and 15)
+                val count = readUint(pos, width, table)
+                pos += width
+                return index(count, Int.MAX_VALUE)
+            }
+            fun span(count: Int, width: Int): Int {
+                val length = count.toLong() * width
+                require(pos.toLong() + length <= table) { "Truncated bplist object" }
+                charge(length)
+                require(expansionCosts[objIdx] <= maxCost - length) { "Bplist expansion budget exceeded" }
+                expansionCosts[objIdx] += length
+                return length.toInt()
+            }
+            fun child(refPos: Int): Any? {
+                val ref = index(readUint(refPos, refSize, table), numObjects)
+                val value = parseAt(ref, depth + 1)
+                require(expansionCosts[objIdx] <= maxCost - expansionCosts[ref]) { "Bplist expansion budget exceeded" }
+                expansionCosts[objIdx] += expansionCosts[ref]
+                heights[objIdx] = maxOf(heights[objIdx], 1 + heights[ref])
+                return value
+            }
+            val value: Any? = when (high) {
+                0 -> when (low) {
+                    0 -> null
+                    8 -> false
+                    9 -> true
+                    else -> throw IllegalArgumentException("Unsupported bplist simple value")
                 }
-                0x1 -> {
-                    val nBytes = 1 shl low
-                    if (pos + nBytes > bytes.size) 0L else readUint(pos, nBytes)
+                1 -> {
+                    require(low <= 3) { "Unsupported bplist integer width" }
+                    readUint(pos, 1 shl low, table)
                 }
-                0x2 -> {
-                    val nBytes = 1 shl low
-                    if (pos + nBytes > bytes.size) 0.0
-                    else if (nBytes == 4) ByteBuffer.wrap(bytes, pos, 4).float.toDouble()
+                2 -> {
+                    require(low == 2 || low == 3) { "Invalid bplist real width" }
+                    span(1, 1 shl low)
+                    if (low == 2) ByteBuffer.wrap(bytes, pos, 4).float.toDouble()
                     else ByteBuffer.wrap(bytes, pos, 8).double
                 }
-                0x4 -> {
-                    val len = readCount().coerceAtMost(bytes.size - pos)
-                    if (len <= 0) ByteArray(0) else bytes.copyOfRange(pos, pos + len)
-                }
-                0x5 -> {
-                    val len = readCount().coerceAtMost(bytes.size - pos)
-                    if (len <= 0) "" else String(bytes, pos, len, StandardCharsets.US_ASCII)
-                }
-                0x6 -> {
-                    val chars = readCount()
-                    val byteLen = (chars * 2).coerceAtMost(bytes.size - pos)
-                    if (byteLen <= 0) "" else String(bytes, pos, byteLen, StandardCharsets.UTF_16BE)
-                }
-                0xA -> {
-                    val count = readCount().coerceAtMost((bytes.size - pos) / maxOf(1, refSize))
-                    List(count) { i ->
-                        val ref = readUint(pos + i * refSize, refSize).toInt()
-                        parseAt(ref, depth + 1)
+                4, 5, 6 -> {
+                    val length = span(readCount(), if (high == 6) 2 else 1)
+                    when (high) {
+                        4 -> bytes.copyOfRange(pos, pos + length)
+                        5 -> String(bytes, pos, length, StandardCharsets.US_ASCII)
+                        else -> String(bytes, pos, length, StandardCharsets.UTF_16BE)
                     }
                 }
-                0xD -> {
-                    val count = readCount().coerceAtMost((bytes.size - pos) / (2 * maxOf(1, refSize)))
+                10 -> {
+                    val count = readCount()
+                    span(count, refSize)
+                    List(count) { child(pos + it * refSize) }
+                }
+                13 -> {
+                    val count = readCount()
+                    span(count, 2 * refSize)
                     val map = LinkedHashMap<String, Any?>(count)
-                    val valStart = pos + count * refSize
                     for (i in 0 until count) {
-                        val kRef = readUint(pos + i * refSize, refSize).toInt()
-                        val vRef = readUint(valStart + i * refSize, refSize).toInt()
-                        val key = parseAt(kRef, depth + 1)?.toString() ?: continue
-                        map[key] = parseAt(vRef, depth + 1)
+                        val key = child(pos + i * refSize)
+                        require(key is String && !map.containsKey(key)) { "Invalid or duplicate bplist dictionary key" }
+                        map[key] = child(pos + (count + i) * refSize)
                     }
                     map
                 }
-                else -> null
+                else -> throw IllegalArgumentException("Unsupported bplist object type: $high")
             }
+            memo[objIdx] = value
+            state[objIdx] = 2
+            return value
         }
-
-        return parseAt(topObject, 0)
+        return parseAt(rootIndex.toInt(), 0)
     }
 
     // =========================================================================
@@ -538,145 +575,253 @@ object GlideDropCodec {
         return Files.getFileStore(destDir.toPath()).usableSpace
     }
 
+    private const val MAX_CPIO_TRAILING_PADDING_BYTES = 65536
+
+    data class ApprovedFile(val name: String, val size: Long? = null)
+
     /**
-     * Decodes a DVZip or Gzip stream containing a 070707 (odc) or 070701/070702 (newc)
-     * CPIO archive and extracts regular files into destDir.
+     * Extracts regular files only after a complete CPIO archive has been validated.
+     * BLE callers must set [maxExpandedBytes] to a transport-specific cap; Wi-Fi streams
+     * remain unrestricted by default. The cap includes headers, skipped entries and padding.
+     * After TRAILER!!!, only up to 64 KiB of zero padding is allowed. Decoder EOF and
+     * compressed-stream checksums/framing are validated before any files are published.
+     * Pass the user-approved [approvedFiles] to enforce the exact flattened names/counts
+     * and known sizes; null sizes support peers that omit FileSize. An empty list denies files.
+     * The caller owns rawIn and must provide a trusted destination directory.
      */
-    fun extractDvzipCpio(rawIn: InputStream, destDir: File, context: Context? = null): List<File> {
+    fun extractDvzipCpio(
+        rawIn: InputStream,
+        destDir: File,
+        context: Context? = null,
+        maxExpandedBytes: Long = Long.MAX_VALUE,
+        approvedFiles: List<ApprovedFile>? = null
+    ): List<File> {
+        require(maxExpandedBytes >= 0) { "Negative expansion limit" }
+        val remaining = approvedFiles?.map {
+            require(it.size == null || it.size >= 0) { "Negative approved file size" }
+            it.copy(name = safeFileName(it.name))
+        }?.groupingBy { it }?.eachCount()?.toMutableMap()
         destDir.mkdirs()
-        val cpioStream = openDvzipOrGzipStream(rawIn)
+        val destination = destDir.canonicalFile
+        val staging = Files.createTempDirectory(destination.toPath(), ".glidedrop-")
+        val pending = ArrayList<Pair<File, String>>()
         val saved = ArrayList<File>()
         val ioBuf = ByteArray(DVZIP_STORED_BLOCK_BYTES)
-
-        fun readExact(inp: InputStream, dst: ByteArray, len: Int = dst.size): Int {
-            var off = 0
-            while (off < len) {
-                val n = inp.read(dst, off, len - off)
-                if (n <= 0) break
-                off += n
-            }
-            return off
+        // Release decoder resources without closing the caller-owned HTTP/BLE stream.
+        val borrowed = object : java.io.FilterInputStream(rawIn) {
+            override fun close() = Unit
         }
-
-        while (true) {
-            val magicBuf = ByteArray(6)
-            val m = readExact(cpioStream, magicBuf, 6)
-            if (m == 0) break
-            if (m < 6) throw EOFException("Truncated CPIO magic")
-            val magic = String(magicBuf, StandardCharsets.US_ASCII)
-
-            val mode: Int
-            val nameSize: Int
-            val fileSize: Long
-            val isNewc: Boolean
-
-            when (magic) {
-                "070707" -> {
-                    val hdr = ByteArray(70)
-                    if (readExact(cpioStream, hdr, 70) < 70) throw EOFException("Truncated odc header")
-                    val hStr = String(hdr, StandardCharsets.US_ASCII)
-                    mode = hStr.substring(12, 18).toInt(8)
-                    nameSize = hStr.substring(53, 59).toInt(8)
-                    fileSize = hStr.substring(59, 70).toLong(8)
-                    isNewc = false
-                }
-                "070701", "070702" -> {
-                    val hdr = ByteArray(104)
-                    if (readExact(cpioStream, hdr, 104) < 104) throw EOFException("Truncated newc header")
-                    val hStr = String(hdr, StandardCharsets.US_ASCII)
-                    mode = hStr.substring(8, 16).toInt(16)
-                    fileSize = hStr.substring(48, 56).toLong(16)
-                    nameSize = hStr.substring(88, 96).toInt(16)
-                    isNewc = true
-                }
-                "070764" -> {
-                    val hdr = ByteArray(96)
-                    if (readExact(cpioStream, hdr, 96) < 96) throw EOFException("Truncated 070764 header")
-                    val hStr = String(hdr, StandardCharsets.US_ASCII)
-                    mode = hStr.substring(16, 24).toInt(16)
-                    fileSize = java.lang.Long.parseUnsignedLong(hStr.substring(64, 80), 16)
-                    nameSize = hStr.substring(80, 88).toInt(16)
-                    isNewc = false
-                }
-                else -> throw IllegalArgumentException("Invalid CPIO magic: $magic")
-            }
-
-            require(fileSize >= 0L) { "Invalid negative CPIO file size: $fileSize" }
-            require(nameSize in 1..4097) { "Invalid CPIO name size: $nameSize" }
-            val nameBuf = ByteArray(nameSize)
-            if (readExact(cpioStream, nameBuf, nameSize) < nameSize) {
-                throw EOFException("Truncated CPIO entry name")
-            }
-            val rawName = String(nameBuf, 0, nameSize - 1, StandardCharsets.UTF_8)
-            if (isNewc) {
-                val hdrPad = (4 - ((110 + nameSize) % 4)) % 4
-                if (hdrPad > 0) readExact(cpioStream, ByteArray(hdrPad), hdrPad)
-            }
-            if (rawName == "TRAILER!!!") break
-
-            val isRegularFile = (mode and 61440) == 32768 // (mode & 0170000) == 0100000
-            if (isRegularFile) {
-                val baseName = safeFileName(rawName)
-                var outFile = File(destDir, baseName)
-                val destCanonical = destDir.canonicalPath.let { if (it.endsWith(File.separator)) it else it + File.separator }
-                if (!outFile.canonicalPath.startsWith(destCanonical)) {
-                    throw SecurityException("CPIO path traversal detected: $rawName")
-                }
-                val availableBytes = availableStorageBytes(destDir, context)
-                if (availableBytes < fileSize) {
-                    throw IOException("Insufficient storage space for $baseName: required $fileSize B, available $availableBytes B")
-                }
-                var suffix = 1
-                while (outFile.exists()) {
-                    val dot = baseName.lastIndexOf('.')
-                    outFile = if (dot > 0) {
-                        File(destDir, "${baseName.substring(0, dot)} ($suffix)${baseName.substring(dot)}")
-                    } else {
-                        File(destDir, "$baseName ($suffix)")
+        try {
+            openDvzipOrGzipStream(borrowed).use { decoded ->
+                val cpioStream = object : InputStream() {
+                    var expanded = 0L
+                    override fun read(): Int {
+                        val b = ByteArray(1)
+                        return if (read(b, 0, 1) < 0) -1 else b[0].toInt() and 255
                     }
-                    suffix++
+                    override fun read(b: ByteArray, off: Int, len: Int): Int {
+                        if (len == 0) return 0
+                        if (expanded >= maxExpandedBytes) {
+                            // Permit an EOF probe at the exact cap, including footer/checksum validation.
+                            if (decoded.read() < 0) return -1
+                            throw IOException("Expanded archive exceeds limit: $maxExpandedBytes")
+                        }
+                        val n = decoded.read(b, off, minOf(len.toLong(), maxExpandedBytes - expanded).toInt())
+                        if (n > 0) expanded += n
+                        return n
+                    }
                 }
-                val partFile = File(destDir, "${outFile.name}.part")
-                var writeSuccess = false
-                try {
-                    BufferedOutputStream(FileOutputStream(partFile), DVZIP_STORED_BLOCK_BYTES).use { fos ->
+
+                fun readExact(inp: InputStream, dst: ByteArray, len: Int = dst.size): Int {
+                    var off = 0
+                    while (off < len) {
+                        val n = inp.read(dst, off, len - off)
+                        if (n <= 0) break
+                        off += n
+                    }
+                    return off
+                }
+
+                while (true) {
+                    val magicBuf = ByteArray(6)
+                    val m = readExact(cpioStream, magicBuf, 6)
+                    if (m == 0) throw EOFException("Missing CPIO trailer")
+                    if (m < 6) throw EOFException("Truncated CPIO magic")
+                    val magic = String(magicBuf, StandardCharsets.US_ASCII)
+
+                    val mode: Int
+                    val nameSize: Int
+                    val fileSize: Long
+                    val isNewc: Boolean
+
+                    when (magic) {
+                        "070707" -> {
+                            val hdr = ByteArray(70)
+                            if (readExact(cpioStream, hdr, 70) < 70) throw EOFException("Truncated odc header")
+                            val hStr = String(hdr, StandardCharsets.US_ASCII)
+                            mode = hStr.substring(12, 18).toInt(8)
+                            nameSize = hStr.substring(53, 59).toInt(8)
+                            fileSize = hStr.substring(59, 70).toLong(8)
+                            isNewc = false
+                        }
+                        "070701", "070702" -> {
+                            val hdr = ByteArray(104)
+                            if (readExact(cpioStream, hdr, 104) < 104) throw EOFException("Truncated newc header")
+                            val hStr = String(hdr, StandardCharsets.US_ASCII)
+                            mode = hStr.substring(8, 16).toInt(16)
+                            fileSize = hStr.substring(48, 56).toLong(16)
+                            nameSize = hStr.substring(88, 96).toInt(16)
+                            isNewc = true
+                        }
+                        "070764" -> {
+                            val hdr = ByteArray(96)
+                            if (readExact(cpioStream, hdr, 96) < 96) throw EOFException("Truncated 070764 header")
+                            val hStr = String(hdr, StandardCharsets.US_ASCII)
+                            mode = hStr.substring(16, 24).toInt(16)
+                            fileSize = java.lang.Long.parseUnsignedLong(hStr.substring(64, 80), 16)
+                            nameSize = hStr.substring(80, 88).toInt(16)
+                            isNewc = false
+                        }
+                        else -> throw IllegalArgumentException("Invalid CPIO magic: $magic")
+                    }
+
+                    require(fileSize >= 0L) { "Invalid negative CPIO file size: $fileSize" }
+                    require(nameSize in 1..4097) { "Invalid CPIO name size: $nameSize" }
+                    val nameBuf = ByteArray(nameSize)
+                    if (readExact(cpioStream, nameBuf, nameSize) < nameSize) {
+                        throw EOFException("Truncated CPIO entry name")
+                    }
+                    require(nameBuf.indexOf(0.toByte()) == nameSize - 1) {
+                        "Invalid CPIO name terminator"
+                    }
+                    val rawName = String(nameBuf, 0, nameSize - 1, StandardCharsets.UTF_8)
+                    if (isNewc) {
+                        val hdrPad = (4 - ((110 + nameSize) % 4)) % 4
+                        if (hdrPad > 0 && readExact(cpioStream, ByteArray(hdrPad), hdrPad) != hdrPad) {
+                            throw EOFException("Truncated CPIO header padding")
+                        }
+                    }
+                    if (rawName == "TRAILER!!!") {
+                        require(fileSize == 0L) { "Invalid CPIO trailer size" }
+                        break
+                    }
+
+                    val isRegularFile = (mode and 61440) == 32768 // (mode & 0170000) == 0100000
+                    if (isRegularFile) {
+                        val baseName = safeFileName(rawName)
+                        if (remaining != null) {
+                            // Consume exact sizes before unknown sizes so duplicate names are order-independent.
+                            val exact = ApprovedFile(baseName, fileSize)
+                            val match = if (remaining.containsKey(exact)) exact else ApprovedFile(baseName)
+                            val count = remaining[match]
+                                ?: throw IOException("CPIO entry is not in approved manifest: $baseName ($fileSize bytes)")
+                            if (count == 1) remaining.remove(match) else remaining[match] = count - 1
+                        }
+                        if (fileSize > maxExpandedBytes - cpioStream.expanded) {
+                            throw IOException("Expanded archive exceeds limit: $maxExpandedBytes")
+                        }
+                        val availableBytes = availableStorageBytes(destination, context)
+                        if (availableBytes < fileSize) {
+                            throw IOException("Insufficient storage space for $baseName: required $fileSize B, available $availableBytes B")
+                        }
+                        val partFile = staging.resolve("${pending.size}.part").toFile()
+                        BufferedOutputStream(Files.newOutputStream(
+                            partFile.toPath(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS
+                        ), DVZIP_STORED_BLOCK_BYTES).use { fos ->
+                            var left = fileSize
+                            while (left > 0) {
+                                val want = minOf(ioBuf.size.toLong(), left).toInt()
+                                val n = cpioStream.read(ioBuf, 0, want)
+                                if (n <= 0) throw EOFException("Truncated CPIO file data for $baseName")
+                                fos.write(ioBuf, 0, n)
+                                left -= n
+                            }
+                        }
+                        pending.add(partFile to baseName)
+                    } else {
+                        // Senders (macOS sharingd and GlideDrop for Mac) emit an empty "." root
+                        // directory entry before files. Empty directories are never materialised
+                        // (output is flattened), so they are safe; any other non-regular entry
+                        // (symlink, device, FIFO, or a directory carrying data) stays rejected.
+                        val isEmptyDirectory = (mode and 61440) == 16384 && fileSize == 0L
+                        if (remaining != null && !isEmptyDirectory) {
+                            throw IOException("Non-regular CPIO entry is not approved: $rawName")
+                        }
                         var left = fileSize
                         while (left > 0) {
                             val want = minOf(ioBuf.size.toLong(), left).toInt()
                             val n = cpioStream.read(ioBuf, 0, want)
-                            if (n <= 0) throw EOFException("Truncated CPIO file data for $baseName")
-                            fos.write(ioBuf, 0, n)
+                            if (n <= 0) throw EOFException("Truncated CPIO non-file entry")
                             left -= n
                         }
-                        fos.flush()
                     }
-                    if (partFile.renameTo(outFile)) {
-                        writeSuccess = true
-                        saved.add(outFile)
-                    } else {
-                        throw IOException("Failed to atomically rename temporary file $partFile to $outFile")
-                    }
-                } finally {
-                    if (!writeSuccess) {
-                        partFile.delete()
-                    }
-                }
-            } else {
-                var left = fileSize
-                while (left > 0) {
-                    val want = minOf(ioBuf.size.toLong(), left).toInt()
-                    val n = cpioStream.read(ioBuf, 0, want)
-                    if (n <= 0) throw EOFException("Truncated CPIO non-file entry")
-                    left -= n
-                }
-            }
 
-            if (isNewc) {
-                val dataPad = ((4 - (fileSize % 4)) % 4).toInt()
-                if (dataPad > 0) readExact(cpioStream, ByteArray(dataPad), dataPad)
+                    if (isNewc) {
+                        val dataPad = ((4 - (fileSize % 4)) % 4).toInt()
+                        if (dataPad > 0 && readExact(cpioStream, ByteArray(dataPad), dataPad) != dataPad) {
+                            throw EOFException("Truncated CPIO data padding")
+                        }
+                    }
+                }
+                // Reaching TRAILER!!! alone does not validate a gzip/zlib footer or later DVZip blocks.
+                var padding = 0
+                while (true) {
+                    val n = cpioStream.read(ioBuf, 0, minOf(ioBuf.size, MAX_CPIO_TRAILING_PADDING_BYTES - padding + 1))
+                    if (n < 0) break
+                    padding += n
+                    if (padding > MAX_CPIO_TRAILING_PADDING_BYTES) throw IOException("Excessive CPIO trailing padding")
+                    for (i in 0 until n) {
+                        if (ioBuf[i] != 0.toByte()) throw IOException("Non-zero data after CPIO trailer")
+                    }
+                }
             }
+            if (!remaining.isNullOrEmpty()) throw IOException("CPIO archive is missing approved files")
+            for ((partFile, baseName) in pending) {
+                var suffix = 0
+                while (true) {
+                    val dot = baseName.lastIndexOf('.')
+                    val name = when {
+                        suffix == 0 -> baseName
+                        dot > 0 -> "${baseName.substring(0, dot)} ($suffix)${baseName.substring(dot)}"
+                        else -> "$baseName ($suffix)"
+                    }
+                    val target = File(destination, name)
+                    try {
+                        publishNoReplace(partFile, target)
+                        saved.add(target)
+                        break
+                    } catch (_: FileAlreadyExistsException) {
+                        suffix++
+                    }
+                }
+            }
+            return saved
+        } finally {
+            staging.toFile().deleteRecursively()
         }
-        return saved
+    }
+
+    private fun publishNoReplace(staged: File, target: File) {
+        try {
+            // A hard link is atomic and fails if *any* target entry already exists, including a dangling symlink.
+            Files.createLink(target.toPath(), staged.toPath())
+            return
+        } catch (e: FileAlreadyExistsException) {
+            throw e
+        } catch (_: UnsupportedOperationException) {
+            // Emulated Android external storage may not support hard links.
+        } catch (_: FileSystemException) {
+            // Fall back to exclusive creation, never a check-then-replacing rename.
+        }
+        val output = Files.newOutputStream(
+            target.toPath(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS
+        )
+        try {
+            output.use { out -> staged.inputStream().use { it.copyTo(out, DVZIP_STORED_BLOCK_BYTES) } }
+        } catch (e: Exception) {
+            target.delete()
+            throw e
+        }
     }
 
     private fun openDvzipOrGzipStream(rawIn: InputStream): InputStream {
@@ -706,12 +851,10 @@ object GlideDropCodec {
             private val oneByte = ByteArray(1)
             private var eof = false
 
-            private fun drainCompLeft() {
-                while (compLeft > 0) {
-                    val n = combined.read(inBuf, 0, minOf(inBuf.size, compLeft))
-                    if (n <= 0) throw EOFException("Truncated DVZip block tail")
-                    compLeft -= n
-                }
+            private fun finishCompressedBlock(inf: Inflater) {
+                if (inf.remaining != 0 || compLeft != 0) throw IOException("DVZip compressed block length mismatch")
+                inf.end()
+                inflater = null
             }
 
             override fun read(): Int {
@@ -734,19 +877,17 @@ object GlideDropCodec {
                         if (inf.needsDictionary()) {
                             throw IOException("Zlib preset dictionary not supported in DVZip")
                         }
-                        val produced = inf.inflate(b, off, len)
+                        val produced = try {
+                            inf.inflate(b, off, len)
+                        } catch (e: java.util.zip.DataFormatException) {
+                            throw IOException("Invalid DVZip zlib block", e)
+                        }
                         if (produced > 0) {
-                            if (inf.finished()) {
-                                inf.end()
-                                inflater = null
-                                drainCompLeft()
-                            }
+                            if (inf.finished()) finishCompressedBlock(inf)
                             return produced
                         }
                         if (inf.finished()) {
-                            inf.end()
-                            inflater = null
-                            drainCompLeft()
+                            finishCompressedBlock(inf)
                             continue
                         }
                         if (inf.needsInput()) {
@@ -775,10 +916,12 @@ object GlideDropCodec {
                     if (hRead < 4) throw EOFException("Truncated DVZip block header ($hRead bytes)")
                     val v = ByteBuffer.wrap(hdr).int
                     if (v == 0) {
+                        if (combined.read() >= 0) throw IOException("Data after DVZip end block")
                         eof = true
                         return -1
                     }
                     val blockLen = v and 0x7FFFFFFF
+                    if (blockLen == 0) throw IOException("Empty DVZip data block")
                     if ((v and DVZIP_STORED) != 0) {
                         storedLeft = blockLen
                     } else {

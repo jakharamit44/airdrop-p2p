@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Dual-Protocol Embedded Proxy Server (SOCKS5 + HTTP CONNECT & Forward Proxy), default port 1080.
+ * Dual-Protocol Embedded Proxy Server (SOCKS5 + HTTP CONNECT & Forward Proxy), OS-assigned port.
  *
  * Runs on Android during Wi-Fi Direct P2P transfers so connected macOS peers
  * can route internet traffic through Android's active upstream cellular connection.
@@ -56,7 +56,7 @@ import java.util.concurrent.atomic.AtomicReference
  */
 class EmbeddedProxyServer internal constructor(
     private val context: Context? = null,
-    val port: Int = DEFAULT_PROXY_PORT,
+    val port: Int = 0,
     private val logger: ((String) -> Unit)? = null,
     private val outboundAddressResolver: ((Network?, String) -> Array<InetAddress>)? = null,
     private val outboundSocketConnectHook: ((Socket, InetAddress, Int, Int) -> Unit)? = null,
@@ -66,12 +66,11 @@ class EmbeddedProxyServer internal constructor(
 
     constructor(
         context: Context? = null,
-        port: Int = DEFAULT_PROXY_PORT,
+        port: Int = 0,
         logger: ((String) -> Unit)? = null
     ) : this(context, port, logger, null, null, { emptyList() }, false)
 
     companion object {
-        const val DEFAULT_PROXY_PORT = 1080
         private const val HANDSHAKE_TIMEOUT_MS = 15_000
         private const val RELAY_IDLE_TIMEOUT_MS = 60_000
         private const val OUTBOUND_CONNECT_TIMEOUT_MS = 10_000
@@ -746,12 +745,40 @@ class EmbeddedProxyServer internal constructor(
         stop()
     }
 
+    private class HandshakeInputStream(private val socket: Socket) :
+        PushbackInputStream(socket.getInputStream(), 1024) {
+        private val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_TIMEOUT_MS.toLong())
+        private var complete = false
+
+        private fun checkDeadline() {
+            if (complete) return
+            val remainingNanos = deadlineNanos - System.nanoTime()
+            if (remainingNanos <= 0) throw SocketTimeoutException("Proxy handshake deadline exceeded")
+            socket.soTimeout = maxOf(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos)).toInt()
+        }
+
+        override fun read(): Int {
+            checkDeadline()
+            return super.read()
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            checkDeadline()
+            return super.read(buffer, offset, length)
+        }
+
+        fun finishHandshake() {
+            checkDeadline()
+            complete = true
+        }
+    }
+
     private fun handleClient(clientSocket: Socket) {
         clientSocket.soTimeout = HANDSHAKE_TIMEOUT_MS
         clientSocket.tcpNoDelay = true
         activeSockets.add(clientSocket)
 
-        val input = PushbackInputStream(clientSocket.getInputStream(), 1024)
+        val input = HandshakeInputStream(clientSocket)
         try {
             val firstByte = input.read()
             if (firstByte == -1) return
@@ -862,8 +889,13 @@ class EmbeddedProxyServer internal constructor(
             return
         }
 
-        sendSocksReply(output, SOCKS_REP_SUCCESS)
-        relayBidirectional(client, input, outboundSocket)
+        try {
+            sendSocksReply(output, SOCKS_REP_SUCCESS)
+            relayBidirectional(client, input, outboundSocket)
+        } finally {
+            activeSockets.remove(outboundSocket)
+            runCatching { outboundSocket.close() }
+        }
     }
 
     private fun sendSocksReply(output: OutputStream, rep: Int) {
@@ -944,8 +976,13 @@ class EmbeddedProxyServer internal constructor(
                 return
             }
 
-            sendHttpResponse(output, 200, "Connection Established", closeConnection = false)
-            relayBidirectional(client, input, outboundSocket)
+            try {
+                sendHttpResponse(output, 200, "Connection Established", closeConnection = false)
+                relayBidirectional(client, input, outboundSocket)
+            } finally {
+                activeSockets.remove(outboundSocket)
+                runCatching { outboundSocket.close() }
+            }
         } else {
             // Standard HTTP Forward Proxy (GET, POST, HEAD, PUT, DELETE, etc.)
             val (targetHost, targetPort, rewrittenUri) = parseForwardHttpTarget(uriStr, headerStr)
@@ -964,21 +1001,27 @@ class EmbeddedProxyServer internal constructor(
                 return
             }
 
-            // Rewrite first line to origin-form (e.g., "GET /path HTTP/1.1") and normalize connection headers
-            val httpVersion = if (parts.size >= 3) parts[2] else "HTTP/1.1"
-            val rewrittenHeader = rewriteForwardHttpHeaders(method, rewrittenUri, httpVersion, headerStr)
-            val outboundOut = outboundSocket.getOutputStream()
-            outboundOut.write(rewrittenHeader.toByteArray(StandardCharsets.US_ASCII))
-            outboundOut.flush()
+            try {
+                // Rewrite first line to origin-form and normalize connection headers.
+                val httpVersion = if (parts.size >= 3) parts[2] else "HTTP/1.1"
+                val rewrittenHeader = rewriteForwardHttpHeaders(method, rewrittenUri, httpVersion, headerStr)
+                val outboundOut = outboundSocket.getOutputStream()
+                outboundOut.write(rewrittenHeader.toByteArray(StandardCharsets.US_ASCII))
+                outboundOut.flush()
 
-            relayBidirectional(client, input, outboundSocket)
+                relayBidirectional(client, input, outboundSocket)
+            } finally {
+                activeSockets.remove(outboundSocket)
+                runCatching { outboundSocket.close() }
+            }
         }
     }
 
     internal fun parseForwardHttpTarget(uriStr: String, fullHeaders: String): Triple<String, Int, String> {
-        if (uriStr.startsWith("http://", ignoreCase = true) || uriStr.startsWith("https://", ignoreCase = true)) {
-            val isHttps = uriStr.startsWith("https://", ignoreCase = true)
-            val defaultPort = if (isHttps) 443 else 80
+        // HTTPS must use CONNECT: forwarding it over a plain socket would expose headers and bodies.
+        if (uriStr.startsWith("https://", ignoreCase = true)) return Triple("", -1, "")
+        if (uriStr.startsWith("http://", ignoreCase = true)) {
+            val defaultPort = 80
             try {
                 val uri = URI(uriStr)
                 val host = uri.host
@@ -1268,6 +1311,7 @@ class EmbeddedProxyServer internal constructor(
     // =========================================================================
 
     private fun relayBidirectional(client: Socket, clientIn: InputStream, outbound: Socket) {
+        (clientIn as? HandshakeInputStream)?.finishHandshake()
         client.tcpNoDelay = true
         outbound.tcpNoDelay = true
         client.soTimeout = RELAY_IDLE_TIMEOUT_MS

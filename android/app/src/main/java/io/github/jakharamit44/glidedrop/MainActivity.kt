@@ -69,6 +69,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -566,7 +567,10 @@ fun GlideDropScreen(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
         node.refreshSystemReadiness()
-        node.start()
+        if (node.permissionsGranted.value) {
+            runCatching { context.startForegroundService(Intent(context, GlideDropService::class.java)) }
+            node.start()
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -619,6 +623,82 @@ fun GlideDropScreen(
 
     // Incoming Ask Consent Modal
     incomingAsk?.let { ask ->
+      if (ask.verificationCode != null) {
+        var rememberPeerChecked by remember(ask) { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { ask.decision.complete(false) },
+            containerColor = c.surfaceOverlay,
+            titleContentColor = c.textPrimary,
+            textContentColor = c.textSecondary,
+            shape = RoundedCornerShape(20.dp),
+            title = {
+                Text(
+                    text = "Allow connection from ${ask.senderName}?",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "${ask.senderName} wants to open a secure 5 GHz Wi-Fi Direct link to send you files. Accept only if the code below matches the one on the Mac.",
+                        color = c.textSecondary,
+                        fontSize = 14.sp
+                    )
+                    Surface(
+                        color = c.surfaceSunken,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, c.borderSubtle),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = ask.verificationCode,
+                            color = c.textPrimary,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 28.sp,
+                            textAlign = TextAlign.Center,
+                            style = TextStyle(fontFeatureSettings = "tnum"),
+                            modifier = Modifier.padding(12.dp).fillMaxWidth()
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = rememberPeerChecked,
+                            onCheckedChange = {
+                                rememberPeerChecked = it
+                                ask.rememberPeer?.set(it)
+                            }
+                        )
+                        Text("Always allow this Mac", color = c.textPrimary, fontSize = 14.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        ask.rememberPeer?.set(rememberPeerChecked)
+                        ask.decision.complete(true)
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = c.bgActionPrimary,
+                        contentColor = c.textOnAction
+                    ),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("Allow", fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = { ask.decision.complete(false) },
+                    border = BorderStroke(1.dp, c.borderDefault),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("Decline", color = c.textPrimary)
+                }
+            }
+        )
+      } else
         AlertDialog(
             onDismissRequest = { ask.decision.complete(false) },
             containerColor = c.surfaceOverlay,
@@ -974,7 +1054,20 @@ fun GlideDropScreen(
                     logs = logs,
                     showLogs = showLogs,
                     onSelectThemeMode = { node.themeMode = it },
-                    onToggleRunning = { enabled -> if (enabled) node.start() else node.stop() },
+                    onToggleRunning = { enabled ->
+                        if (enabled) {
+                            node.refreshSystemReadiness()
+                            if (node.permissionsGranted.value) {
+                                runCatching { context.startForegroundService(Intent(context, GlideDropService::class.java)) }
+                                node.start()
+                            } else {
+                                permLauncher.launch(requiredPermissions)
+                            }
+                        } else {
+                            node.stop()
+                            context.stopService(Intent(context, GlideDropService::class.java))
+                        }
+                    },
                     onSelectAutoAccept = { node.autoAccept = it },
                     onToggleShareCellularInternet = { node.shareCellularInternet = it },
                     onRenameDevice = {
@@ -2898,7 +2991,7 @@ private fun SettingsScreenTab(
             }
         }
 
-        // 3. Internet Sharing Proxy (SOCKS5 + HTTP CONNECT, default port 1080 / dynamic fallback)
+        // 3. Internet Sharing Proxy (SOCKS5 + HTTP CONNECT, OS-assigned port)
         item {
             Surface(
                 color = c.surfaceRaised,
@@ -2936,7 +3029,7 @@ private fun SettingsScreenTab(
                     val proxyPortLabel = if (proxyActualPort > 0) {
                         "active on port $proxyActualPort"
                     } else {
-                        "default port ${EmbeddedProxyServer.DEFAULT_PROXY_PORT}"
+                        "OS-assigned port"
                     }
                     Text(
                         text = if (shareCellularInternet) {
@@ -3570,19 +3663,21 @@ private fun QuickVectorIcon(
 
 private fun openFileWithProvider(context: Context, path: String, fallback: () -> Unit) {
     try {
-        val file = File(path)
-        if (!file.exists()) {
-            fallback()
-            return
+        val contentUri = path.toUri().takeIf { it.scheme == "content" }
+        val uri = contentUri ?: File(path).let { file ->
+            if (!file.exists()) {
+                fallback()
+                return
+            }
+            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         }
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        val ext = file.extension.lowercase()
-        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+        val mime = context.contentResolver.getType(uri)
+            ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(File(path).extension.lowercase()) ?: "*/*"
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(Intent.createChooser(intent, "Open ${file.name}"))
+        context.startActivity(Intent.createChooser(intent, "Open received file"))
     } catch (_: Throwable) {
         fallback()
     }
@@ -3598,17 +3693,20 @@ private fun shareFileOrUrl(context: Context, item: ReceivedItem) {
             context.startActivity(Intent.createChooser(intent, "Share link"))
             return
         }
-        val file = File(item.pathOrUrl)
-        if (!file.exists()) return
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        val ext = file.extension.lowercase()
-        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+        val uri = item.pathOrUrl.toUri().takeIf { it.scheme == "content" }
+            ?: File(item.pathOrUrl).let { file ->
+                if (!file.exists()) return
+                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            }
+        val mime = context.contentResolver.getType(uri)
+            ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(File(item.title).extension.lowercase()) ?: "*/*"
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = mime
             putExtra(Intent.EXTRA_STREAM, uri)
+            clipData = ClipData.newRawUri("GlideDrop file", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(Intent.createChooser(intent, "Share ${file.name}"))
+        context.startActivity(Intent.createChooser(intent, "Share ${item.title}"))
     } catch (_: Throwable) {
         Toast.makeText(context, "Unable to share file", Toast.LENGTH_SHORT).show()
     }

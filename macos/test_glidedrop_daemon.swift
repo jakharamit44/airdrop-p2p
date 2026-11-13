@@ -523,6 +523,80 @@ struct GlideDropDaemonTests {
             print("[PASS] BleSenderConnectState stale switch, timeout/drop, and GATT/L2CAP retry logic")
         }
 
+        // Failed HTTPS child launch must return a terminal local-error status, not wait on an unstarted process.
+        do {
+            cleanTestState()
+            let process = Process()
+            process.executableURL = testRoot.appendingPathComponent("missing-https-sender")
+            let status = runP2pTxProcess(process)
+            check(status == 45, "Child launch failure must return local error 45")
+
+            check(!shouldAllowBleAutoFallback(fileCount: 1, totalRawBytes: 100_000, txExitCode: status),
+                  "Local HTTPS launch/config errors must not silently downgrade to BLE")
+            print("[PASS] HTTPS child launch failure and terminal fallback policy")
+        }
+
+        // HTTPS terminal failures may neither retry nor switch transports.
+        do {
+            for code: Int32 in [43, 44, 45, 46, 47] {
+                for bytes: Int64 in [1024, 10_000_000] {
+                    check(!shouldRetryP2pTx(fileCount: 1, totalRawBytes: bytes, txExitCode: code,
+                                           elapsed: 1, cancelled: false),
+                          "Terminal HTTPS status \(code) must not retry for \(bytes) bytes")
+                }
+            }
+            check(shouldRetryP2pTx(fileCount: 1, totalRawBytes: 10_000_000, txExitCode: 1,
+                                   elapsed: 1, cancelled: false), "Transient initial failure of large transfer may retry")
+            check(!shouldRetryP2pTx(fileCount: 1, totalRawBytes: 1024, txExitCode: 1,
+                                    elapsed: 1, cancelled: false), "Small transient failure should use existing BLE fallback policy")
+            check(!shouldRetryP2pTx(fileCount: 1, totalRawBytes: 10_000_000, txExitCode: 1,
+                                    elapsed: 15, cancelled: false), "Late failure must not replay upload")
+            check(!shouldRetryP2pTx(fileCount: 1, totalRawBytes: 10_000_000, txExitCode: 1,
+                                    elapsed: 1, cancelled: true), "Cancellation must prevent retry")
+            print("[PASS] HTTPS terminal status and retry policy")
+        }
+
+        // The establishment timeout is not a total-send timeout; live progress renews the idle deadline.
+        do {
+            var connecting = BleSenderActivityDeadline(startedAt: 1000)
+            check(!connecting.hasTimedOut(transferStarted: false, progressUpdatedAt: 1299, now: 1299),
+                  "Connection establishment must retain its 300s allowance")
+            check(connecting.hasTimedOut(transferStarted: false, progressUpdatedAt: 1300, now: 1300),
+                  "Connecting UI heartbeats must not extend establishment indefinitely")
+
+            var sending = BleSenderActivityDeadline(startedAt: 1000)
+            check(!sending.hasTimedOut(transferStarted: true, progressUpdatedAt: nil, now: 1299),
+                  "Channel opened near establishment deadline must get a fresh idle allowance")
+            check(!sending.hasTimedOut(transferStarted: true, progressUpdatedAt: nil, now: 1301),
+                  "Live send must not be killed 300s after startup")
+            for now in stride(from: 1359.0, through: 4899.0, by: 60) {
+                check(!sending.hasTimedOut(transferStarted: true, progressUpdatedAt: now, now: now),
+                      "Progressing transfer must survive beyond an hour without a total-duration limit")
+            }
+            check(!sending.hasTimedOut(transferStarted: true, progressUpdatedAt: 4899, now: 5198),
+                  "Live send may wait just under 300s since its latest progress")
+            check(sending.hasTimedOut(transferStarted: true, progressUpdatedAt: 4899, now: 5199),
+                  "Stale progress must not keep a stalled send alive indefinitely")
+
+            var idle = BleSenderActivityDeadline(startedAt: 1000)
+            check(!idle.hasTimedOut(transferStarted: true, progressUpdatedAt: 999, now: 1001),
+                  "Pre-existing progress must not affect a new live send")
+            check(idle.hasTimedOut(transferStarted: true, progressUpdatedAt: 9999, now: 1301),
+                  "Future progress timestamps must not extend a stalled send")
+
+            cleanTestState()
+            let progressFile = STATE_DIR.appendingPathComponent("transfer_progress.json")
+            check(senderProgressUpdatedAt() == nil, "Missing progress must not fabricate activity")
+            for (active, direction, expected) in [(true, "Sending", Optional(1500.0)),
+                                                   (true, "Receiving", nil), (false, "Sending", nil)] {
+                let data = try! JSONSerialization.data(withJSONObject: ["active": active, "direction": direction, "updatedAt": 1500.0])
+                try! data.write(to: progressFile, options: [.atomic])
+                check(senderProgressUpdatedAt() == expected, "Only active Sending progress may renew the sender deadline")
+            }
+            cleanTestState()
+            print("[PASS] Establishment timeout and activity-aware live sender deadline")
+        }
+
         // 7. makeOdcCpioHeader 4-8 GB (070707 64-bit octal) & >8 GB (070764) formatting
         do {
             let fiveGb: Int64 = 5_000_000_000
@@ -560,6 +634,28 @@ struct GlideDropDaemonTests {
             check(bleB64 == "YrIYKl4YCHCjpy5kHceecyO0ix53rFC6MNbj+dzP6Rg=", "BleFrameKey vector mismatch: \(bleB64)")
             check(bearerTok == "e17df0a3f490020f6fa1834856fca83007dbf426c3a07f58207eb1adb31b415e", "BearerToken vector mismatch: \(bearerTok)")
             check(sessB64 != bleB64, "SessionKey and BleFrameKey must be domain-separated")
+
+            // Task 3.5: W2P2 v3 HKDF vector shared with Android (GlideDropNodeRegressionTest.w2p2V3MaterialMatchesSwiftVector)
+            let v3Sid = Data((1...16).map { UInt8($0) })
+            let v3RespPub = Data(repeating: 0x42, count: 91)
+            let v3 = deriveW2p2SessionMaterial(
+                sharedSecret: shared, sessionId: v3Sid, initiatorPubDer: pub1Der, responderPubDer: v3RespPub,
+                initiatorFingerprint: String(repeating: "aa", count: 32), responderFingerprint: String(repeating: "bb", count: 32))
+            check(v3 != nil, "v3 material must derive")
+            check(v3?.sessionKey.withUnsafeBytes { Data($0) }.base64EncodedString() == "/UapwvsyFihK9p7CgynCYS3jGftS09bUXvMf27AKBQE=", "v3 AES key vector mismatch")
+            check(v3?.token == "8ea5f9f4940b8095d52e539e0b1a8d57bca6d6e9eafd4f34180a7d2dd6f1a161", "v3 token vector mismatch: \(v3?.token ?? "nil")")
+            check(v3?.verificationCode == "551 971", "v3 verification code vector mismatch: \(v3?.verificationCode ?? "nil")")
+            let v3Tampered = deriveW2p2SessionMaterial(
+                sharedSecret: shared, sessionId: v3Sid, initiatorPubDer: pub1Der, responderPubDer: v3RespPub,
+                initiatorFingerprint: String(repeating: "aa", count: 32), responderFingerprint: String(repeating: "bc", count: 32))
+            check(v3Tampered?.token != v3?.token && v3Tampered?.verificationCode != nil, "tampered fingerprint must change token")
+            check(deriveW2p2SessionMaterial(sharedSecret: shared, sessionId: v3Sid, initiatorPubDer: pub1Der, responderPubDer: v3RespPub,
+                initiatorFingerprint: "zz", responderFingerprint: String(repeating: "bb", count: 32)) == nil, "malformed fingerprint must be rejected")
+            let reqV3 = parseW2p2Request("3\tPUB\t" + String(repeating: "aa", count: 32) + "\t0102030405060708090a0b0c0d0e0f10")
+            check(reqV3.version == 3 && reqV3.sessionId?.count == 16 && reqV3.pubB64 == "PUB", "v3 request must parse")
+            check(parseW2p2Request("2\tPUB\tFP").version < W2P2_PROTOCOL_VERSION, "v2 request is below the required version")
+            check(parseW2p2Request("PUB\tFP").version < W2P2_PROTOCOL_VERSION, "unversioned request is below the required version")
+            check(isW2p2UpdateRequiredReply("ERR\tUPDATE\t3") && isW2p2UpdateRequiredReply("NO\tUPDATE\t3") && !isW2p2UpdateRequiredReply("ERR"), "update-required reply detection")
 
             check(isValidSha256Fingerprint(bearerTok), "64 lowercase hex fingerprint must be valid")
             check(isValidSha256Fingerprint(bearerTok.uppercased()), "64 uppercase hex fingerprint must normalize cleanly")
@@ -715,6 +811,8 @@ struct GlideDropDaemonTests {
             check(!isNormalWifiIpv4("127.0.0.1", activeP2pCidr: "192.168.73.0/24"), "Loopback excluded from normal Wi-Fi")
 
             writeActiveP2pSession(
+                ssid: "DIRECT-TransportTest",
+                interfaceName: "en7",
                 gatewayIp: "192.168.73.1",
                 cidr: "192.168.73.0/24",
                 httpsPort: 9443,
@@ -725,6 +823,32 @@ struct GlideDropDaemonTests {
                 now: 1000.0
             )
             let loadedSess = loadActiveP2pSession(stateDir: testStateDir, maxAge: 60.0, now: 1010.0)
+            check(loadedSess?.ssid == "DIRECT-TransportTest", "Session must persist OS-confirmed SSID")
+            check(loadedSess?.interfaceName == "en7", "Session must persist OS-confirmed interface")
+            let sessionFile = testStateDir.appendingPathComponent("active_p2p_session.json")
+            let sessionJson = try! JSONSerialization.jsonObject(with: Data(contentsOf: sessionFile)) as! [String: Any]
+            check(sessionJson["ssid"] as? String == "DIRECT-TransportTest" && sessionJson["interfaceName"] as? String == "en7",
+                  "Session JSON must satisfy the shell provenance contract")
+            let sessionPerms = (try! FileManager.default.attributesOfItem(atPath: sessionFile.path)[.posixPermissions] as! NSNumber).intValue
+            check(sessionPerms & 0o777 == 0o600, "P2P session provenance must be private")
+            let approvedToken = String(repeating: "c", count: 64)
+            check(writeWp2pAuthorization(senderName: "TestPeer", ssid: "DIRECT-TransportTest", token: approvedToken,
+                      peerIp: "192.168.73.1", stateDir: testStateDir, now: 1010.0), "Verified session must allow bound approval")
+            let approvalFile = testStateDir.appendingPathComponent("wp2p_authorized_session.json")
+            let approval = try! JSONSerialization.jsonObject(with: Data(contentsOf: approvalFile)) as! [String: Any]
+            check(approval["senderName"] as? String == "TestPeer" && approval["ssid"] as? String == "DIRECT-TransportTest" &&
+                  approval["token"] as? String == approvedToken && approval["peerIp"] as? String == "192.168.73.1" &&
+                  approval["authorizedAt"] as? Double == 1010.0, "Reusable approval must bind exact peer, SSID, token, name and approval time")
+            let approvalPerms = (try! FileManager.default.attributesOfItem(atPath: approvalFile.path)[.posixPermissions] as! NSNumber).intValue
+            check(approvalPerms & 0o777 == 0o600, "Approval containing a bearer token must be private")
+            try! FileManager.default.removeItem(at: approvalFile)
+            for (ssid, token, peerIp) in [("DIRECT-Other", approvedToken, "192.168.73.1"),
+                                           ("DIRECT-TransportTest", "not-a-token", "192.168.73.1"),
+                                           ("DIRECT-TransportTest", approvedToken, "192.168.73.2")] {
+                check(!writeWp2pAuthorization(senderName: "TestPeer", ssid: ssid, token: token, peerIp: peerIp,
+                          stateDir: testStateDir, now: 1010.0), "Unbound approval must fail closed")
+            }
+            check(!FileManager.default.fileExists(atPath: approvalFile.path), "Rejected approvals must not publish authorization")
             check(loadedSess?.gatewayIp == "192.168.73.1", "active_p2p_session gatewayIp mismatch")
             check(loadedSess?.cidr == "192.168.73.0/24", "active_p2p_session cidr mismatch")
             check(loadedSess?.httpsPort == 9443, "active_p2p_session httpsPort mismatch")
@@ -732,12 +856,13 @@ struct GlideDropDaemonTests {
             check(loadedSess?.macRxPort == 9772, "active_p2p_session macRxPort mismatch")
             check(loadedSess?.udpKeepalivePort == 9774, "active_p2p_session udpKeepalivePort mismatch")
             check(loadActiveP2pSession(stateDir: testStateDir, maxAge: 60.0, now: 1100.0) == nil, "Expired active_p2p_session must not load")
+                        check(loadActiveP2pSession(stateDir: testStateDir, maxAge: 60.0, now: 999.0) == nil, "Future-dated session must not load")
             clearActiveP2pSession(stateDir: testStateDir)
             check(loadActiveP2pSession(stateDir: testStateDir, maxAge: 60.0, now: 1010.0) == nil, "Cleared active_p2p_session must be removed")
 
             let legacyJoin = parseWp2pJoinCredentials("DIRECT-XY-Test\tsecretpass")
             check(legacyJoin?.isV2 == false && legacyJoin?.goIp == "" && legacyJoin?.proxyPort == 0, "Legacy 2-field JOIN must leave goIp empty without guessing a hardcoded IP")
-            check(formatWp2pJoinReply(macIp: "192.168.73.8", isV2: false, macRxPort: 8772, udpKeepalivePort: 8774) == "OK 192.168.73.8\n", "Legacy JOIN reply must keep 1-field format")
+            check(formatWp2pJoinReply(macIp: "192.168.73.8", isV2: false, macRxPort: 9772, udpKeepalivePort: 9774) == "OK 192.168.73.8\n", "Legacy JOIN reply must keep 1-field format")
 
             let invalidGoJoin = parseWp2pJoinCredentials("DIRECT-XY-Test\tsecretpass\t8.8.8.8\t2080")
             check(invalidGoJoin?.isV2 == true && invalidGoJoin?.goIp == "" && invalidGoJoin?.proxyPort == 2080, "Invalid goIp in JOIN must remain empty rather than substituting a default")
@@ -756,15 +881,42 @@ struct GlideDropDaemonTests {
             let daemonSource = try! String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("glidedrop-daemon.swift"), encoding: .utf8)
             check(!daemonSource.contains("publishedPsm > 0 ? publishedPsm : 192"), "Daemon must not substitute fake 192 PSM fallback")
             check(!daemonSource.contains("self?.publishedPsm ?? 192"), "Daemon PING reply must not substitute fake 192 PSM fallback")
+            check(!daemonSource.contains("DEFAULT_MAC_RX_PORT") && !daemonSource.contains("DEFAULT_PROXY_PORT") && !daemonSource.contains("DEFAULT_AWDL_BRIDGE_PORT") && !daemonSource.contains("DEFAULT_FINDER_PROXY_PORT"),
+                  "Daemon must not define compiled-in port constants")
+            check(daemonSource.range(of: "\\b(8771|8772|8773|8774|1080|2080)\\b", options: .regularExpression) == nil,
+                  "Daemon must not contain hardcoded transfer/proxy port literals")
             check(!daemonSource.contains("DEFAULT_P2P_") && !daemonSource.contains("192.168.49"), "Daemon must not contain hardcoded DEFAULT_P2P_ or 192.168.49 references")
             check(daemonSource.contains("prohibitedInterfaceTypes = [.wifi, .wiredEthernet, .cellular, .loopback]"), "AwdlLoopbackBridge must prohibit loopback while allowing .other (awdl0)")
 
-            // Interface P2P matching must not match stale/other subnet IPs when targeting an explicit P2P CIDR
+            for (ssid, iface, gateway, cidr, port) in [
+                ("HomeWiFi", "en7", "10.27.4.1", "10.27.4.0/23", 9443),
+                ("DIRECT-TransportTest", "", "10.27.4.1", "10.27.4.0/23", 9443),
+                ("DIRECT-TransportTest", "en7", "10.27.6.1", "10.27.4.0/23", 9443),
+                ("DIRECT-TransportTest", "en7", "169.254.4.1", "169.254.0.0/16", 9443),
+                ("DIRECT-TransportTest", "en7", "10.27.4.1", "10.27.4.0/23", 0)
+            ] {
+                check(!writeActiveP2pSession(ssid: ssid, interfaceName: iface, gatewayIp: gateway, cidr: cidr,
+                          httpsPort: port, proxyPort: 0, stateDir: testStateDir), "Invalid provenance must not publish a P2P session")
+            }
+            let oldSession = Data("{\"gatewayIp\":\"10.27.4.1\",\"cidr\":\"10.27.4.0/23\",\"httpsPort\":9443,\"proxyPort\":0,\"updatedAt\":1000}".utf8)
+            try! oldSession.write(to: sessionFile)
+            check(loadActiveP2pSession(stateDir: testStateDir, now: 1010) == nil, "Legacy session without SSID/interface provenance must not load")
+            clearActiveP2pSession(stateDir: testStateDir)
+
+            // Missing OS netmask must not be replaced with a guessed /24 or saved CIDR.
+                        check(matchWifiP2pInterfaceAddress(
+                            ip: "192.168.73.55", netmask: nil, actualSsid: "DIRECT-TransportTest",
+                            matchingGateway: "192.168.73.1", matchingCidr: "192.168.73.0/24"
+                        ) == nil, "P2P provenance requires an OS netmask, even on DIRECT-* Wi-Fi")
+                        writeActiveP2pSession(ssid: "DIRECT-TransportTest", interfaceName: "en7", gatewayIp: "192.168.73.1", cidr: "", httpsPort: 9443, proxyPort: 0, stateDir: testStateDir)
+                        check(loadActiveP2pSession(stateDir: testStateDir) == nil, "Session writer must reject missing CIDR instead of guessing /24")
+
+                        // Interface P2P matching must not match stale/other subnet IPs when targeting an explicit P2P CIDR
             check(
                 matchWifiP2pInterfaceAddress(
                     ip: "192.168.49.8",
                     netmask: "255.255.255.0",
-                    rawSsidIsDirect: true,
+                    actualSsid: "DIRECT-TransportTest",
                     matchingGateway: "192.168.73.1",
                     matchingCidr: "192.168.73.0/24"
                 ) == nil,
@@ -774,34 +926,51 @@ struct GlideDropDaemonTests {
                 matchWifiP2pInterfaceAddress(
                     ip: "192.168.49.8",
                     netmask: "255.255.255.0",
-                    rawSsidIsDirect: false,
+                    actualSsid: "",
                     matchingGateway: nil,
                     matchingCidr: nil,
                     activeSession: nil
                 ) == nil,
                 "Without active session, explicit target, or DIRECT-* SSID, no IP may match as P2P"
             )
+            for actualSsid in ["HomeWiFi", "DIRECT-OtherPeer"] {
+                check(matchWifiP2pInterfaceAddress(ip: "10.27.5.20", netmask: "255.255.254.0",
+                    actualSsid: actualSsid, requestedSsid: "DIRECT-TransportTest", matchingGateway: "10.27.4.1") == nil,
+                    "Overlapping subnet on a readable wrong SSID must not satisfy requested association")
+            }
+            // Redacted SSID (no Location authorization): accepted from interface state only when the
+            // advertised group-owner address is on the OS-reported subnet; a gateway is mandatory.
+            check(matchWifiP2pInterfaceAddress(ip: "10.27.5.20", netmask: "255.255.254.0",
+                actualSsid: "", requestedSsid: "DIRECT-TransportTest", matchingGateway: "10.27.4.1")?.cidr == "10.27.4.0/23",
+                "Redacted SSID with matching address, netmask and group-owner router must confirm association")
+            check(matchWifiP2pInterfaceAddress(ip: "10.27.5.20", netmask: "255.255.254.0",
+                actualSsid: "", requestedSsid: "DIRECT-TransportTest", matchingGateway: nil) == nil,
+                "Redacted SSID without an advertised group-owner address must not confirm association")
+            let verified = matchWifiP2pInterfaceAddress(ip: "10.27.5.20", netmask: "255.255.254.0",
+                actualSsid: "DIRECT-TransportTest", requestedSsid: "DIRECT-TransportTest", matchingGateway: "10.27.4.1")
+            check(verified?.ip == "10.27.5.20" && verified?.cidr == "10.27.4.0/23", "Exact SSID and OS /23 must preserve the real subnet")
             let dynMatch = matchWifiP2pInterfaceAddress(
                 ip: "192.168.73.200",
                 netmask: "255.255.255.128",
-                rawSsidIsDirect: false, // redacted SSID must still work
+                actualSsid: "", // redacted SSID must still work
                 matchingGateway: "192.168.73.129",
                 matchingCidr: "192.168.73.0/24"
             )
-            check(dynMatch?.ip == "192.168.73.200" && dynMatch?.cidr == "192.168.73.128/25", "Dynamic P2P IP must match even when SSID is redacted")
-            let genericSess = ActiveP2pSession(gatewayIp: "192.168.73.1", cidr: "192.168.73.0/24", httpsPort: 9443, proxyPort: 2080, updatedAt: 1000.0)
+            check(dynMatch?.ip == "192.168.73.200" && dynMatch?.cidr == "192.168.73.128/25",
+                  "Redacted SSID must confirm association from OS netmask containing the group-owner address")
+            let genericSess = ActiveP2pSession(ssid: "DIRECT-TransportTest", interfaceName: "en7", gatewayIp: "192.168.73.1", cidr: "192.168.73.0/24", httpsPort: 9443, proxyPort: 2080, macRxPort: 9772, udpKeepalivePort: 9774, updatedAt: 1000.0)
             check(
-                matchWifiP2pInterfaceAddress(ip: "192.168.73.55", netmask: "255.255.255.0", rawSsidIsDirect: false, activeSession: genericSess)?.ip == "192.168.73.55",
-                "Generic cleanup probe must detect active dynamic session P2P IP"
+                matchWifiP2pInterfaceAddress(ip: "192.168.73.55", netmask: "255.255.255.0", actualSsid: "", activeSession: genericSess) == nil,
+                "Stale session state must not turn overlapping normal Wi-Fi into P2P"
             )
             check(
-                matchWifiP2pInterfaceAddress(ip: "192.168.1.50", netmask: "255.255.255.0", rawSsidIsDirect: false, activeSession: genericSess) == nil,
+                matchWifiP2pInterfaceAddress(ip: "192.168.1.50", netmask: "255.255.255.0", actualSsid: "", activeSession: genericSess) == nil,
                 "Normal HomeWiFi IP must NOT match P2P probe"
             )
             let broad16Match = matchWifiP2pInterfaceAddress(
                 ip: "172.16.5.20",
                 netmask: "255.255.0.0",
-                rawSsidIsDirect: true,
+                actualSsid: "DIRECT-TransportTest",
                 matchingGateway: "172.16.0.1",
                 matchingCidr: "172.16.0.0/24"
             )
@@ -810,7 +979,7 @@ struct GlideDropDaemonTests {
                 matchWifiP2pInterfaceAddress(
                     ip: "192.168.73.10",
                     netmask: "255.255.255.128",
-                    rawSsidIsDirect: false,
+                    actualSsid: "",
                     matchingGateway: "192.168.73.129",
                     matchingCidr: "192.168.73.0/24"
                 ) == nil,
@@ -820,7 +989,7 @@ struct GlideDropDaemonTests {
                 matchWifiP2pInterfaceAddress(
                     ip: "192.168.73.55",
                     netmask: "255.255.255.0",
-                    rawSsidIsDirect: false,
+                    actualSsid: "",
                     matchingGateway: "10.99.1.1",
                     matchingCidr: nil,
                     activeSession: genericSess
@@ -831,7 +1000,7 @@ struct GlideDropDaemonTests {
                 matchWifiP2pInterfaceAddress(
                     ip: "192.168.73.1",
                     netmask: nil,
-                    rawSsidIsDirect: false,
+                    actualSsid: "",
                     matchingGateway: "192.168.73.1",
                     matchingCidr: "192.168.73.0/24"
                 ) == nil,
@@ -847,7 +1016,7 @@ struct GlideDropDaemonTests {
             print("[PASS] Dynamic P2P CIDR, active_p2p_session.json, v2 JOIN compatibility, and AWDL bridge guards")
         }
 
-        // 11. extractDvzipCpioToDownloads bounds, forcePrompt=true, WARP-locked session wait, & AWDL Unix socket bridge
+        // 11. extractDvzipCpioToDownloads bounds, forcePrompt=true, WARP-locked denial, & AWDL Unix socket bridge
         do {
             cleanTestState()
             let rxDir = testRoot.appendingPathComponent("extract_rx")
@@ -910,28 +1079,79 @@ struct GlideDropDaemonTests {
             let promptAccepted = waitForMacUserAccept(senderName: "NearbyPeer", fileNames: ["5 GHz Wi-Fi Direct Connection (DIRECT-TEST)"], totalBytes: 0, forcePrompt: true)
             check(sawPendingAsk && promptAccepted, "waitForMacUserAccept(forcePrompt: true) must prompt even when autoAccept is true")
 
-            // 11f. WARP-locked LAN fallback session keeps wp2p_authorized_session.json alive until upload_completed.flag
-            let authSessionFile = STATE_DIR.appendingPathComponent("wp2p_authorized_session.json")
-            let uploadDoneFile = STATE_DIR.appendingPathComponent("upload_completed.flag")
-            try? Data("{\"senderName\":\"Peer\"}".utf8).write(to: authSessionFile)
-            try? Data(String(Date().timeIntervalSince1970).utf8).write(to: LAN_FALLBACK_FILE)
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) {
-                try? Data("1".utf8).write(to: uploadDoneFile)
+            // 11f. WARP-locked joins fail with ERR after forced approval, never a LAN OK.
+            cleanTestState()
+            saveMacSettings(autoAccept: true, visible: true, deviceName: "TestMac")
+            askWatcher.async {
+                let deadline = Date().addingTimeInterval(3.0)
+                while Date() < deadline {
+                    if let data = try? Data(contentsOf: pendingAskFile),
+                       let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                       let id = obj["id"] as? String {
+                        let decision = try! JSONSerialization.data(withJSONObject: ["id": id, "accepted": true])
+                        try? decision.write(to: askDecisionFile, options: [.atomic])
+                        return
+                    }
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
             }
-            let lanDone = waitForLanFallbackSession(stateDir: testStateDir, initialStartTimeout: 2.0, idleTimeout: 1.0, maxDuration: 5.0, pollInterval: 0.05)
-            check(lanDone, "waitForLanFallbackSession must return true when upload_completed.flag appears")
-            check(FileManager.default.fileExists(atPath: authSessionFile.path),
-                  "wp2p_authorized_session.json must stay alive during waitForLanFallbackSession until outer defer cleans up")
-            check(!FileManager.default.fileExists(atPath: uploadDoneFile.path),
-                  "waitForLanFallbackSession must consume upload_completed.flag")
+            // Runtime-assigned ports are published by the listeners; a join without them must fail closed.
+            let noPortsOut = OutputStream.toMemory()
+            noPortsOut.open()
+            handleIncomingWp2pJoin(ssid: "DIRECT-TransportTest", pass: "test-passphrase", out: noPortsOut,
+                goIp: "10.27.4.1", httpsPort: 9443, isV2Join: true, peerName: "TestPeer",
+                sessionToken: String(repeating: "a", count: 64), peerTlsFingerprint: String(repeating: "d", count: 64),
+                pauseWarp: { fatalError("Join without runtime-assigned ports must not reach WARP") })
+            check(noPortsOut.property(forKey: .dataWrittenToMemoryStreamKey) as? Data == Data("ERR\n".utf8),
+                  "Join without published mac_rx_port/awdl_bridge_port must deny instead of using fixed ports")
+            noPortsOut.close()
+            check(parseWp2pJoinCredentials("DIRECT-XY-Test\tsecretpass\t192.168.49.1\t0\t9443")?.httpsPort == 9443, "Handshake must carry the peer's runtime HTTPS port")
+            check(parseWp2pJoinCredentials("DIRECT-XY-Test\tsecretpass\t192.168.49.1\t0")?.httpsPort == 0, "Missing peer HTTPS port must parse as 0, not a default")
+            check(readPortFile("mac_rx_port") == nil, "Missing port file must yield nil, not a fallback")
+            try! Data("9772\n".utf8).write(to: STATE_DIR.appendingPathComponent("mac_rx_port"))
+            try! Data("9774\n".utf8).write(to: STATE_DIR.appendingPathComponent("awdl_bridge_port"))
+            let deniedOut = OutputStream.toMemory()
+            deniedOut.open()
+            var warpChecked = false
+            handleIncomingWp2pJoin(ssid: "DIRECT-TransportTest", pass: "test-passphrase", out: deniedOut,
+                goIp: "10.27.4.1", httpsPort: 9443, isV2Join: true, peerName: "TestPeer",
+                sessionToken: String(repeating: "a", count: 64), peerTlsFingerprint: String(repeating: "d", count: 64), pauseWarp: {
+                    warpChecked = true
+                    return false
+                })
+            check(warpChecked, "Approved join must check WARP before association")
+            check(deniedOut.property(forKey: .dataWrittenToMemoryStreamKey) as? Data == Data("ERR\n".utf8),
+                  "WARP-locked incoming join must deny, not return a LAN endpoint")
+            deniedOut.close()
+            for name in ["active_p2p_session.json", "wp2p_authorized_session.json", "lan_fallback_active.flag", "p2p_outgoing_token.json"] {
+                check(!FileManager.default.fileExists(atPath: STATE_DIR.appendingPathComponent(name).path),
+                      "Denied join must not publish \(name)")
+            }
 
-            // Stale transfer_progress.json (>30s old) must NOT trigger transferDetected
-            let txProgressFile = STATE_DIR.appendingPathComponent("transfer_progress.json")
-            let staleObj: [String: Any] = ["active": true, "updatedAt": Date().timeIntervalSince1970 - 120.0]
-            try? JSONSerialization.data(withJSONObject: staleObj).write(to: txProgressFile)
-            let staleLanDone = waitForLanFallbackSession(stateDir: testStateDir, initialStartTimeout: 0.2, idleTimeout: 0.2, maxDuration: 0.5, pollInterval: 0.05)
-            check(!staleLanDone, "waitForLanFallbackSession must ignore stale transfer_progress.json and time out false")
-            try? FileManager.default.removeItem(at: txProgressFile)
+            // Busy requests must neither reuse another peer's IP nor remove its pin/approval/token.
+            let pinFile = STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt")
+            let authFile = STATE_DIR.appendingPathComponent("wp2p_authorized_session.json")
+            let ownerToken = String(repeating: "b", count: 64)
+            registerP2pSessionToken(ownerToken)
+            try! Data("owner-pin".utf8).write(to: pinFile)
+            try! Data("owner-approval".utf8).write(to: authFile)
+            check(beginWp2pJoin(), "First join must acquire ownership")
+            check(!beginWp2pJoin(), "Concurrent join must not acquire ownership")
+            let busyOut = OutputStream.toMemory()
+            busyOut.open()
+            handleIncomingWp2pJoin(ssid: "DIRECT-OtherPeer", pass: "other-passphrase", out: busyOut,
+                goIp: "10.27.4.1", isV2Join: true, sessionToken: ownerToken, peerTlsFingerprint: String(repeating: "e", count: 64),
+                pauseWarp: { fatalError("Busy request must not reach WARP or association") })
+            check(busyOut.property(forKey: .dataWrittenToMemoryStreamKey) as? Data == Data("ERR\n".utf8),
+                  "Busy join must immediately deny even for overlapping gateways")
+            busyOut.close()
+            check((try? Data(contentsOf: pinFile)) == Data("owner-pin".utf8), "Busy join must preserve owner's TLS pin")
+            check((try? Data(contentsOf: authFile)) == Data("owner-approval".utf8), "Busy join must preserve owner's approval")
+            let tokenData = try! Data(contentsOf: STATE_DIR.appendingPathComponent("p2p_session_token.json"))
+            check(String(data: tokenData, encoding: .utf8)?.contains(ownerToken) == true, "Busy join must not revoke owner's token")
+            finishWp2pJoin()
+            check(beginWp2pJoin(), "Join ownership must be available after release")
+            finishWp2pJoin()
 
             // Multi-file raw uncompressed CPIO exceeding maxDecompressedBytes cumulatively must fail closed
             func makeRawOdcEntry(name: String, payload: Data) -> Data {
@@ -950,7 +1170,7 @@ struct GlideDropDaemonTests {
 
             // 11g. Source invariants for ADRE ordering, forcePrompt: true, and Unix socket bridge
             let daemonSource = try! String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("glidedrop-daemon.swift"), encoding: .utf8)
-            check(daemonSource.contains("if !waitForMacUserAccept(senderName: incomingPeerName, fileNames: [\"5 GHz Wi-Fi Direct Connection (\\(ssid))\"], totalBytes: 0, forcePrompt: true, isRemoteAborted: isRemoteAbortedNow)"),
+            check(daemonSource.contains("if !waitForMacUserAccept(senderName: incomingPeerName, fileNames: [\"5 GHz Wi-Fi Direct Connection (\\(ssid))\" + (verificationCode.map { \" • Verification code \\($0)\" } ?? \"\")], totalBytes: 0, forcePrompt: true, isRemoteAborted: isRemoteAbortedNow)"),
                   "handleIncomingWp2pJoin must always enforce forcePrompt: true and check isRemoteAborted")
             check(daemonSource.contains("if extractDvzipCpioToDownloads(archiveData: archData, metaDict: metaDict) {\n                        _ = writeAll(out, data: Data(\"OK\\r\\n\".utf8))"),
                   "ADRE must extract before sending OK")
@@ -958,11 +1178,11 @@ struct GlideDropDaemonTests {
                   "AwdlLoopbackBridge must forward to Finder proxy over Unix domain socket")
 
             // 11h. AwdlLoopbackBridge endpoint validation & real AF_UNIX NWConnection round-trip
-            check(!isAllowedAwdlEndpoint(.hostPort(host: .ipv4(IPv4Address("127.0.0.1")!), port: 8774)),
+            check(!isAllowedAwdlEndpoint(.hostPort(host: .ipv4(IPv4Address("127.0.0.1")!), port: 9774)),
                   "isAllowedAwdlEndpoint must reject IPv4 loopback")
-            check(!isAllowedAwdlEndpoint(.hostPort(host: .ipv6(IPv6Address("2001:db8::1")!), port: 8774)),
+            check(!isAllowedAwdlEndpoint(.hostPort(host: .ipv6(IPv6Address("2001:db8::1")!), port: 9774)),
                   "isAllowedAwdlEndpoint must reject non-link-local IPv6")
-            check(isAllowedAwdlEndpoint(.hostPort(host: .ipv6(IPv6Address("fe80::1")!), port: 8774)),
+            check(isAllowedAwdlEndpoint(.hostPort(host: .ipv6(IPv6Address("fe80::1")!), port: 9774)),
                   "isAllowedAwdlEndpoint must accept link-local IPv6")
 
             let unixSockPath = "/tmp/gd_unix_bridge_\(getpid()).sock"
@@ -1030,7 +1250,7 @@ struct GlideDropDaemonTests {
                 check(gotPong, "NWConnection(.unix) must round-trip PING/PONG to 0600 AF_UNIX listener")
             }
 
-            print("[PASS] extractDvzipCpioToDownloads bounds, forcePrompt=true, WARP-locked session wait, & Unix socket bridge")
+            print("[PASS] extractDvzipCpioToDownloads bounds, forcePrompt=true, WARP-locked denial, & Unix socket bridge")
         }
 
         // 12. Cancel-sync & P2P large-file BLE fallback guard tests
@@ -1042,7 +1262,7 @@ struct GlideDropDaemonTests {
                   "Small <=5MB file may fall back to BLE on P2P connect error")
             check(!shouldAllowBleAutoFallback(fileCount: 1, totalRawBytes: BLE_AUTO_FALLBACK_MAX_RAW_BYTES + 1, txExitCode: 1),
                   "Large >5MB file must refuse slow automatic BLE fallback")
-            for blockedCode: Int32 in [43, 44, 45, 46] {
+            for blockedCode: Int32 in [43, 44, 45, 46, 47] {
                 check(!shouldAllowBleAutoFallback(fileCount: 1, totalRawBytes: 1024, txExitCode: blockedCode),
                       "Exit code \(blockedCode) must never fall back to BLE even for small files")
             }
@@ -1069,6 +1289,37 @@ struct GlideDropDaemonTests {
             print("[PASS] Cancel-sync prompt dismissal & large-file BLE fallback policy")
         }
 
+        // Bug condition exploration (Property 1): Mac fails to join Android Wi-Fi Direct group.
+        // These encode EXPECTED behavior and are EXPECTED TO FAIL on unfixed code.
+        do {
+            let before = failures
+            // Redacted SSID (no Location authorization): valid P2P address, real netmask, router == advertised GO.
+            for (ip, mask, gw) in [("192.168.49.123", "255.255.255.0", "192.168.49.1"),
+                                   ("192.168.73.55", "255.255.255.0", "192.168.73.1")] {
+                let m = matchWifiP2pInterfaceAddress(ip: ip, netmask: mask, actualSsid: "",
+                    requestedSsid: "DIRECT-ab-Xyz1", matchingGateway: gw, matchingCidr: nil)
+                check(m?.ip == ip, "[EXPLORE] empty SSID with valid P2P address \(ip)/\(mask) router \(gw) must confirm association")
+            }
+            // Scan strategy: nil-SSID scan results must still yield a join candidate.
+            let src = (try? String(contentsOfFile: #filePath.replacingOccurrences(of: "test_glidedrop_daemon.swift", with: "glidedrop-daemon.swift"), encoding: .utf8)) ?? ""
+            let joinBody = src.components(separatedBy: "func joinWifiDirectNetwork(").dropFirst().first?
+                .components(separatedBy: "func associateWifiDirectWithRetry(").first ?? ""
+            check(!joinBody.isEmpty, "[EXPLORE] could not locate joinWifiDirectNetwork source")
+            check(!joinBody.contains("$0.ssid == ssid") || joinBody.contains("bssid") || joinBody.contains("BSSID") || joinBody.contains("channelHint"),
+                  "[EXPLORE] join strategy filters scan results only by readable ssid; nil-SSID scan results can never be selected (no BSSID/channel fallback)")
+            let cands = [WifiScanCandidate(ssid: nil, bssid: "aa:bb:cc:00:00:01", channel: 36, rssi: -40),
+                         WifiScanCandidate(ssid: nil, bssid: "aa:bb:cc:00:00:02", channel: 149, rssi: -60),
+                         WifiScanCandidate(ssid: nil, bssid: "aa:bb:cc:00:00:03", channel: 149, rssi: -50),
+                         WifiScanCandidate(ssid: "Home", bssid: "aa:bb:cc:00:00:04", channel: 149, rssi: -30)]
+            check(selectWifiJoinCandidate(cands, ssid: "DIRECT-ab-X", hints: WifiJoinHints(bssid: "AA:BB:CC:00:00:02")) == 1, "BSSID hint must select nil-SSID candidate")
+            check(selectWifiJoinCandidate(cands, ssid: "DIRECT-ab-X", hints: WifiJoinHints(channelHint: 149)) == 2, "Channel hint must pick strongest hidden-name candidate, not a named network")
+            check(selectWifiJoinCandidate(cands, ssid: "DIRECT-ab-X", hints: WifiJoinHints()) == nil, "No hints and no readable name must not guess")
+            check(selectWifiJoinCandidate(cands + [WifiScanCandidate(ssid: "DIRECT-ab-X", bssid: nil, channel: 1, rssi: -80)], ssid: "DIRECT-ab-X", hints: WifiJoinHints()) == 4, "Readable name match wins")
+            check(wifiJoinBackoff(attempt: 1) == 1.5 && wifiJoinBackoff(attempt: 20) == 6.0, "Backoff grows and is capped")
+            check(!WifiDirectStage.association.userAction.isEmpty && WifiDirectStage.tlsPin.rawValue == "TLS pin", "Stages carry user actions")
+            check(src.contains("CLLocationManager"), "[EXPLORE] Mac never requests Location authorization (no CLLocationManager)")
+            if failures > before { print("[EXPLORE] Swift bug-condition checks FAILED as expected on unfixed code (\(failures - before))") }
+        }
         if failures > 0 {
             fputs("[SUMMARY] \(failures) Swift regression check(s) FAILED\n", stderr)
             exit(1)
