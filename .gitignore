@@ -91,3 +91,10 @@ env/
 .idea/
 .vscode/
 
+
+# Swift transport scratch builds and stray build artifacts
+.tmp-swift-transport/
+macos/GlideDrop.app/
+/GlideDrop.app/
+macos/glidedrop-daemon
+macos/.build/

@@ -2,6 +2,17 @@
 
 All notable changes to GlideDrop are documented in this file.
 
+## [v3.0.0] - 2026-11-13
+### Changed (Mac -> Android P2P transfer fix; Mac and Android must be updated together)
+- **W2P2 protocol v3**: HKDF-SHA256 derives the AES key, bearer token and a 6-digit verification code, bound to a random session ID and both TLS fingerprints. Older builds are rejected with an update-required reply; there is no downgrade.
+- **Phone consent**: consent dialog shows the verification code; a Mac can be trusted by TLS fingerprint.
+- **Per-session SSID/passphrase and OS-assigned ports**: ports are exchanged in the handshake; compiled-in fixed ports and fixed subnet defaults were removed.
+- **Pre-auth hardening**: 30 s pre-auth timeout, 4 concurrent L2CAP connections, per-peer and global handshake rate limits; non-P2P sources are dropped before TLS (listeners still bind the wildcard address).
+- **Secrets handling**: peer pin and token passed via `0600` files, not env or argv. BLE advertising no longer includes the device name.
+### Documentation
+- Mac needs Location Services permission for Wi-Fi names. The macOS app is unnotarized; replaced the Gatekeeper-bypass suggestion with a verify-first risk statement. Corrected README, SECURITY and ARCHITECTURE to match the code.
+### Repository
+- `.gitignore` now covers `.tmp-swift-transport/`, `__pycache__` and built `GlideDrop.app` artifacts.
 ## [v2.6.0] - 2026-11-11
 
 ### Fixed (Mac -> Android Send & Transfer Stability)

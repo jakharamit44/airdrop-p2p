@@ -647,9 +647,9 @@ class GlideDropSecurityTest {
         assertFalse(GlideDropNode.isReceiverClientAllowed("::1", dynamicSubnets))
         assertTrue(GlideDropNode.isReceiverClientAllowed("127.0.0.1", dynamicSubnets, allowLoopback = true))
 
-        // Token-gated LAN fallback via isReceiverRequestClientAllowed:
+        // A session token must not bypass strict active-P2P-subnet admission.
         assertFalse(GlideDropNode.isReceiverRequestClientAllowed("192.168.1.42", dynamicSubnets, hasActiveSessionToken = false))
-        assertTrue(GlideDropNode.isReceiverRequestClientAllowed("192.168.1.42", dynamicSubnets, hasActiveSessionToken = true))
+        assertFalse(GlideDropNode.isReceiverRequestClientAllowed("192.168.1.42", dynamicSubnets, hasActiveSessionToken = true))
         assertFalse(GlideDropNode.isReceiverRequestClientAllowed("8.8.8.8", dynamicSubnets, hasActiveSessionToken = true))
         assertFalse(GlideDropNode.isReceiverRequestClientAllowed("127.0.0.1", dynamicSubnets, hasActiveSessionToken = true))
     }
@@ -685,10 +685,10 @@ class GlideDropSecurityTest {
         assertEquals(9772, v2.macRxPort)
         assertEquals(9774, v2.udpKeepalivePort)
 
-        val legacy = GlideDropNode.parseJoinReply("OK 192.168.49.5")!!
-        assertEquals("192.168.49.5", legacy.macIp)
-        assertEquals(GlideDropNode.DEFAULT_MAC_RX_PORT, legacy.macRxPort)
-        assertEquals(GlideDropNode.DEFAULT_UDP_KEEPALIVE_PORT, legacy.udpKeepalivePort)
+        // Legacy one-field and partial replies carry no runtime ports: no compiled-in fallback is allowed.
+        assertNull(GlideDropNode.parseJoinReply("OK 192.168.49.5"))
+        assertNull(GlideDropNode.parseJoinReply("OK 192.168.49.5\t9772"))
+        assertNull(GlideDropNode.parseJoinReply("OK 192.168.49.5\t0\t9774"))
 
         val tabDelim = GlideDropNode.parseJoinReply("OK\t192.168.73.11\t9775\t9776")!!
         assertEquals("192.168.73.11", tabDelim.macIp)

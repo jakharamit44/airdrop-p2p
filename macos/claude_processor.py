@@ -103,9 +103,9 @@ SENSITIVE_TEXT_SNIPPETS = [
 
 SENSITIVE_CONTENT_PATTERNS = [
     (re.compile(r"sk-ant-[a-zA-Z0-9_\-]{20,}"), "Anthropic API key"),
-    (re.compile(r"sk-[a-zA-Z0-9]{32,}"), "OpenAI API key"),
+    (re.compile(r"sk-(?:(?:proj|svcacct)-)?[a-zA-Z0-9_\-]{32,}"), "OpenAI API key"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS Access Key ID"),
-    (re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{36}"), "GitHub Personal Access Token"),
+    (re.compile(r"(?:(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{22,})"), "GitHub Personal Access Token"),
     (re.compile(r"xox[baprs]-[0-9a-zA-Z]{10,}"), "Slack Token"),
     (re.compile(r"(?:api[_-]?key|secret[_-]?key|access[_-]?token)[\"']?\s*[:=]\s*[\"'][a-zA-Z0-9_\-]{16,}[\"']", re.IGNORECASE), "Secret API key assignment")
 ]
@@ -527,24 +527,27 @@ def analyze_document_file(doc_path: Path, api_key: Optional[str] = None) -> str:
     return call_claude_api(messages, system_prompt, model=DEFAULT_MODEL, max_tokens=3000, api_key=api_key)
 
 
+def read_text_sample(file_path: Path) -> Tuple[str, bool]:
+    """Bound both reads and memory, keeping the head and tail of large UTF-8 files."""
+    with file_path.open("rb") as source:
+        head = source.read(MAX_TEXT_CHARS + 1)
+        if len(head) <= MAX_TEXT_CHARS:
+            return head.decode("utf-8", errors="replace"), False
+        head_len = int(MAX_TEXT_CHARS * 0.7)
+        tail_len = MAX_TEXT_CHARS - head_len
+        source.seek(-tail_len, os.SEEK_END)
+        tail = source.read(tail_len)
+    return (head[:head_len].decode("utf-8", errors="replace")
+            + "\n\n[... Truncated intermediate content for token safety ...]\n\n"
+            + tail.decode("utf-8", errors="replace")), True
+
+
 def analyze_text_file(file_path: Path, api_key: Optional[str] = None) -> str:
     """Summarize and extract action items from text/document/code files."""
     try:
-        content = file_path.read_text(encoding="utf-8", errors="replace")
+        sample, _ = read_text_sample(file_path)
     except Exception as e:
         raise RuntimeError(f"Could not read text file: {e}")
-
-    # Retain both head and tail of large files to preserve context and conclusion
-    if len(content) > MAX_TEXT_CHARS:
-        head_len = int(MAX_TEXT_CHARS * 0.7)
-        tail_len = int(MAX_TEXT_CHARS * 0.3)
-        sample = (
-            content[:head_len]
-            + f"\n\n[... Truncated {len(content) - (head_len + tail_len):,} intermediate characters for token safety ...]\n\n"
-            + content[-tail_len:]
-        )
-    else:
-        sample = content
 
     system_prompt = (
         "You are an intelligent file intake assistant running on macOS. "
@@ -619,28 +622,31 @@ def extract_local_apple_vision_ocr(image_path: Path) -> str:
     Extract text from image using Apple Vision framework via swift script.
     Uses CommandLine.arguments to securely pass image path without string interpolation.
     """
-    swift_script = """
+    swift_script = r"""
     import AppKit
     import Vision
 
-    guard CommandLine.arguments.count > 1 else { exit(0) }
+    guard CommandLine.arguments.count > 1 else { exit(1) }
     let path = CommandLine.arguments[1]
 
     guard let img = NSImage(contentsOfFile: path),
           let tiff = img.tiffRepresentation,
           let rep = NSBitmapImageRep(data: tiff),
           let cg = rep.cgImage else {
-        exit(0)
+        exit(1)
     }
 
-    let request = VNRecognizeTextRequest { req, _ in
-        guard let observations = req.results as? [VNRecognizedTextObservation] else { return }
-        let recognized = observations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
-        print(recognized)
-    }
+    let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
     let handler = VNImageRequestHandler(cgImage: cg, options: [:])
-    try? handler.perform([request])
+    do {
+        try handler.perform([request])
+        guard let observations = request.results else { exit(1) }
+        let recognized = observations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+        print(recognized)
+    } catch {
+        exit(1)
+    }
     """
     try:
         res = subprocess.run(
@@ -650,9 +656,10 @@ def extract_local_apple_vision_ocr(image_path: Path) -> str:
             capture_output=True,
             timeout=15.0
         )
+        res.check_returncode()
         return res.stdout.strip()
-    except Exception:
-        return ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PrivacyGuardBlockedError("Vision OCR failed; image cannot be screened for cloud upload") from exc
 
 
 def run_local_offline_analysis(file_path: Path) -> str:
@@ -673,7 +680,11 @@ def run_local_offline_analysis(file_path: Path) -> str:
     # Image OCR via macOS native Vision CLI helper
     if ext in image_exts:
         lines.append("## Optical Character Recognition (Apple Vision Engine)")
-        ocr_text = extract_local_apple_vision_ocr(file_path)
+        try:
+            ocr_text = extract_local_apple_vision_ocr(file_path)
+        except PrivacyGuardBlockedError:
+            lines.append("*(OCR unavailable; image was not sent to cloud analysis)*")
+            ocr_text = ""
         if ocr_text:
             lines.append("```text")
             lines.append(ocr_text)
@@ -692,11 +703,12 @@ def run_local_offline_analysis(file_path: Path) -> str:
     elif ext in text_exts:
         lines.append("## Text Overview")
         try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            content, truncated = read_text_sample(file_path)
             content_lines = content.splitlines()
             words = content.split()
-            lines.append(f"- **Line Count:** {len(content_lines):,}")
-            lines.append(f"- **Word Count:** {len(words):,}")
+            qualifier = " (bounded sample)" if truncated else ""
+            lines.append(f"- **Line Count{qualifier}:** {len(content_lines):,}")
+            lines.append(f"- **Word Count{qualifier}:** {len(words):,}")
 
             # Extract headings / function signatures
             headings = [l.strip() for l in content_lines if l.startswith("#") or l.startswith("func ") or l.startswith("def ") or l.startswith("class ")][:10]
@@ -718,6 +730,27 @@ def run_local_offline_analysis(file_path: Path) -> str:
             lines.append(f"*(Read error: {e})*")
 
     return "\n".join(lines) + "\n"
+
+
+def write_sidecar(sidecar_path: Path, content: str) -> Optional[Path]:
+    """Replace the directory entry atomically, never writing through a sidecar link."""
+    temporary_path = None
+    try:
+        if sidecar_path.is_symlink():
+            raise OSError("Refusing a symlink sidecar")
+        fd, temporary_name = tempfile.mkstemp(prefix=".glidedrop-sidecar-", dir=sidecar_path.parent)
+        temporary_path = Path(temporary_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(content)
+        # Replacement does not follow symlinks, including any planted after the check.
+        os.replace(temporary_path, sidecar_path)
+        return sidecar_path
+    except OSError as exc:
+        print(f"[Claude-AI] Could not safely save sidecar: {exc}")
+        return None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def process_dropped_file(file_path: Path, output_dir: Optional[Path] = None) -> Optional[Path]:
@@ -745,8 +778,7 @@ def process_dropped_file(file_path: Path, output_dir: Optional[Path] = None) -> 
             f"- **Reason:** {reason}\n"
             f"- **Status:** File preserved safely in local directory without external transmission.\n"
         )
-        sidecar_path.write_text(notice, encoding="utf-8")
-        return sidecar_path
+        return write_sidecar(sidecar_path, notice)
 
     # 2. Check API Key
     api_key = get_api_key()
@@ -763,9 +795,10 @@ def process_dropped_file(file_path: Path, output_dir: Optional[Path] = None) -> 
         print(f"[Claude-AI] No Anthropic API key found. Running local on-device engine for {file_path.name}...")
         try:
             local_summary = run_local_offline_analysis(file_path)
-            sidecar_path.write_text(local_summary, encoding="utf-8")
-            print(f"[Claude-AI] Local analysis saved to {sidecar_path}")
-            return sidecar_path
+            saved = write_sidecar(sidecar_path, local_summary)
+            if saved:
+                print(f"[Claude-AI] Local analysis saved to {saved}")
+            return saved
         except Exception as e:
             print(f"[Claude-AI] Local analysis failed: {e}")
             return None
@@ -775,7 +808,7 @@ def process_dropped_file(file_path: Path, output_dir: Optional[Path] = None) -> 
         if ext in image_exts:
             result = analyze_image_file(file_path, api_key=api_key)
         elif ext in pdf_exts:
-            result = analyze_document_file(file_path, api_key=api_key)
+            raise PrivacyGuardBlockedError("Automatic PDF cloud analysis is disabled until PDF secret screening is available")
         elif ext in text_exts:
             result = analyze_text_file(file_path, api_key=api_key)
         else:
@@ -786,26 +819,25 @@ def process_dropped_file(file_path: Path, output_dir: Optional[Path] = None) -> 
             f"*Generated by GlideDrop Intelligent Ingestion Engine*\n\n"
             f"---\n\n"
         )
-        sidecar_path.write_text(header + result + "\n", encoding="utf-8")
-        print(f"[Claude-AI] Analysis saved to {sidecar_path}")
-        return sidecar_path
+        saved = write_sidecar(sidecar_path, header + result + "\n")
+        if saved:
+            print(f"[Claude-AI] Analysis saved to {saved}")
+        return saved
 
     except PrivacyGuardBlockedError as pge:
-        print(f"[Claude-AI] Privacy Guard: Skipped cloud AI processing for sensitive image '{file_path.name}' ({pge}).")
+        print(f"[Claude-AI] Privacy Guard: Skipped cloud AI processing for '{file_path.name}' ({pge}).")
         notice = (
             f"# Privacy Safeguard Notice: {file_path.name}\n"
             f"*Automatic cloud AI transmission was blocked to protect confidential credentials.*\n\n"
             f"- **Reason:** {pge}\n"
             f"- **Status:** File preserved safely in local directory without external transmission.\n"
         )
-        sidecar_path.write_text(notice, encoding="utf-8")
-        return sidecar_path
+        return write_sidecar(sidecar_path, notice)
     except Exception as e:
         print(f"[Claude-AI] Cloud analysis failed for {file_path.name}: {e}. Falling back to on-device engine...")
         try:
             fallback_res = run_local_offline_analysis(file_path)
-            sidecar_path.write_text(fallback_res, encoding="utf-8")
-            return sidecar_path
+            return write_sidecar(sidecar_path, fallback_res)
         except Exception:
             return None
 
@@ -873,8 +905,12 @@ def run_subsystem_audit() -> bool:
         # 7. Safe Argument Handling in OCR
         test_quote_file = audit_dir / "test\"quote'file.txt"
         test_quote_file.write_text("hello", encoding="utf-8")
-        ocr_result = extract_local_apple_vision_ocr(test_quote_file)
-        check("Secure OCR Execution: Escapes filenames without code injection", isinstance(ocr_result, str))
+        try:
+            extract_local_apple_vision_ocr(test_quote_file)
+            rejected_invalid_image = False
+        except PrivacyGuardBlockedError:
+            rejected_invalid_image = True
+        check("Privacy Guard: Rejects invalid OCR input with quoted filename", rejected_invalid_image)
 
     print("-------------------------------------------------------")
     print(f"Audit Summary: {passed}/{total} tests passed ({'HEALTHY' if passed == total else 'NEEDS ATTENTION'})")

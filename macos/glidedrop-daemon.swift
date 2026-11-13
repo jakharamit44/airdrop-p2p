@@ -6,6 +6,7 @@ import Network
 import UniformTypeIdentifiers
 import CryptoKit
 import CoreWLAN
+import CoreLocation
 import Darwin
 import SystemConfiguration
 
@@ -109,10 +110,8 @@ func revokeP2pSessionToken(_ token: String, stateDir: URL = STATE_DIR) {
     }
 }
 
-let DEFAULT_MAC_RX_PORT = 8772
-let DEFAULT_PROXY_PORT = 1080
-let DEFAULT_AWDL_BRIDGE_PORT: UInt16 = 8774
-let DEFAULT_FINDER_PROXY_PORT: UInt16 = 8773
+// No compiled-in ports: every listener binds to port 0 and the OS-assigned value is
+// published via port files in STATE_DIR or exchanged inside the encrypted handshake.
 
 func parseIpv4Address(_ ip: String) -> UInt32? {
     let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -222,6 +221,8 @@ func isNormalWifiIpv4(_ ip: String, activeP2pCidr: String? = nil, rawWifiSsid: S
 }
 
 struct ActiveP2pSession: Codable, Equatable {
+    let ssid: String
+    let interfaceName: String
     let gatewayIp: String
     let cidr: String
     let httpsPort: Int
@@ -231,18 +232,22 @@ struct ActiveP2pSession: Codable, Equatable {
     let updatedAt: Double
 
     enum CodingKeys: String, CodingKey {
-        case gatewayIp, cidr, httpsPort, proxyPort, macRxPort, udpKeepalivePort, updatedAt
+        case ssid, interfaceName, gatewayIp, cidr, httpsPort, proxyPort, macRxPort, udpKeepalivePort, updatedAt
     }
 
     init(
+        ssid: String,
+        interfaceName: String,
         gatewayIp: String,
         cidr: String,
         httpsPort: Int,
         proxyPort: Int,
-        macRxPort: Int = DEFAULT_MAC_RX_PORT,
-        udpKeepalivePort: Int = Int(DEFAULT_AWDL_BRIDGE_PORT),
+        macRxPort: Int,
+        udpKeepalivePort: Int,
         updatedAt: Double
     ) {
+        self.ssid = ssid
+        self.interfaceName = interfaceName
         self.gatewayIp = gatewayIp
         self.cidr = cidr
         self.httpsPort = httpsPort
@@ -254,50 +259,65 @@ struct ActiveP2pSession: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.ssid = try c.decode(String.self, forKey: .ssid)
+        self.interfaceName = try c.decode(String.self, forKey: .interfaceName)
         self.gatewayIp = try c.decode(String.self, forKey: .gatewayIp)
         self.cidr = try c.decode(String.self, forKey: .cidr)
         self.httpsPort = try c.decode(Int.self, forKey: .httpsPort)
         self.proxyPort = try c.decode(Int.self, forKey: .proxyPort)
-        self.macRxPort = try c.decodeIfPresent(Int.self, forKey: .macRxPort) ?? DEFAULT_MAC_RX_PORT
-        self.udpKeepalivePort = try c.decodeIfPresent(Int.self, forKey: .udpKeepalivePort) ?? Int(DEFAULT_AWDL_BRIDGE_PORT)
+        self.macRxPort = try c.decodeIfPresent(Int.self, forKey: .macRxPort) ?? 0
+        self.udpKeepalivePort = try c.decodeIfPresent(Int.self, forKey: .udpKeepalivePort) ?? 0
         self.updatedAt = try c.decode(Double.self, forKey: .updatedAt)
     }
 }
 
-func writeAtomicPrivateFile(data: Data, to target: URL) {
+@discardableResult
+func writeAtomicPrivateFile(data: Data, to target: URL) -> Bool {
     let tmp = target.deletingLastPathComponent().appendingPathComponent("\(target.lastPathComponent).tmp.\(UUID().uuidString)")
     if FileManager.default.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: 0o600]) {
         _ = chmod(tmp.path, 0o600)
-        if Darwin.rename(tmp.path, target.path) != 0 {
-            try? FileManager.default.removeItem(at: tmp)
-        }
+        if Darwin.rename(tmp.path, target.path) == 0 { return true }
+        try? FileManager.default.removeItem(at: tmp)
     }
+    return false
 }
 
+func hasValidP2pProvenance(ssid: String, interfaceName: String, gatewayIp: String, cidr: String, httpsPort: Int) -> Bool {
+    return ssid.hasPrefix("DIRECT-") && ssid.utf8.count <= 32 &&
+        interfaceName.range(of: "^[A-Za-z][A-Za-z0-9]{0,31}$", options: .regularExpression) != nil &&
+        isRfc1918Ipv4(gatewayIp) && cidrContains(cidr: cidr, ip: gatewayIp) &&
+        (1...65535).contains(httpsPort)
+}
+
+@discardableResult
 func writeActiveP2pSession(
+    ssid: String,
+    interfaceName: String,
     gatewayIp: String,
     cidr: String,
     httpsPort: Int,
     proxyPort: Int,
-    macRxPort: Int = readPortFile("mac_rx_port", defaultPort: DEFAULT_MAC_RX_PORT),
-    udpKeepalivePort: Int = readPortFile("awdl_bridge_port", defaultPort: Int(DEFAULT_AWDL_BRIDGE_PORT)),
+    macRxPort: Int = readPortFile("mac_rx_port") ?? 0,
+    udpKeepalivePort: Int = readPortFile("awdl_bridge_port") ?? 0,
     stateDir: URL = STATE_DIR,
     now: Double = Date().timeIntervalSince1970
-) {
-    guard isValidP2pGatewayIp(gatewayIp) else { return }
+) -> Bool {
+    guard now.isFinite,
+          hasValidP2pProvenance(ssid: ssid, interfaceName: interfaceName, gatewayIp: gatewayIp, cidr: cidr, httpsPort: httpsPort) else { return false }
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-    let normalizedCidr = !cidr.isEmpty ? cidr : (deriveIpv4Cidr(ip: gatewayIp) ?? "")
     let session = ActiveP2pSession(
+        ssid: ssid,
+        interfaceName: interfaceName,
         gatewayIp: gatewayIp,
-        cidr: normalizedCidr,
-        httpsPort: (1...65535).contains(httpsPort) ? httpsPort : 8771,
+        cidr: cidr,
+        httpsPort: httpsPort,
         proxyPort: (1...65535).contains(proxyPort) ? proxyPort : 0,
-        macRxPort: (1...65535).contains(macRxPort) ? macRxPort : DEFAULT_MAC_RX_PORT,
-        udpKeepalivePort: (1...65535).contains(udpKeepalivePort) ? udpKeepalivePort : Int(DEFAULT_AWDL_BRIDGE_PORT),
+        macRxPort: (1...65535).contains(macRxPort) ? macRxPort : 0,
+        udpKeepalivePort: (1...65535).contains(udpKeepalivePort) ? udpKeepalivePort : 0,
         updatedAt: now
     )
-    guard let data = try? JSONEncoder().encode(session) else { return }
-    writeAtomicPrivateFile(data: data, to: stateDir.appendingPathComponent("active_p2p_session.json"))
+    guard let data = try? JSONEncoder().encode(session) else { return false }
+    return writeAtomicPrivateFile(data: data, to: stateDir.appendingPathComponent("active_p2p_session.json"))
 }
 
 func loadActiveP2pSession(
@@ -308,10 +328,29 @@ func loadActiveP2pSession(
     let file = stateDir.appendingPathComponent("active_p2p_session.json")
     guard let data = try? Data(contentsOf: file),
           let session = try? JSONDecoder().decode(ActiveP2pSession.self, from: data),
-          (now - session.updatedAt) <= maxAge else {
+          now.isFinite, session.updatedAt.isFinite,
+          (0...max(0, maxAge)).contains(now - session.updatedAt),
+          hasValidP2pProvenance(ssid: session.ssid, interfaceName: session.interfaceName,
+                                gatewayIp: session.gatewayIp, cidr: session.cidr, httpsPort: session.httpsPort) else {
         return nil
     }
     return session
+}
+
+@discardableResult
+func writeWp2pAuthorization(
+    senderName: String, ssid: String, token: String, peerIp: String,
+    stateDir: URL = STATE_DIR, now: Double = Date().timeIntervalSince1970
+) -> Bool {
+    guard token.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+          let session = loadActiveP2pSession(stateDir: stateDir, now: now),
+          session.ssid == ssid, session.gatewayIp == peerIp else { return false }
+    let payload: [String: Any] = [
+        "senderName": senderName, "ssid": ssid, "token": token,
+        "peerIp": peerIp, "authorizedAt": now
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return false }
+    return writeAtomicPrivateFile(data: data, to: stateDir.appendingPathComponent("wp2p_authorized_session.json"))
 }
 
 func clearActiveP2pSession(stateDir: URL = STATE_DIR) {
@@ -347,11 +386,12 @@ func clearOutgoingP2pToken(stateDir: URL = STATE_DIR) {
     try? FileManager.default.removeItem(at: stateDir.appendingPathComponent("p2p_outgoing_token.json"))
 }
 
-func readPortFile(_ name: String, defaultPort: Int, stateDir: URL = STATE_DIR) -> Int {
+/// Reads an OS-assigned port published by a listener. Returns nil when it is missing or invalid; there is no fallback value.
+func readPortFile(_ name: String, stateDir: URL = STATE_DIR) -> Int? {
     let file = stateDir.appendingPathComponent(name)
     guard let raw = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
           let val = Int(raw), val >= 1 && val <= 65535 else {
-        return defaultPort
+        return nil
     }
     return val
 }
@@ -516,6 +556,127 @@ func deriveSessionKey(sharedSecret: SharedSecret) -> SymmetricKey {
     hasher.update(data: Data("GlideDrop-v2-SessionKey".utf8))
     let keyBytes = hasher.finalize()
     return SymmetricKey(data: keyBytes)
+}
+
+// MARK: - W2P2 protocol v3 (HKDF-SHA256, key/fingerprint/session-bound)
+
+/// W2P2 wire version. v3 requests are `W2P2\t3\t<initiatorPub>\t<initiatorTlsFp>\t<sessionIdHex>`;
+/// v3 replies are `OK\t<responderPub>\t<responderTlsFp>[\t<encryptedCreds>]`.
+/// Older peers (no version field, or 1/2) are refused with `UPDATE` so the security
+/// properties are never silently downgraded.
+let W2P2_PROTOCOL_VERSION = 3
+let W2P2_SESSION_ID_BYTES = 16
+
+struct W2p2Request {
+    let version: Int
+    let pubB64: String
+    let tlsFingerprint: String
+    let sessionId: Data?
+}
+
+/// Parses the tab-separated body of a W2P2 request (everything after the magic).
+func parseW2p2Request(_ body: String) -> W2p2Request {
+    let parts = body.split(separator: "\t").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    if parts.count >= 4, let v = Int(parts[0]), v >= 3 {
+        return W2p2Request(version: v, pubB64: parts[1], tlsFingerprint: parts[2], sessionId: dataFromHex(parts[3]))
+    }
+    if parts.count >= 3, parts[0] == "2" || parts[0] == "1" {
+        return W2p2Request(version: Int(parts[0]) ?? 1, pubB64: parts[1], tlsFingerprint: parts[2], sessionId: nil)
+    }
+    if parts.count >= 2 {
+        return W2p2Request(version: 1, pubB64: parts[0], tlsFingerprint: parts[1], sessionId: nil)
+    }
+    return W2p2Request(version: 1, pubB64: parts.first ?? "", tlsFingerprint: "", sessionId: nil)
+}
+
+func dataFromHex(_ hex: String) -> Data? {
+    let chars = Array(hex.lowercased())
+    guard !chars.isEmpty, chars.count % 2 == 0 else { return nil }
+    var out = Data(capacity: chars.count / 2)
+    var i = 0
+    while i < chars.count {
+        guard let hi = chars[i].hexDigitValue, let lo = chars[i + 1].hexDigitValue else { return nil }
+        out.append(UInt8(hi << 4 | lo))
+        i += 2
+    }
+    return out
+}
+
+func randomW2p2SessionId() -> Data {
+    var bytes = [UInt8](repeating: 0, count: W2P2_SESSION_ID_BYTES)
+    for i in 0..<bytes.count { bytes[i] = UInt8.random(in: 0...255) }
+    return Data(bytes)
+}
+
+func w2p2HexString(_ data: Data) -> String {
+    data.map { String(format: "%02x", $0) }.joined()
+}
+
+private func w2p2LengthPrefixed(_ data: Data) -> Data {
+    var out = Data()
+    var n = UInt32(data.count).bigEndian
+    withUnsafeBytes(of: &n) { out.append(contentsOf: $0) }
+    out.append(data)
+    return out
+}
+
+/// HKDF `info` = "GlideDrop-v3/<label>" 0x00 || lp(initiatorPub) || lp(responderPub) || lp(initiatorFp) || lp(responderFp)
+func w2p2HkdfInfo(label: String, initiatorPubDer: Data, responderPubDer: Data, initiatorFp: Data, responderFp: Data) -> Data {
+    var info = Data("GlideDrop-v3/\(label)".utf8)
+    info.append(0)
+    info.append(w2p2LengthPrefixed(initiatorPubDer))
+    info.append(w2p2LengthPrefixed(responderPubDer))
+    info.append(w2p2LengthPrefixed(initiatorFp))
+    info.append(w2p2LengthPrefixed(responderFp))
+    return info
+}
+
+struct W2p2SessionMaterial {
+    let sessionKey: SymmetricKey
+    let token: String
+    /// Six decimal digits, formatted "123 456".
+    let verificationCode: String
+}
+
+/// Formats a 32-bit value as a six digit code split in two groups of three.
+func formatW2p2VerificationCode(_ value: UInt32) -> String {
+    let six = String(format: "%06u", value % 1_000_000)
+    return "\(six.prefix(3)) \(six.suffix(3))"
+}
+
+/// Derives AES key, bearer token and verification code with distinct HKDF labels.
+/// Returns nil when a fingerprint is malformed.
+func deriveW2p2SessionMaterial(
+    sharedSecret: SharedSecret,
+    sessionId: Data,
+    initiatorPubDer: Data,
+    responderPubDer: Data,
+    initiatorFingerprint: String,
+    responderFingerprint: String
+) -> W2p2SessionMaterial? {
+    guard let iFp = dataFromHex(normalizeSha256Fingerprint(initiatorFingerprint)), iFp.count == 32,
+          let rFp = dataFromHex(normalizeSha256Fingerprint(responderFingerprint)), rFp.count == 32,
+          !sessionId.isEmpty else { return nil }
+    func derive(_ label: String, _ count: Int) -> Data {
+        let info = w2p2HkdfInfo(label: label, initiatorPubDer: initiatorPubDer, responderPubDer: responderPubDer, initiatorFp: iFp, responderFp: rFp)
+        let key = sharedSecret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: sessionId, sharedInfo: info, outputByteCount: count)
+        return key.withUnsafeBytes { Data($0) }
+    }
+    let aes = derive("aes-key", 32)
+    let tok = derive("bearer-token", 32)
+    let code = derive("verify-code", 4)
+    let codeValue = code.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    return W2p2SessionMaterial(
+        sessionKey: SymmetricKey(data: aes),
+        token: w2p2HexString(tok),
+        verificationCode: formatW2p2VerificationCode(codeValue)
+    )
+}
+
+/// True when a peer reply asks for a newer protocol (`NO\tUPDATE\t3` / `ERR\tUPDATE\t3`).
+func isW2p2UpdateRequiredReply(_ line: String) -> Bool {
+    let parts = line.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "\t").map(String.init)
+    return parts.count >= 2 && (parts[0] == "NO" || parts[0] == "ERR") && parts[1] == "UPDATE"
 }
 
 func deriveBleFrameKey(sharedSecret: SharedSecret) -> SymmetricKey {
@@ -1016,13 +1177,46 @@ let BLE_AUTO_FALLBACK_MAX_RAW_BYTES: Int64 = 5_000_000
 let MAX_BLE_META_BYTES = 1_048_576
 
 func shouldAllowBleAutoFallback(fileCount: Int, totalRawBytes: Int64, txExitCode: Int32? = nil) -> Bool {
-    if let code = txExitCode, code == 43 || code == 44 || code == 45 || code == 46 {
+    if let code = txExitCode, (43...47).contains(code) {
         return false
     }
     if fileCount > 0 && totalRawBytes > BLE_AUTO_FALLBACK_MAX_RAW_BYTES {
         return false
     }
     return true
+}
+
+func shouldRetryP2pTx(fileCount: Int, totalRawBytes: Int64, txExitCode: Int32, elapsed: TimeInterval, cancelled: Bool) -> Bool {
+    return txExitCode != 0 && !(43...47).contains(txExitCode) && !cancelled && elapsed < 15.0 &&
+        !shouldAllowBleAutoFallback(fileCount: fileCount, totalRawBytes: totalRawBytes, txExitCode: txExitCode)
+}
+
+struct BleSenderActivityDeadline {
+    let startedAt: TimeInterval
+    private var lastActivityAt: TimeInterval?
+
+    init(startedAt: TimeInterval = Date().timeIntervalSince1970) {
+        self.startedAt = startedAt
+    }
+
+    mutating func hasTimedOut(transferStarted: Bool, progressUpdatedAt: TimeInterval?, now: TimeInterval) -> Bool {
+        guard transferStarted else { return now - startedAt >= 300.0 }
+        // Opening L2CAP ends the startup deadline; only inactivity can expire a live send.
+        let previousActivity = lastActivityAt ?? now
+        if let updatedAt = progressUpdatedAt, updatedAt.isFinite, updatedAt >= startedAt, updatedAt <= now {
+            lastActivityAt = max(previousActivity, updatedAt)
+        } else {
+            lastActivityAt = previousActivity
+        }
+        return now - (lastActivityAt ?? now) >= 300.0
+    }
+}
+
+func senderProgressUpdatedAt(stateDir: URL = STATE_DIR) -> TimeInterval? {
+    guard let data = try? Data(contentsOf: stateDir.appendingPathComponent("transfer_progress.json")),
+          let progress = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          progress["active"] as? Bool == true, progress["direction"] as? String == "Sending" else { return nil }
+    return progress["updatedAt"] as? Double
 }
 
 func writeTxInProgressLock(timestamp: TimeInterval = Date().timeIntervalSince1970) {
@@ -1184,8 +1378,10 @@ func parseAirportNetworkSsid(_ output: String) -> String {
     return name
 }
 
-func currentRawWifiSsid() -> String {
-    let iface = getWifiInterfaceName()
+func currentRawWifiSsid(on iface: String = getWifiInterfaceName()) -> String {
+    if let ssid = CWWiFiClient.shared().interface(withName: iface)?.ssid(), !ssid.isEmpty {
+        return ssid
+    }
     let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-getairportnetwork", iface])
     return parseAirportNetworkSsid(out)
 }
@@ -1243,12 +1439,55 @@ func currentWifiSsid() -> String {
     return name
 }
 
-func saveCurrentWifiSsid() {
-    var ssid = currentWifiSsid()
-    if ssid.isEmpty {
-        ssid = topPreferredWifiNetwork()
+/// True when the interface still reports the expected SSID, or when macOS redacts the SSID
+/// (no Location authorization) so the name cannot contradict the interface-state association.
+func wifiSsidConsistent(on iface: String, expected: String) -> Bool {
+    let current = currentRawWifiSsid(on: iface)
+    return current.isEmpty || current == expected
+}
+
+private var locationAuthManager: CLLocationManager?
+
+func isLocationAuthorizedForWifiNames() -> Bool {
+    let status = CLLocationManager().authorizationStatus
+    return status == .authorizedAlways || status == .authorized
+}
+
+/// Requests Location authorization (required for macOS to reveal SSID/BSSID) before the first join.
+/// Returns true when authorized. If denied or undetermined after the wait, logs where to enable it;
+/// the join still proceeds because association is confirmed from interface state.
+@discardableResult
+func requestLocationAuthorizationForWifi(timeout: TimeInterval = 8.0) -> Bool {
+    if isLocationAuthorizedForWifiNames() { return true }
+    DispatchQueue.main.async {
+        if locationAuthManager == nil { locationAuthManager = CLLocationManager() }
+        locationAuthManager?.requestWhenInUseAuthorization()
+        locationAuthManager?.startUpdatingLocation()
     }
-    if !ssid.isEmpty {
+    if !Thread.isMainThread {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if isLocationAuthorizedForWifiNames() { return true }
+            if CLLocationManager().authorizationStatus != .notDetermined { break }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+    }
+    if isLocationAuthorizedForWifiNames() { return true }
+    print("[BLE-Daemon] Location access is not granted, so macOS hides Wi-Fi names. Enable it in System Settings > Privacy & Security > Location Services > GlideDrop. Continuing with interface-state association.")
+    fflush(stdout)
+    return false
+}
+
+func saveCurrentWifiSsid() {
+    requestLocationAuthorizationForWifi()
+    // Record only from reliable data (a readable, non-P2P current association). Never guess from the
+    // preferred list; if the name is hidden, restore falls back to re-enabling auto-join.
+    let ssid = currentWifiSsid()
+    if ssid.isEmpty {
+        if !currentRawWifiSsid().hasPrefix("DIRECT-") { try? FileManager.default.removeItem(at: PREV_WIFI_FILE) }
+        print("[BLE-Daemon] Home Wi-Fi name unavailable; will restore by re-enabling auto-join.")
+        fflush(stdout)
+    } else {
         try? ssid.write(to: PREV_WIFI_FILE, atomically: true, encoding: .utf8)
         print("[BLE-Daemon] Preserved home Wi-Fi network: '\(ssid)'")
         fflush(stdout)
@@ -1446,15 +1685,15 @@ func shouldClearFallbackP2pProxy(
         }
     }
     if cfg.enabled && (cfg.server == "127.0.0.1" || cfg.server == "::1") {
-        let trackedPort = (session?.proxyPort ?? 0) > 0 ? session!.proxyPort : DEFAULT_PROXY_PORT
-        if cfg.port == DEFAULT_PROXY_PORT || cfg.port == trackedPort {
+        let trackedPort = session?.proxyPort ?? 0
+        if trackedPort > 0 && cfg.port == trackedPort {
             return true
         }
     }
     return false
 }
 
-func enableMacInternetProxy(host: String, port: Int = DEFAULT_PROXY_PORT, cidr: String? = nil) {
+func enableMacInternetProxy(host: String, port: Int, cidr: String? = nil) {
     let cleanHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !cleanHost.isEmpty, port >= 1 && port <= 65535 else {
         print("[BLE-Daemon] Cellular internet sharing disabled or invalid endpoint (\(cleanHost):\(port)) — skipping macOS system proxy")
@@ -1643,6 +1882,7 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
             _ = runProcessCapture("/usr/sbin/networksetup", ["-removepreferredwirelessnetwork", iface, trimmed])
         }
     }
+    if ssid.hasPrefix("DIRECT-") { forgetWifiDirectProfile(iface: iface, ssid: ssid) }
 
     func wifiHasNormalIpv4() -> Bool {
         let rawSsid = currentRawWifiSsid()
@@ -1698,7 +1938,8 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
     fflush(stdout)
 
     // 3. Resolve target home network to restore
-    let targetSsid = (!savedSsid.isEmpty && !savedSsid.hasPrefix("DIRECT-")) ? savedSsid : topPreferredWifiNetwork()
+    // Only a network recorded from reliable data is restored by name; never guess from the preferred list.
+    let targetSsid = (!savedSsid.isEmpty && !savedSsid.hasPrefix("DIRECT-")) ? savedSsid : ""
 
     // 4. Disassociate iface using CoreWLAN to cleanly detach from P2P when still on P2P
     if onP2p {
@@ -1710,10 +1951,19 @@ func restoreMacInternetWifi(ssid: String = "DIRECT-") {
 
     // 5. If target network is known and not yet reconnected, reassociate
     let activeNow = currentWifiSsid()
-    if activeNow.isEmpty && !targetSsid.isEmpty {
-        print("[BLE-Daemon] Fast-reassociating \(iface) to home Wi-Fi '\(targetSsid)'...")
-        fflush(stdout)
-        _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", iface, targetSsid])
+    if activeNow.isEmpty && !wifiHasNormalIpv4() {
+        if !targetSsid.isEmpty {
+            print("[BLE-Daemon] Fast-reassociating \(iface) to home Wi-Fi '\(targetSsid)'...")
+            fflush(stdout)
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportnetwork", iface, targetSsid])
+        } else {
+            // Home network unknown: let macOS auto-join its own preferred network by cycling Wi-Fi power.
+            print("[BLE-Daemon] Home Wi-Fi unknown; re-enabling auto-join on \(iface).")
+            fflush(stdout)
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportpower", iface, "off"])
+            Thread.sleep(forTimeInterval: 0.5)
+            _ = runProcessCapture("/usr/sbin/networksetup", ["-setairportpower", iface, "on"])
+        }
     }
 
     // 6. Wait synchronously up to 3.0s for iface to obtain normal Wi-Fi IPv4 before resuming WARP
@@ -1972,11 +2222,26 @@ func writeAll(
 private let wp2pJoinLock = NSLock()
 private var wp2pJoinActive = false
 
+func beginWp2pJoin() -> Bool {
+    wp2pJoinLock.lock()
+    defer { wp2pJoinLock.unlock() }
+    guard !wp2pJoinActive else { return false }
+    wp2pJoinActive = true
+    return true
+}
+
+func finishWp2pJoin() {
+    wp2pJoinLock.lock()
+    defer { wp2pJoinLock.unlock() }
+    wp2pJoinActive = false
+}
+
 struct ParsedWp2pJoinPayload: Equatable {
     let ssid: String
     let pass: String
     let goIp: String
     let proxyPort: Int
+    let httpsPort: Int
     let isV2: Bool
 }
 
@@ -1991,7 +2256,10 @@ func parseWp2pJoinCredentials(_ decStr: String) -> ParsedWp2pJoinPayload? {
     let goIp = isValidP2pGatewayIp(rawGo) ? rawGo : ""
     let rawProxy = parts.count >= 4 ? (Int(parts[3].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0
     let proxyPort = (1...65535).contains(rawProxy) ? rawProxy : 0
-    return ParsedWp2pJoinPayload(ssid: ssid, pass: pass, goIp: goIp, proxyPort: proxyPort, isV2: isV2)
+    // Peer's runtime-assigned HTTPS port (5th field). Older peers omit it; 0 means "not supplied".
+    let rawHttps = parts.count >= 5 ? (Int(parts[4].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0
+    let httpsPort = (1...65535).contains(rawHttps) ? rawHttps : 0
+    return ParsedWp2pJoinPayload(ssid: ssid, pass: pass, goIp: goIp, proxyPort: proxyPort, httpsPort: httpsPort, isV2: isV2)
 }
 
 func formatWp2pJoinReply(macIp: String, isV2: Bool, macRxPort: Int, udpKeepalivePort: Int) -> String {
@@ -2004,66 +2272,58 @@ func formatWp2pJoinReply(macIp: String, isV2: Bool, macRxPort: Int, udpKeepalive
 func matchWifiP2pInterfaceAddress(
     ip: String,
     netmask: String?,
-    rawSsidIsDirect: Bool,
+    actualSsid: String,
+    requestedSsid: String? = nil,
     matchingGateway: String? = nil,
     matchingCidr: String? = nil,
     activeSession: ActiveP2pSession? = nil
 ) -> (ip: String, cidr: String)? {
-    let targetGateway = matchingGateway?.trimmingCharacters(in: .whitespacesAndNewlines)
-    let cleanMatchingCidr = matchingCidr?.trimmingCharacters(in: .whitespacesAndNewlines)
-    let fallbackGateway = (targetGateway?.isEmpty == false ? targetGateway : activeSession?.gatewayIp)
-    let explicitTarget = (cleanMatchingCidr?.isEmpty == false) || (targetGateway?.isEmpty == false)
-    let sessionMatchesTargetGateway = (targetGateway?.isEmpty != false) || (activeSession?.gatewayIp == targetGateway)
-    let expectedCidr: String? = (cleanMatchingCidr?.isEmpty == false ? cleanMatchingCidr : nil)
-        ?? (sessionMatchesTargetGateway && activeSession?.cidr.isEmpty == false ? activeSession?.cidr : nil)
-        ?? (fallbackGateway.flatMap { deriveIpv4Cidr(ip: $0) })
-
-    var actualCidr: String? = nil
-    var actualPrefix: Int? = nil
-    if let maskStr = netmask,
-       let prefix = prefixLengthFromIpv4Netmask(maskStr),
-       let derived = deriveIpv4Cidr(ip: ip, prefixLen: prefix) {
-        actualCidr = derived
-        actualPrefix = prefix
+    // Subnet overlap (including a previous session's subnet) is not association evidence.
+    // A readable SSID must be a DIRECT-* name equal to the requested one. When macOS redacts the
+    // SSID (no Location authorization) the name is not evidence either way, so association is
+    // decided from interface state instead: the OS netmask must put the advertised group-owner
+    // address on the same subnet as the interface address, and an explicit gateway is mandatory.
+    let ssidReadable = !actualSsid.isEmpty
+    if ssidReadable {
+        guard actualSsid.hasPrefix("DIRECT-"), requestedSsid == nil || actualSsid == requestedSsid else { return nil }
+    } else {
+        guard let g = matchingGateway, !g.isEmpty else { return nil }
     }
-    guard let resolvedCidr = actualCidr ?? expectedCidr ?? deriveIpv4Cidr(ip: ip) else {
-        return nil
+    guard isRfc1918Ipv4(ip),
+          let netmask = netmask,
+          let prefix = prefixLengthFromIpv4Netmask(netmask),
+          let actualCidr = deriveIpv4Cidr(ip: ip, prefixLen: prefix) else { return nil }
+    let session = activeSession?.ssid == actualSsid ? activeSession : nil
+    let gateway = matchingGateway ?? session?.gatewayIp
+    if let gateway = gateway {
+        guard isRfc1918Ipv4(gateway), ip != gateway,
+              cidrContains(cidr: actualCidr, ip: gateway) else { return nil }
+    } else if let cidr = matchingCidr {
+        guard cidrContains(cidr: cidr, ip: ip) else { return nil }
     }
-    if let prefix = actualPrefix,
-       let netCidr = actualCidr,
-       let gw = fallbackGateway,
-       !gw.isEmpty {
-        if ip != gw &&
-           (prefix >= 22 || rawSsidIsDirect) &&
-           cidrContains(cidr: netCidr, ip: gw) &&
-           isValidP2pGatewayIp(ip) {
-            return (ip, netCidr)
-        }
-        if !cidrContains(cidr: netCidr, ip: gw) {
-            if !explicitTarget && rawSsidIsDirect && isValidP2pGatewayIp(ip) && !isCgnatIpv4(ip) {
-                return (ip, netCidr)
-            }
-            return nil
-        }
-    }
-    if let expected = expectedCidr,
-       ip != fallbackGateway,
-       cidrContains(cidr: expected, ip: ip) {
-        return (ip, resolvedCidr)
-    }
-    if !explicitTarget && rawSsidIsDirect && isValidP2pGatewayIp(ip) && !isCgnatIpv4(ip) {
-        return (ip, resolvedCidr)
-    }
-    return nil
+    return (ip, actualCidr)
 }
 
-func currentWifiP2pAddressAndCidr(matchingGateway: String? = nil, matchingCidr: String? = nil) -> (ip: String, cidr: String)? {
+func currentWifiP2pAddressAndCidr(matchingGateway: String? = nil, matchingCidr: String? = nil, matchingSsid: String? = nil, on interfaceName: String? = nil) -> (ip: String, cidr: String, ssid: String, interfaceName: String)? {
     var ifaddr: UnsafeMutablePointer<ifaddrs>?
     guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
     defer { freeifaddrs(ifaddr) }
-    let wifiIface = getWifiInterfaceName()
+    let wifiIface = interfaceName ?? getWifiInterfaceName()
     let activeSession = loadActiveP2pSession()
-    let rawSsidIsDirect = currentRawWifiSsid().hasPrefix("DIRECT-")
+    let actualSsid = currentRawWifiSsid(on: wifiIface)
+    let requestedSsid = matchingSsid ?? activeSession?.ssid
+    let ssidReadable = !actualSsid.isEmpty
+    if ssidReadable {
+        guard actualSsid.hasPrefix("DIRECT-"), requestedSsid == nil || actualSsid == requestedSsid else { return nil }
+    } else {
+        // Redacted SSID: require a target gateway and confirm the DHCP router (route interface)
+        // equals the advertised group-owner address before treating the interface as joined.
+        let sessionGateway = (activeSession != nil && activeSession?.ssid == requestedSsid) ? activeSession?.gatewayIp : nil
+        guard let gateway = matchingGateway ?? sessionGateway, !gateway.isEmpty,
+              currentWifiRouterIp(on: wifiIface) == gateway else { return nil }
+    }
+    let effectiveGateway: String? = matchingGateway ?? (ssidReadable ? nil : ((activeSession?.ssid == requestedSsid) ? activeSession?.gatewayIp : nil))
+    let reportedSsid = ssidReadable ? actualSsid : (requestedSsid ?? "")
 
     for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
         let flags = Int32(ptr.pointee.ifa_flags)
@@ -2087,12 +2347,15 @@ func currentWifiP2pAddressAndCidr(matchingGateway: String? = nil, matchingCidr: 
         if let matched = matchWifiP2pInterfaceAddress(
             ip: ip,
             netmask: netmaskStr,
-            rawSsidIsDirect: rawSsidIsDirect,
-            matchingGateway: matchingGateway,
+            actualSsid: actualSsid,
+            requestedSsid: requestedSsid,
+            matchingGateway: effectiveGateway,
             matchingCidr: matchingCidr,
             activeSession: activeSession
         ) {
-            return matched
+            // Reject an association change while the interface snapshot was being read.
+            guard currentRawWifiSsid(on: wifiIface) == actualSsid else { return nil }
+            return (matched.ip, matched.cidr, reportedSsid, wifiIface)
         }
     }
     return nil
@@ -2102,110 +2365,118 @@ func currentWifiP2pIp(matchingGateway: String? = nil, matchingCidr: String? = ni
     return currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway, matchingCidr: matchingCidr)?.ip ?? ""
 }
 
-@discardableResult
-func waitForLanFallbackSession(
-    stateDir: URL = STATE_DIR,
-    initialStartTimeout: TimeInterval = 30.0,
-    idleTimeout: TimeInterval = 40.0,
-    maxDuration: TimeInterval = 180.0,
-    pollInterval: TimeInterval = 0.5
-) -> Bool {
-    let uploadDoneFile = stateDir.appendingPathComponent("upload_completed.flag")
-    let askFile = stateDir.appendingPathComponent("pending_ask.json")
-    let txFile = stateDir.appendingPathComponent("transfer_progress.json")
-    let startAt = Date()
-    let startDeadline = startAt.addingTimeInterval(initialStartTimeout)
-    var transferDetected = false
+/// Optional BSSID / channel hints for the group owner, taken from the encrypted credentials.
+/// Used only to recognise the SoftAP when the OS redacts scan-result names.
+struct WifiJoinHints {
+    var bssid: String? = nil
+    var channelHint: Int? = nil
+}
 
-    while Date() < startDeadline {
-        if isTransferCancelled() {
-            writeProgressJson(active: false)
-            return false
-        }
-        if FileManager.default.fileExists(atPath: uploadDoneFile.path) {
-            try? FileManager.default.removeItem(at: uploadDoneFile)
-            return true
-        }
-        let detected = autoreleasepool { () -> Bool in
-            if FileManager.default.fileExists(atPath: askFile.path) ||
-                hasActiveTcpReceiverConnection() {
-                return true
-            }
-            let now = Date().timeIntervalSince1970
-            if let data = try? Data(contentsOf: txFile),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let active = obj["active"] as? Bool, active,
-               let updatedAt = obj["updatedAt"] as? Double,
-               (now - updatedAt) < 30.0 {
-                return true
-            }
-            return false
-        }
-        if detected {
-            transferDetected = true
-            break
-        }
-        Thread.sleep(forTimeInterval: pollInterval)
-    }
+struct WifiScanCandidate {
+    let ssid: String?
+    let bssid: String?
+    let channel: Int
+    let rssi: Int
+}
 
-    if !transferDetected {
-        return false
+/// Picks the index of the scan result to join. Order: readable exact name, then BSSID hint, then
+/// channel hint among results whose name is hidden. Never picks an unrelated named network.
+func selectWifiJoinCandidate(_ candidates: [WifiScanCandidate], ssid: String, hints: WifiJoinHints) -> Int? {
+    func best(_ idxs: [Int]) -> Int? { idxs.max(by: { candidates[$0].rssi < candidates[$1].rssi }) }
+    let all = Array(candidates.indices)
+    if let i = best(all.filter { candidates[$0].ssid == ssid }) { return i }
+    if let hint = hints.bssid?.lowercased(), !hint.isEmpty,
+       let i = best(all.filter { candidates[$0].bssid?.lowercased() == hint }) { return i }
+    if let ch = hints.channelHint, ch > 0 {
+        return best(all.filter { (candidates[$0].ssid ?? "").isEmpty && candidates[$0].channel == ch })
     }
+    return nil
+}
 
-    var lastActivity = Date()
-    let maxDeadline = startAt.addingTimeInterval(maxDuration)
-    while Date() < maxDeadline {
-        if isTransferCancelled() {
-            writeProgressJson(active: false)
-            return false
+/// Parses an Android `PENDING\t<retryAfterMs>` W2P2 reply. Returns the clamped retry delay in
+/// milliseconds, or nil when the line is not a PENDING reply (OK, NO, BUSY, ERR keep their meaning).
+func parseW2p2PendingRetryMs(_ line: String) -> Int? {
+    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed == "PENDING" || trimmed.hasPrefix("PENDING\t") || trimmed.hasPrefix("PENDING ") else { return nil }
+    let fields = trimmed.split(whereSeparator: { $0 == "\t" || $0 == " " })
+    let raw = fields.count >= 2 ? (Int(fields[1]) ?? 2000) : 2000
+    return min(max(raw, 250), 5000)
+}
+
+/// Stage at which a Mac-to-Android Wi-Fi Direct send failed, with an action the user can take.
+enum WifiDirectStage: String {
+    case bluetoothConnect = "Bluetooth connect"
+    case handshake = "handshake"
+    case groupCreation = "group creation"
+    case association = "association"
+    case addressAssignment = "address assignment"
+    case tlsPin = "TLS pin"
+    case token = "token"
+
+    var userAction: String {
+        switch self {
+        case .bluetoothConnect: return "Keep the phone unlocked and nearby with GlideDrop open, then try again."
+        case .handshake: return "Open GlideDrop on the phone, accept the request, and try again."
+        case .groupCreation: return "Make sure Wi-Fi is on and Wi-Fi Direct is allowed on the phone, then try again."
+        case .association: return "Make sure Mac Wi-Fi is on. If a Location prompt appeared, allow it in System Settings > Privacy & Security > Location Services > GlideDrop, then try again."
+        case .addressAssignment: return "Move the phone closer to the Mac and try again."
+        case .tlsPin: return "The phone's certificate did not match. Retry; if it repeats, re-pair the devices."
+        case .token: return "The phone rejected the session token. Retry the transfer."
         }
-        if FileManager.default.fileExists(atPath: uploadDoneFile.path) {
-            try? FileManager.default.removeItem(at: uploadDoneFile)
-            return true
-        }
-        let isBusy = autoreleasepool { () -> Bool in
-            if FileManager.default.fileExists(atPath: askFile.path) || hasActiveTcpReceiverConnection() {
-                return true
-            }
-            let now = Date().timeIntervalSince1970
-            if let data = try? Data(contentsOf: txFile),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let active = obj["active"] as? Bool, active,
-               let updatedAt = obj["updatedAt"] as? Double {
-                return (now - updatedAt) < 30.0
-            }
-            return false
-        }
-        if isBusy {
-            lastActivity = Date()
-        } else if Date().timeIntervalSince(lastActivity) > idleTimeout {
-            return false
-        }
-        Thread.sleep(forTimeInterval: pollInterval)
     }
-    return false
+}
+
+enum WifiJoinFailure {
+    case wifiOff
+    case notFound
+    case rejected
+}
+
+/// Most recent failure reason from joinWifiDirectNetwork (single sender per process).
+var lastWifiJoinFailure: WifiJoinFailure? = nil
+
+/// Delay before the next join attempt: exponential backoff from 1.5 s capped at 6 s.
+func wifiJoinBackoff(attempt: Int) -> TimeInterval {
+    min(6.0, 1.5 * pow(1.5, Double(max(0, attempt - 1))))
+}
+
+/// Removes the saved profile and stored password for a (per-session) Wi-Fi Direct name. Best effort.
+func forgetWifiDirectProfile(iface: String, ssid: String) {
+    guard ssid.hasPrefix("DIRECT-") else { return }
+    _ = runProcessCapture("/usr/sbin/networksetup", ["-removepreferredwirelessnetwork", iface, ssid])
+    _ = runProcessCapture("/usr/bin/security", ["delete-generic-password", "-a", ssid, "-D", "AirPort network password"])
 }
 
 /// Attempts one association pass to an ephemeral Wi-Fi Direct SoftAP. Returns true if the OS
 /// accepted the join request (even though DHCP may still take a moment to assign a P2P IP).
-func joinWifiDirectNetwork(iface: String, ssid: String, pass: String, logPrefix: String, attempt: Int = 1) -> Bool {
+func joinWifiDirectNetwork(iface: String, ssid: String, pass: String, logPrefix: String, attempt: Int = 1,
+                           hints: WifiJoinHints = WifiJoinHints()) -> Bool {
     if let cwIface = CWWiFiClient.shared().interface(withName: iface) ?? CWWiFiClient.shared().interface() {
-        // 1. Fast directed scan first in case the channel cache already knows the SoftAP;
-        // if empty (common when phone is on another 5 GHz channel like Ch 161 / 5805 MHz), run a full wildcard sweep.
+        if !cwIface.powerOn() {
+            lastWifiJoinFailure = .wifiOff
+            print("\(logPrefix) Wi-Fi interface \(iface) is powered off; cannot join \(ssid)")
+            fflush(stdout)
+            return false
+        }
+        // 1. Fast directed scan by name (works when the name is readable); otherwise run a full sweep and
+        // match on BSSID / channelHint from the encrypted credentials, since the OS may redact SSIDs.
         var matchedNet: CWNetwork? = nil
         if let fastNets = try? cwIface.scanForNetworks(withName: ssid),
            let best = fastNets.max(by: { $0.rssiValue < $1.rssiValue }) {
             matchedNet = best
         } else {
-            let wildNets: Set<CWNetwork>
+            let wildNets: [CWNetwork]
             if let hiddenSweep = try? cwIface.scanForNetworks(withName: nil, includeHidden: true) {
-                wildNets = hiddenSweep
+                wildNets = Array(hiddenSweep)
             } else {
-                wildNets = (try? cwIface.scanForNetworks(withName: nil)) ?? []
+                wildNets = Array((try? cwIface.scanForNetworks(withName: nil)) ?? [])
             }
-            let matching = wildNets.filter { $0.ssid == ssid }
-            matchedNet = matching.max(by: { $0.rssiValue < $1.rssiValue })
-            if matchedNet == nil {
+            let candidates = wildNets.map {
+                WifiScanCandidate(ssid: $0.ssid, bssid: $0.bssid, channel: $0.wlanChannel?.channelNumber ?? 0, rssi: $0.rssiValue)
+            }
+            if let idx = selectWifiJoinCandidate(candidates, ssid: ssid, hints: hints) {
+                matchedNet = wildNets[idx]
+            } else {
                 print("\(logPrefix) CoreWLAN full-channel sweep scanned \(wildNets.count) BSS(s), 0 matching \(ssid) (attempt \(attempt))")
                 fflush(stdout)
             }
@@ -2217,8 +2488,10 @@ func joinWifiDirectNetwork(iface: String, ssid: String, pass: String, logPrefix:
                 fflush(stdout)
                 return true
             } catch {
-                print("\(logPrefix) CoreWLAN associate failed for \(ssid) (attempt \(attempt)): \(error.localizedDescription)")
+                let nsErr = error as NSError
+                print("\(logPrefix) CoreWLAN associate failed for \(ssid) (attempt \(attempt)): \(error.localizedDescription) [domain=\(nsErr.domain) code=\(nsErr.code) userInfo=\(nsErr.userInfo)]")
                 fflush(stdout)
+                lastWifiJoinFailure = .rejected
             }
         }
     }
@@ -2237,6 +2510,7 @@ func joinWifiDirectNetwork(iface: String, ssid: String, pass: String, logPrefix:
     }
     print("\(logPrefix) networksetup join \(ssid) on \(iface) (attempt \(attempt)) rc=\(joinRc)\(cleanJoinOut.isEmpty ? "" : ": \(cleanJoinOut)")")
     fflush(stdout)
+    if lastWifiJoinFailure != .rejected { lastWifiJoinFailure = .notFound }
     return false
 }
 
@@ -2251,11 +2525,19 @@ func associateWifiDirectWithRetry(
     logPrefix: String,
     lastWarpCheck: inout Date,
     isAborted: (() -> Bool)? = nil,
+    hints: WifiJoinHints = WifiJoinHints(),
+    maxAttempts: Int = 8,
     onTick: () -> Void
-) -> (ip: String, cidr: String)? {
-    if let existing = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway), !existing.ip.isEmpty {
+) -> (ip: String, cidr: String, ssid: String, interfaceName: String)? {
+    guard !isTransferCancelled(), isAborted?() != true else { return nil }
+    if let existing = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway, matchingSsid: ssid, on: iface), !existing.ip.isEmpty {
         return existing
     }
+    lastWifiJoinFailure = nil
+    // Clear any stale profile/password for this name before joining, and again if the join fails.
+    forgetWifiDirectProfile(iface: iface, ssid: ssid)
+    var joinedOk = false
+    defer { if !joinedOk { forgetWifiDirectProfile(iface: iface, ssid: ssid) } }
 
     let deadline = Date().addingTimeInterval(timeout)
     var lastProgressTouch = Date()
@@ -2264,21 +2546,26 @@ func associateWifiDirectWithRetry(
     var joinAccepted = false
 
     while Date() < deadline {
-        if isTransferCancelled() || (isAborted?() == true) { break }
+        if isTransferCancelled() || (isAborted?() == true) { return nil }
         keepCloudflareWarpPausedPeriodically(lastChecked: &lastWarpCheck)
-        if let resolved = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway), !resolved.ip.isEmpty {
+        if let resolved = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway, matchingSsid: ssid, on: iface), !resolved.ip.isEmpty {
+            joinedOk = true
             return resolved
         }
 
-        let retryCooldown: TimeInterval = joinAccepted ? 5.0 : 1.5
+        let retryCooldown: TimeInterval = joinAccepted ? 5.0 : wifiJoinBackoff(attempt: attempt)
         if Date().timeIntervalSince(lastJoinAttemptAt) >= retryCooldown {
+            if attempt >= maxAttempts { break }
             attempt += 1
             lastJoinAttemptAt = Date()
-            joinAccepted = joinWifiDirectNetwork(iface: iface, ssid: ssid, pass: pass, logPrefix: logPrefix, attempt: attempt)
+            joinAccepted = joinWifiDirectNetwork(iface: iface, ssid: ssid, pass: pass, logPrefix: logPrefix, attempt: attempt, hints: hints)
             keepCloudflareWarpPausedPeriodically(lastChecked: &lastWarpCheck, interval: 0.5)
-            if let resolved = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway), !resolved.ip.isEmpty {
+            if let resolved = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway, matchingSsid: ssid, on: iface), !resolved.ip.isEmpty {
+                joinedOk = true
                 return resolved
             }
+            // Unrecoverable: Wi-Fi is off, so further attempts cannot succeed. Stop now.
+            if lastWifiJoinFailure == .wifiOff { break }
         }
 
         if Date().timeIntervalSince(lastProgressTouch) >= 2.0 {
@@ -2288,7 +2575,22 @@ func associateWifiDirectWithRetry(
         Thread.sleep(forTimeInterval: 0.2)
     }
 
-    return currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway)
+    guard !isTransferCancelled(), isAborted?() != true else { return nil }
+    let finalResult = currentWifiP2pAddressAndCidr(matchingGateway: matchingGateway, matchingSsid: ssid, on: iface)
+    if let r = finalResult, !r.ip.isEmpty { joinedOk = true }
+    return finalResult
+}
+
+/// Stage that failed after associateWifiDirectWithRetry returned nil or an address-less result.
+func wifiJoinFailureStage() -> WifiDirectStage {
+    // The OS accepted a join request but never produced an address: address assignment.
+    // Otherwise the SoftAP was never found, was refused, or Wi-Fi is off: association.
+    lastWifiJoinFailure == nil ? .addressAssignment : .association
+}
+
+func logWifiDirectStageFailure(_ stage: WifiDirectStage, logPrefix: String) {
+    print("\(logPrefix) Wi-Fi Direct failed at stage '\(stage.rawValue)'. Action: \(stage.userAction)")
+    fflush(stdout)
 }
 
 func handleIncomingWp2pJoin(
@@ -2297,16 +2599,20 @@ func handleIncomingWp2pJoin(
     out: OutputStream,
     goIp: String = "",
     proxyPort: Int = 0,
+    httpsPort: Int = 0,
     isV2Join: Bool = false,
     peerName: String? = nil,
     sessionToken: String? = nil,
+    peerTlsFingerprint: String,
     inp: InputStream? = nil,
-    isRemoteDisconnected: (() -> Bool)? = nil
+    isRemoteDisconnected: (() -> Bool)? = nil,
+    pauseWarp: () -> Bool = pauseCloudflareWarpIfNeeded,
+    verificationCode: String? = nil
 ) {
     let suppliedGoIp = isValidP2pGatewayIp(goIp) ? goIp.trimmingCharacters(in: .whitespacesAndNewlines) : ""
     let effectiveProxyPort = (1...65535).contains(proxyPort) ? proxyPort : 0
-    let macRxPort = readPortFile("mac_rx_port", defaultPort: DEFAULT_MAC_RX_PORT)
-    let udpKeepalivePort = readPortFile("awdl_bridge_port", defaultPort: Int(DEFAULT_AWDL_BRIDGE_PORT))
+    let macRxPort = readPortFile("mac_rx_port") ?? 0
+    let udpKeepalivePort = readPortFile("awdl_bridge_port") ?? 0
     let isRemoteAbortedNow: () -> Bool = {
         isStreamAborted(inp) || (isRemoteDisconnected?() ?? false)
     }
@@ -2315,10 +2621,28 @@ func handleIncomingWp2pJoin(
         if let tok = sessionToken {
             revokeP2pSessionToken(tok)
         }
-        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
     }
-    guard ssid.hasPrefix("DIRECT-"), !pass.isEmpty else {
+    guard beginWp2pJoin() else {
+        // A concurrent request has no approval and must not borrow or clean up the owner's session.
+        _ = writeAll(out, data: Data("ERR\n".utf8))
+        return
+    }
+    defer {
+        revokeCurrentSessionToken()
+        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
+        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("wp2p_authorized_session.json"))
+        finishWp2pJoin()
+    }
+    guard isValidSha256Fingerprint(peerTlsFingerprint),
+          ssid.hasPrefix("DIRECT-"), ssid.utf8.count <= 32, !pass.isEmpty else {
         print("[BLE-Daemon] Rejected invalid WP2P request: SSID '\(ssid)' does not start with DIRECT-")
+        revokeCurrentSessionToken()
+        _ = writeAll(out, data: Data("ERR\n".utf8))
+        return
+    }
+    guard (1...65535).contains(httpsPort), (1...65535).contains(macRxPort), (1...65535).contains(udpKeepalivePort) else {
+        print("[BLE-Daemon] Rejected WP2P request for \(ssid): missing runtime-assigned port (peer httpsPort=\(httpsPort), mac rx=\(macRxPort), keepalive=\(udpKeepalivePort)). Update GlideDrop on both devices.")
+        fflush(stdout)
         revokeCurrentSessionToken()
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
@@ -2330,94 +2654,31 @@ func handleIncomingWp2pJoin(
         return
     }
 
-    wp2pJoinLock.lock()
-    if wp2pJoinActive {
-        let existingIp = currentWifiP2pIp(matchingGateway: suppliedGoIp.isEmpty ? nil : suppliedGoIp)
-        wp2pJoinLock.unlock()
-        if !existingIp.isEmpty {
-            print("[BLE-Daemon] Reusing in-flight 5GHz P2P session at \(existingIp)")
-            fflush(stdout)
-            let reply = formatWp2pJoinReply(macIp: existingIp, isV2: isV2Join, macRxPort: macRxPort, udpKeepalivePort: udpKeepalivePort)
-            _ = writeAll(out, data: Data(reply.utf8))
-            return
-        }
-        // Wait briefly for in-flight join to finish obtaining DHCP
-        let waitJoin = Date().addingTimeInterval(8.0)
-        while Date() < waitJoin {
-            if isTransferCancelled() || isRemoteAbortedNow() { break }
-            let ip = currentWifiP2pIp(matchingGateway: suppliedGoIp.isEmpty ? nil : suppliedGoIp)
-            if !ip.isEmpty {
-                let reply = formatWp2pJoinReply(macIp: ip, isV2: isV2Join, macRxPort: macRxPort, udpKeepalivePort: udpKeepalivePort)
-                _ = writeAll(out, data: Data(reply.utf8))
-                return
-            }
-            Thread.sleep(forTimeInterval: 0.25)
-        }
-        revokeCurrentSessionToken()
-        _ = writeAll(out, data: Data("ERR\n".utf8))
-        return
-    }
-    wp2pJoinActive = true
-    wp2pJoinLock.unlock()
-
-    defer {
-        wp2pJoinLock.lock()
-        wp2pJoinActive = false
-        wp2pJoinLock.unlock()
-        let authSessionFile = STATE_DIR.appendingPathComponent("wp2p_authorized_session.json")
-        try? FileManager.default.removeItem(at: authSessionFile)
-    }
-
     let incomingPeerName = peerName ?? (loadActivePeersFromDisk(maxAge: 30.0).first?.name ?? "Nearby Device")
     clearCancelFlag()
 
     // Gate incoming WP2P join behind mandatory explicit user confirmation even when autoAccept is enabled
-    if !waitForMacUserAccept(senderName: incomingPeerName, fileNames: ["5 GHz Wi-Fi Direct Connection (\(ssid))"], totalBytes: 0, forcePrompt: true, isRemoteAborted: isRemoteAbortedNow) {
+    if !waitForMacUserAccept(senderName: incomingPeerName, fileNames: ["5 GHz Wi-Fi Direct Connection (\(ssid))" + (verificationCode.map { " • Verification code \($0)" } ?? "")], totalBytes: 0, forcePrompt: true, isRemoteAborted: isRemoteAbortedNow) {
         print("[BLE-Daemon] User declined or sender cancelled incoming WP2P connection request from \(incomingPeerName)")
         revokeCurrentSessionToken()
         _ = writeAll(out, data: Data("ERR\n".utf8))
         return
     }
 
-    // Record authorized WP2P session so subsequent HTTP /Ask in glidedrop.sh accepts automatically without a 2nd prompt
     let authSessionFile = STATE_DIR.appendingPathComponent("wp2p_authorized_session.json")
-    let authPayload: [String: Any] = [
-        "senderName": incomingPeerName,
-        "ssid": ssid,
-        "authorizedAt": Date().timeIntervalSince1970
-    ]
-    if let authData = try? JSONSerialization.data(withJSONObject: authPayload) {
-        try? authData.write(to: authSessionFile, options: [.atomic])
-    }
+    try? FileManager.default.removeItem(at: authSessionFile)
+    clearActiveP2pSession()
+    clearOutgoingP2pToken()
 
     let uploadDoneFile = STATE_DIR.appendingPathComponent("upload_completed.flag")
     try? FileManager.default.removeItem(at: uploadDoneFile)
 
     // Pause Cloudflare WARP before associating en0 to offline DIRECT-* P2P so WARP's 36s Happy Eyeballs
     // fail-closed firewall never drops P2P subnet traffic mid-transfer.
-    let warpCleared = pauseCloudflareWarpIfNeeded()
-    if !warpCleared {
-        let lanIp = currentMacLanIp()
-        if lanIp.isEmpty {
-            print("[BLE-Daemon] WARP switch locked and no LAN IP available — aborting WP2P join")
-            fflush(stdout)
-            revokeCurrentSessionToken()
-            _ = writeAll(out, data: Data("ERR\n".utf8))
-            return
-        }
-        try? String(Date().timeIntervalSince1970).write(to: LAN_FALLBACK_FILE, atomically: true, encoding: .utf8)
-        defer {
-            try? FileManager.default.removeItem(at: LAN_FALLBACK_FILE)
-        }
-        print("[BLE-Daemon] WARP switch locked; keeping Wi-Fi on LAN (\(lanIp)) for Split-Tunnel transfer")
+    guard pauseWarp() else {
+        print("[BLE-Daemon] WARP switch locked — refusing LAN transport; peer may use encrypted BLE fallback")
         fflush(stdout)
-        let reply = formatWp2pJoinReply(macIp: lanIp, isV2: isV2Join, macRxPort: macRxPort, udpKeepalivePort: udpKeepalivePort)
-        guard writeAll(out, data: Data(reply.utf8)) else {
-            revokeCurrentSessionToken()
-            return
-        }
-        _ = waitForLanFallbackSession()
-        revokeCurrentSessionToken()
+        _ = writeAll(out, data: Data("ERR\n".utf8))
         return
     }
 
@@ -2461,6 +2722,7 @@ func handleIncomingWp2pJoin(
     }
 
     guard !isTransferCancelled(), !isRemoteAbortedNow(), let joined = resolvedP2p, !joined.ip.isEmpty else {
+        logWifiDirectStageFailure(wifiJoinFailureStage(), logPrefix: "[BLE-Daemon]")
         writeProgressJson(active: false)
         restoreMacInternetWifi(ssid: ssid)
         revokeCurrentSessionToken()
@@ -2478,7 +2740,9 @@ func handleIncomingWp2pJoin(
             Thread.sleep(forTimeInterval: 0.1)
         }
     }
-    guard isValidP2pGatewayIp(effectiveGoIp) else {
+    guard isRfc1918Ipv4(effectiveGoIp), effectiveGoIp != joined.ip,
+          cidrContains(cidr: joined.cidr, ip: effectiveGoIp),
+          wifiSsidConsistent(on: joined.interfaceName, expected: joined.ssid) else {
         print("[BLE-Daemon] Joined \(ssid) at \(joined.ip) but OS did not report a valid P2P gateway router — failing closed")
         fflush(stdout)
         writeProgressJson(active: false)
@@ -2489,16 +2753,25 @@ func handleIncomingWp2pJoin(
     }
     let macP2pIp = joined.ip
     let sessionCidr = joined.cidr
-    writeActiveP2pSession(
+    guard writeActiveP2pSession(
+        ssid: joined.ssid,
+        interfaceName: joined.interfaceName,
         gatewayIp: effectiveGoIp,
         cidr: sessionCidr,
-        httpsPort: 8771,
+        httpsPort: httpsPort,
         proxyPort: effectiveProxyPort,
         macRxPort: macRxPort,
         udpKeepalivePort: udpKeepalivePort
-    )
+    ), writeAtomicPrivateFile(data: Data(normalizeSha256Fingerprint(peerTlsFingerprint).utf8),
+                              to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt")) else {
+        writeProgressJson(active: false)
+        restoreMacInternetWifi(ssid: ssid)
+        _ = writeAll(out, data: Data("ERR\n".utf8))
+        return
+    }
     if let tok = sessionToken {
-        writeOutgoingP2pToken(tok, host: effectiveGoIp, port: 8771)
+        writeWp2pAuthorization(senderName: incomingPeerName, ssid: joined.ssid, token: tok, peerIp: effectiveGoIp)
+        writeOutgoingP2pToken(tok, host: effectiveGoIp, port: httpsPort)
     }
 
     writeProgressJson(
@@ -3690,7 +3963,6 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                         return
                     }
                     let normalizedPin = normalizeSha256Fingerprint(androidTlsFingerprint)
-                    try? normalizedPin.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
                     let macPriv = P256.KeyAgreement.PrivateKey()
                     guard let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) else {
                         _ = writeAll(out, data: Data("NO\n".utf8))
@@ -3726,9 +3998,11 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                         out: out,
                         goIp: parsedJoin.goIp,
                         proxyPort: parsedJoin.proxyPort,
+                        httpsPort: parsedJoin.httpsPort,
                         isV2Join: parsedJoin.isV2,
                         peerName: targetPeerName,
                         sessionToken: sessionToken,
+                        peerTlsFingerprint: normalizedPin,
                         inp: inp,
                         isRemoteDisconnected: { [weak self] in self?.isPingPeerDisconnected() ?? false }
                     )
@@ -3956,42 +4230,45 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                 if magic == "W2P2" {
                     guard let reqData = readExact(inp, count: metaLen),
                           let reqStr = String(data: reqData, encoding: .utf8) else { return }
-                    let rawParts = reqStr.split(separator: "\t").map(String.init)
-                    let parts = rawParts.filter { !$0.isEmpty }
-                    var androidPubB64 = ""
-                    var androidTlsFingerprint = ""
-                    if parts.count >= 3 && (parts[0] == "2" || parts[0] == "1") {
-                        androidPubB64 = parts[1]
-                        androidTlsFingerprint = parts[2]
-                    } else if parts.count == 2 && (parts[0] == "2" || parts[0] == "1") {
-                        androidPubB64 = parts[1]
-                    } else if parts.count >= 2 {
-                        androidPubB64 = parts[0]
-                        androidTlsFingerprint = parts[1]
-                    } else if parts.count == 1 {
-                        androidPubB64 = parts[0]
+                    let w2p2Req = parseW2p2Request(reqStr)
+                    if w2p2Req.version < W2P2_PROTOCOL_VERSION {
+                        print("[BLE-Daemon] Rejected W2P2 v\(w2p2Req.version) request: peer must update GlideDrop (protocol v\(W2P2_PROTOCOL_VERSION) required)")
+                        fflush(stdout)
+                        _ = writeAll(out, data: Data("ERR\tUPDATE\t\(W2P2_PROTOCOL_VERSION)\n".utf8))
+                        return
                     }
+                    let androidPubB64 = w2p2Req.pubB64
+                    let androidTlsFingerprint = w2p2Req.tlsFingerprint
                     let macTlsFingerprint = getLocalMacTlsCertFingerprint()
                     guard isValidSha256Fingerprint(androidTlsFingerprint),
                           isValidSha256Fingerprint(macTlsFingerprint),
+                          let w2p2SessionId = w2p2Req.sessionId, w2p2SessionId.count == W2P2_SESSION_ID_BYTES,
                           !androidPubB64.isEmpty,
                           let androidPubDer = Data(base64Encoded: androidPubB64),
                           let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer) else {
-                        print("[BLE-Daemon] Rejected W2P2 handshake: missing/invalid peer public key or TLS fingerprint")
+                        print("[BLE-Daemon] Rejected W2P2 handshake: missing/invalid peer public key, session id or TLS fingerprint")
                         fflush(stdout)
                         _ = writeAll(out, data: Data("ERR\n".utf8))
                         return
                     }
                     let normalizedPin = normalizeSha256Fingerprint(androidTlsFingerprint)
-                    try? normalizedPin.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
 
                     let macPriv = P256.KeyAgreement.PrivateKey()
-                    guard let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub) else {
+                    guard let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub),
+                          let material = deriveW2p2SessionMaterial(
+                            sharedSecret: sharedSecret,
+                            sessionId: w2p2SessionId,
+                            initiatorPubDer: androidPubDer,
+                            responderPubDer: macPriv.publicKey.derRepresentation,
+                            initiatorFingerprint: androidTlsFingerprint,
+                            responderFingerprint: macTlsFingerprint
+                          ) else {
                         _ = writeAll(out, data: Data("ERR\n".utf8))
                         return
                     }
-                    let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
-                    let sessionToken = deriveSessionToken(sharedSecret: sharedSecret)
+                    let sessionKey = material.sessionKey
+                    let sessionToken = material.token
+                    let w2p2VerificationCode = material.verificationCode
                     registerP2pSessionToken(sessionToken)
                     let macPubB64 = macPriv.publicKey.derRepresentation.base64EncodedString()
                     let reply = "OK\t\(macPubB64)\t\(macTlsFingerprint)\n"
@@ -4027,10 +4304,13 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                         out: out,
                         goIp: parsedJoin.goIp,
                         proxyPort: parsedJoin.proxyPort,
+                        httpsPort: parsedJoin.httpsPort,
                         isV2Join: parsedJoin.isV2,
                         peerName: pName,
                         sessionToken: sessionToken,
-                        inp: inp
+                        peerTlsFingerprint: normalizedPin,
+                        inp: inp,
+                        verificationCode: w2p2VerificationCode
                     )
                     return
                 }
@@ -4150,6 +4430,33 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
 // ============================================================================
 // Sender Mode: Mac -> Android Direct BLE L2CAP Sender (Central)
 // ============================================================================
+func runP2pTxProcess(_ process: Process, onTick: () -> Void = {}) -> Int32 {
+    activeChildTxLock.lock()
+    activeChildTxProcess = process
+    activeChildTxLock.unlock()
+    defer {
+        activeChildTxLock.lock()
+        activeChildTxProcess = nil
+        activeChildTxLock.unlock()
+    }
+    do {
+        try process.run()
+    } catch {
+        print("[BLE-Send] Could not launch HTTPS sender: \(error.localizedDescription)")
+        return 45
+    }
+    while process.isRunning {
+        if isTransferCancelled() {
+            process.terminate()
+            break
+        }
+        onTick()
+        Thread.sleep(forTimeInterval: 0.25)
+    }
+    process.waitUntilExit()
+    return isTransferCancelled() ? 44 : process.terminationStatus
+}
+
 enum BleConnectSwitchAction: Equatable {
     case keepExisting
     case switchTo(peerId: UUID, psm: UInt16)
@@ -4735,6 +5042,7 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 exit(exitCode)
             }
 
+            var p2pTxExitCode: Int32? = nil
             // 5GHz Wi-Fi Direct P2P Negotiation for large files
             if self.totalRawBytes >= 65_536 && !self.files.isEmpty {
                 self.reportSenderConnecting("Negotiating secure 5 GHz Wi-Fi Direct…")
@@ -4751,28 +5059,61 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 var p2pCreds: (ssid: String, pass: String, host: String, port: String, peerPin: String, proxyPort: Int, sessionToken: String)? = nil
                 var w2p2TimedOut = false
                 var w2p2ReplyLine: String? = nil
+                var w2p2VerificationCode: String? = nil
+                let w2p2SessionId = randomW2p2SessionId()
+                let w2p2Request = "W2P2\t\(W2P2_PROTOCOL_VERSION)\t\(macPubB64)\t\(macCertFingerprint)\t\(w2p2HexString(w2p2SessionId))\n"
 
-                // Strict v2 ECDH P-256 negotiation with mandatory peer TLS pinning (no unpinned WP2P downgrade)
+                // Strict v3 ECDH P-256 negotiation with mandatory peer TLS pinning (no unpinned WP2P downgrade)
                 try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
-                let w2p2WriteOk = writeAll(out, data: Data("W2P2\t\(macPubB64)\t\(macCertFingerprint)\n".utf8))
+                let w2p2WriteOk = writeAll(out, data: Data(w2p2Request.utf8))
                 if w2p2WriteOk {
-                    w2p2ReplyLine = readBleStreamLine(inp, timeout: 25.0, checkCancel: true, onTimeout: {
-                        w2p2TimedOut = true
-                        DispatchQueue.main.async { self.cm?.cancelPeripheralConnection(peripheral) }
-                    })
+                    // Android may answer `PENDING\t<retryAfterMs>` while its group is still starting.
+                    // Wait the advertised time (bounded), resend the same W2P2 request, and read again.
+                    // Peers that never send PENDING behave exactly as before.
+                    var pendingRetries = 0
+                    while true {
+                        w2p2ReplyLine = readBleStreamLine(inp, timeout: 25.0, checkCancel: true, onTimeout: {
+                            w2p2TimedOut = true
+                            DispatchQueue.main.async { self.cm?.cancelPeripheralConnection(peripheral) }
+                        })
+                        guard let pendingReply = w2p2ReplyLine,
+                              let retryAfterMs = parseW2p2PendingRetryMs(pendingReply),
+                              pendingRetries < 4, !isTransferCancelled() else { break }
+                        pendingRetries += 1
+                        print("[BLE-Send] Peer Wi-Fi Direct group still starting; retrying W2P2 in \(retryAfterMs) ms (\(pendingRetries)/4)")
+                        fflush(stdout)
+                        Thread.sleep(forTimeInterval: Double(retryAfterMs) / 1000.0)
+                        if !writeAll(out, data: Data(w2p2Request.utf8)) {
+                            w2p2ReplyLine = nil
+                            break
+                        }
+                    }
                     if let reply = w2p2ReplyLine, reply.hasPrefix("OK\t") {
+                        // v3 reply: OK <phonePub> <phoneTlsFp> <encryptedCreds>
                         let parts = reply.dropFirst(3).split(separator: "\t").map(String.init)
-                        if parts.count >= 2,
+                        if parts.count >= 3,
+                           isValidSha256Fingerprint(parts[1]),
                            let androidPubDer = Data(base64Encoded: parts[0]),
                            let androidPub = try? P256.KeyAgreement.PublicKey(derRepresentation: androidPubDer),
                            let sharedSecret = try? macPriv.sharedSecretFromKeyAgreement(with: androidPub),
-                           let encCreds = Data(base64Encoded: parts[1]) {
-                            let sessionKey = deriveSessionKey(sharedSecret: sharedSecret)
-                            let sessionToken = deriveSessionToken(sharedSecret: sharedSecret)
+                           let encCreds = Data(base64Encoded: parts[2]),
+                           let material = deriveW2p2SessionMaterial(
+                                sharedSecret: sharedSecret,
+                                sessionId: w2p2SessionId,
+                                initiatorPubDer: macPriv.publicKey.derRepresentation,
+                                responderPubDer: androidPubDer,
+                                initiatorFingerprint: macCertFingerprint,
+                                responderFingerprint: parts[1]
+                           ) {
+                            let sessionKey = material.sessionKey
+                            let sessionToken = material.token
+                            w2p2VerificationCode = material.verificationCode
                             if let decData = decryptAesGcm(packet: encCreds, using: sessionKey),
                                let decStr = String(data: decData, encoding: .utf8) {
                                 let credParts = decStr.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-                                if credParts.count >= 5 && isValidSha256Fingerprint(credParts[4]) {
+                                // The fingerprint inside the encrypted credentials must equal the one bound into the key derivation.
+                                if credParts.count >= 5 && isValidSha256Fingerprint(credParts[4]) &&
+                                    normalizeSha256Fingerprint(credParts[4]) == normalizeSha256Fingerprint(parts[1]) {
                                     let rawProxy = credParts.count >= 6 ? (Int(credParts[5].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) : 0
                                     let parsedProxyPort = (1...65535).contains(rawProxy) ? rawProxy : 0
                                     p2pCreds = (
@@ -4795,13 +5136,21 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                 }
                 if !w2p2WriteOk || w2p2ReplyLine == nil {
                     let reason = w2p2TimedOut
-                        ? "[BLE-Send] Timed out negotiating 5 GHz Wi-Fi Direct over Bluetooth LE"
-                        : "[BLE-Send] Bluetooth LE connection closed during 5 GHz Wi-Fi Direct handshake"
+                        ? "[BLE-Send] Timed out negotiating 5 GHz Wi-Fi Direct over Bluetooth LE. Failed stage: \(WifiDirectStage.handshake.rawValue). \(WifiDirectStage.handshake.userAction)"
+                        : "[BLE-Send] Bluetooth LE connection closed during 5 GHz Wi-Fi Direct handshake. Failed stage: \(WifiDirectStage.bluetoothConnect.rawValue). \(WifiDirectStage.bluetoothConnect.userAction)"
                     failL2capSession(message: reason)
                 }
 
+                if let reply = w2p2ReplyLine, isW2p2UpdateRequiredReply(reply) {
+                    failL2capSession(message: "[BLE-Send] The phone runs an incompatible GlideDrop version (secure handshake v\(W2P2_PROTOCOL_VERSION) required). Update GlideDrop on the phone and try again.")
+                }
                 guard let creds = p2pCreds else {
-                    failL2capSession(message: "[BLE-Send] Peer rejected secure W2P2 ECDH/TLS pinning handshake — refusing unpinned downgrade")
+                    failL2capSession(message: "[BLE-Send] Peer rejected secure W2P2 ECDH/TLS pinning handshake — refusing unpinned downgrade. If the phone runs an older GlideDrop build, update it to the matching version.")
+                }
+                if let code = w2p2VerificationCode {
+                    print("[BLE-Send] Verification code \(code) — it must match the code shown on the phone")
+                    fflush(stdout)
+                    self.reportSenderConnecting("Verification code \(code) (matches phone)…")
                 }
 
                 let ssid = creds.ssid, pass = creds.pass, host = creds.host, port = creds.port, peerPin = creds.peerPin
@@ -4812,70 +5161,19 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                       (1...65535).contains(targetHttpsPort) else {
                     failL2capSession(message: "[BLE-Send] Peer supplied invalid Wi-Fi Direct endpoint \(host):\(port)")
                 }
-                let sessionCidr = deriveIpv4Cidr(ip: host) ?? ""
-                try? peerPin.write(to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"), atomically: true, encoding: .utf8)
-                writeOutgoingP2pToken(sessionToken, host: host, port: targetHttpsPort)
-                writeActiveP2pSession(gatewayIp: host, cidr: sessionCidr, httpsPort: targetHttpsPort, proxyPort: proxyPort)
-
+                guard ssid.hasPrefix("DIRECT-"), ssid.utf8.count <= 32, !pass.isEmpty else {
+                    failL2capSession(message: "[BLE-Send] Peer supplied invalid Wi-Fi Direct credentials")
+                }
+                clearActiveP2pSession()
+                clearOutgoingP2pToken()
                 let warpCleared = pauseCloudflareWarpIfNeeded()
                 if !warpCleared {
-                    if isTcpPortReachable(host: host, port: targetHttpsPort, timeoutMs: 250) {
-                        writeTxInProgressLock()
-                        self.reportSenderConnecting("Connecting over reachable Wi-Fi link (\(host))…")
-                        let peerArg = host.contains(":") ? "[\(host)]:\(targetHttpsPort)" : "\(host):\(targetHttpsPort)"
-                        let txProc = Process()
-                        txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
-                        txProc.environment = ProcessInfo.processInfo.environment
-                        txProc.environment?["SKIP_BLE_RESTART"] = "1"
-                        txProc.environment?["GLIDEDROP_P2P_TOKEN"] = sessionToken
-                        txProc.arguments = ["send", "--peer", peerArg, "--pin", peerPin] + self.files.map { $0.path } + self.urls
-                        activeChildTxLock.lock()
-                        activeChildTxProcess = txProc
-                        activeChildTxLock.unlock()
-                        try? txProc.run()
-                        txProc.waitUntilExit()
-                        activeChildTxLock.lock()
-                        activeChildTxProcess = nil
-                        activeChildTxLock.unlock()
-                        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
-                        clearActiveP2pSession()
-                        clearOutgoingP2pToken()
-
-                        if isTransferCancelled() {
-                            writeProgressJson(active: false)
-                            failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true, exitCode: 44)
-                        }
-                        if txProc.terminationStatus == 44 {
-                            writeProgressJson(active: false)
-                            failL2capSession(message: "[BLE-Send] Transfer cancelled by receiver", clearCancel: true, exitCode: 44)
-                        }
-                        if txProc.terminationStatus == 0 {
-                            writeProgressJson(active: false)
-                            inp.close()
-                            out.close()
-                            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
-                            print("[BLE-Send] Delivered via token-authenticated TLS over reachable Wi-Fi!")
-                            exit(0)
-                        }
-                        if txProc.terminationStatus == 43 {
-                            failL2capSession(message: "[BLE-Send] Transfer declined by receiver", exitCode: 43)
-                        }
-                        if txProc.terminationStatus == 46 {
-                            failL2capSession(message: "[BLE-Send] Peer TLS certificate fingerprint pinning mismatch — aborting transfer", exitCode: 46)
-                        }
-                        print("[BLE-Send] WARP-locked HTTPS probe failed (status=\(txProc.terminationStatus))")
-                        fflush(stdout)
-                    } else {
-                        print("[BLE-Send] Cloudflare WARP switch is locked and \(host):\(targetHttpsPort) unreachable; skipping Wi-Fi Direct switch and using Direct BLE L2CAP")
-                        fflush(stdout)
-                        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
-                        clearActiveP2pSession()
-                        clearOutgoingP2pToken()
-                    }
+                    print("[BLE-Send] WARP switch locked — refusing LAN transport; using encrypted BLE if permitted")
+                    fflush(stdout)
                 } else {
                     saveCurrentWifiSsid()
                     self.reportSenderConnecting("Joining 5 GHz Wi-Fi Direct (\(ssid))…")
-                    print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(targetHttpsPort), cidr=\(sessionCidr))...")
+                    print("[BLE-Send] Joining 5GHz P2P group \(ssid) (\(host):\(targetHttpsPort))...")
                     fflush(stdout)
 
                     let wifiIface = getWifiInterfaceName()
@@ -4896,10 +5194,9 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                         failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true, exitCode: 44)
                     }
 
-                    let hasP2pIp = !(joinedP2p?.ip.isEmpty ?? true)
-                    let actualCidr = joinedP2p?.cidr ?? sessionCidr
-                    if hasP2pIp {
-                        let localP2pIp = joinedP2p?.ip ?? ""
+                    if let joinedP2p = joinedP2p {
+                        let actualCidr = joinedP2p.cidr
+                        let localP2pIp = joinedP2p.ip
                         print("[BLE-Send] Obtained 5GHz P2P IP \(localP2pIp) on \(wifiIface) (cidr=\(actualCidr))")
                         fflush(stdout)
                         // Ensure WARP Always-On didn't re-attach and wait briefly for P2P route/ARP settle before spawning HTTPS client
@@ -4918,7 +5215,13 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                             print("[BLE-Send] Warning: \(host):\(targetHttpsPort) not yet reachable from Swift probe after 4s; attempting glidedrop.sh connect")
                             fflush(stdout)
                         }
-                        writeActiveP2pSession(gatewayIp: host, cidr: actualCidr, httpsPort: targetHttpsPort, proxyPort: proxyPort)
+                        guard wifiSsidConsistent(on: joinedP2p.interfaceName, expected: joinedP2p.ssid),
+                              writeActiveP2pSession(ssid: joinedP2p.ssid, interfaceName: joinedP2p.interfaceName,
+                                  gatewayIp: host, cidr: actualCidr, httpsPort: targetHttpsPort, proxyPort: proxyPort),
+                              writeAtomicPrivateFile(data: Data(peerPin.utf8), to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt")) else {
+                            failL2capSession(message: "[BLE-Send] Could not publish OS-confirmed pinned P2P session")
+                        }
+                        writeOutgoingP2pToken(sessionToken, host: host, port: targetHttpsPort)
                         writeTxInProgressLock()
                         self.reportSenderConnecting("Connecting over 5 GHz Wi-Fi Direct (\(host))…")
                         if proxyPort > 0 {
@@ -4930,40 +5233,31 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                             txProc.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
                             txProc.environment = ProcessInfo.processInfo.environment
                             txProc.environment?["SKIP_BLE_RESTART"] = "1"
-                            txProc.environment?["GLIDEDROP_P2P_TOKEN"] = sessionToken
-                            txProc.arguments = ["send", "--peer", peerArg, "--pin", peerPin] + self.files.map { $0.path } + self.urls
-                            activeChildTxLock.lock()
-                            activeChildTxProcess = txProc
-                            activeChildTxLock.unlock()
-                            try? txProc.run()
-                            while txProc.isRunning {
-                                if isTransferCancelled() {
-                                    txProc.terminate()
-                                    break
-                                }
-                                keepCloudflareWarpPausedPeriodically(lastChecked: &lastSendWarpCheck)
-                                Thread.sleep(forTimeInterval: 0.25)
+                            txProc.environment?.removeValue(forKey: "GLIDEDROP_P2P_TOKEN")
+                            // Peer pin: one-time 0600 file (deleted by glidedrop.sh after read), never argv.
+                            // Bearer token: already in the 0600 p2p_outgoing_token.json state file.
+                            guard writeAtomicPrivateFile(data: Data(peerPin.utf8),
+                                                         to: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt")) else {
+                                return 45
                             }
-                            txProc.waitUntilExit()
-                            activeChildTxLock.lock()
-                            activeChildTxProcess = nil
-                            activeChildTxLock.unlock()
-                            return txProc.terminationStatus
+                            txProc.arguments = ["send", "--peer", peerArg] + self.files.map { $0.path } + self.urls
+                            return runP2pTxProcess(txProc) {
+                                keepCloudflareWarpPausedPeriodically(lastChecked: &lastSendWarpCheck)
+                            }
                         }
                         let attemptStart = Date()
                         var txStatus = runP2pTxAttempt()
                         // Retry once on transient initial connect drop if WARP Always-On flickered and payload shouldn't drop to BLE
-                        if txStatus != 0 &&
-                            shouldAllowBleAutoFallback(fileCount: self.files.count, totalRawBytes: self.totalRawBytes, txExitCode: txStatus) == false &&
-                            txStatus != 43 && txStatus != 44 && txStatus != 46 &&
-                            !isTransferCancelled() &&
-                            Date().timeIntervalSince(attemptStart) < 15.0 {
+                        if shouldRetryP2pTx(fileCount: self.files.count, totalRawBytes: self.totalRawBytes,
+                                            txExitCode: txStatus, elapsed: Date().timeIntervalSince(attemptStart),
+                                            cancelled: isTransferCancelled()) {
                             print("[BLE-Send] Retrying 5 GHz Wi-Fi Direct HTTPS connect once after transient drop (status=\(txStatus))...")
                             fflush(stdout)
                             _ = pauseCloudflareWarpIfNeeded()
                             Thread.sleep(forTimeInterval: 0.5)
                             txStatus = runP2pTxAttempt()
                         }
+                        p2pTxExitCode = txStatus
                         if isTransferCancelled() {
                             writeProgressJson(active: false)
                             restoreMacInternetWifi(ssid: ssid)
@@ -4987,12 +5281,19 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
                         if txStatus == 43 {
                             failL2capSession(message: "[BLE-Send] Transfer declined by receiver", exitCode: 43)
                         }
+                        if txStatus == 45 {
+                            failL2capSession(message: "[BLE-Send] HTTPS sender launch/configuration failed — refusing BLE downgrade", exitCode: 45)
+                        }
                         if txStatus == 46 {
-                            failL2capSession(message: "[BLE-Send] Peer TLS certificate fingerprint pinning mismatch — aborting transfer", exitCode: 46)
+                            failL2capSession(message: "[BLE-Send] Peer TLS certificate fingerprint pinning mismatch — aborting transfer. Failed stage: \(WifiDirectStage.tlsPin.rawValue). \(WifiDirectStage.tlsPin.userAction)", exitCode: 46)
+                        }
+                        if txStatus == 47 {
+                            failL2capSession(message: "[BLE-Send] HTTPS protocol/upload error — refusing retry or BLE downgrade", exitCode: 47)
                         }
                     } else {
-                        print("[BLE-Send] Failed to obtain 5GHz P2P IP on \(wifiIface) for \(sessionCidr)")
+                        print("[BLE-Send] Failed to verify 5GHz P2P association on \(wifiIface) for \(ssid)")
                         fflush(stdout)
+                        logWifiDirectStageFailure(wifiJoinFailureStage(), logPrefix: "[BLE-Send]")
                         restoreMacInternetWifi(ssid: ssid)
                     }
                 }
@@ -5001,7 +5302,10 @@ final class BleGlideDropSender: NSObject, CBCentralManagerDelegate, CBPeripheral
             if isTransferCancelled() {
                 failL2capSession(message: "[BLE-Send] Transfer cancelled by user", clearCancel: true, exitCode: 44)
             }
-            if !shouldAllowBleAutoFallback(fileCount: self.files.count, totalRawBytes: self.totalRawBytes) {
+            clearOutgoingP2pToken()
+            clearActiveP2pSession()
+            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("pinned_peer_tls_fingerprint.txt"))
+            if !shouldAllowBleAutoFallback(fileCount: self.files.count, totalRawBytes: self.totalRawBytes, txExitCode: p2pTxExitCode) {
                 failL2capSession(
                     message: "[BLE-Send] 5 GHz Wi-Fi Direct failed for \(formatByteSize(self.totalRawBytes)) transfer — refusing slow Bluetooth LE fallback. Ensure Wi-Fi is enabled and pause Cloudflare WARP if active."
                 )
@@ -8259,7 +8563,7 @@ final class AwdlLoopbackBridge {
     private let queue = DispatchQueue(label: "com.glidedrop.awdl-bridge", qos: .userInitiated)
 
     init(
-        listenPort: UInt16 = DEFAULT_AWDL_BRIDGE_PORT,
+        listenPort: UInt16 = 0,
         sockPath: String? = nil,
         stateDir: URL = STATE_DIR
     ) throws {
@@ -8465,7 +8769,12 @@ func runGlideDropMain() throws {
             exit(1)
         }
         withExtendedLifetime(sender) {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 300.0) {
+            var deadline = BleSenderActivityDeadline()
+            let watchdog = Timer(timeInterval: 1.0, repeats: true) { _ in
+                guard deadline.hasTimedOut(transferStarted: sender.connectState.transferStarted,
+                                           progressUpdatedAt: senderProgressUpdatedAt(),
+                                           now: Date().timeIntervalSince1970) else { return }
+                sender.connectState.isTerminalFailure = true
                 writeProgressJson(active: false)
                 try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("tx_in_progress.lock"))
                 clearOutgoingP2pToken()
@@ -8474,9 +8783,13 @@ func runGlideDropMain() throws {
                 } else {
                     clearActiveP2pSession()
                 }
-                print("[BLE-Send] Timed out waiting for BLE L2CAP transfer")
+                print(sender.connectState.transferStarted
+                      ? "[BLE-Send] Send stalled: no sender activity for 300s"
+                      : "[BLE-Send] Timed out establishing BLE L2CAP connection")
                 exit(1)
             }
+            RunLoop.main.add(watchdog, forMode: .common)
+            defer { watchdog.invalidate() }
             RunLoop.main.run()
         }
     } else {

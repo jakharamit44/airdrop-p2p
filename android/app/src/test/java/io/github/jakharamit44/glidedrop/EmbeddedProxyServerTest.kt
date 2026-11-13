@@ -1166,6 +1166,117 @@ class EmbeddedProxyServerTest {
         }
     }
 
+    @Test
+    fun testAbsoluteHttpsForwardRequestRejectedBeforeDialing() {
+        val dials = java.util.concurrent.atomic.AtomicInteger(0)
+        val proxy = EmbeddedProxyServer(
+            context = null, port = 0,
+            outboundAddressResolver = { _, _ -> arrayOf(InetAddress.getByName("93.184.216.34")) },
+            outboundSocketConnectHook = { _, _, _, _ ->
+                dials.incrementAndGet()
+                throw java.io.IOException("Unexpected upstream connection")
+            },
+            allowLoopbackClients = true
+        )
+        assertTrue(proxy.start())
+        try {
+            for (scheme in listOf("https", "HTTPS")) {
+                Socket("127.0.0.1", proxy.actualPort).use { client ->
+                    client.soTimeout = 2000
+                    client.getOutputStream().write(("GET $scheme://relay.example.test/private HTTP/1.1\r\n" +
+                        "Host: relay.example.test\r\nAuthorization: Bearer test\r\n\r\n").toByteArray())
+                    assertTrue(readLine(client.getInputStream()).orEmpty().contains("403"))
+                }
+            }
+            assertEquals(0, dials.get())
+        } finally {
+            proxy.stop()
+        }
+    }
+
+    @Test
+    fun testSocksReplyFailureClosesOutboundSocket() = assertPreRelayFailureClosesOutbound("socks")
+
+    @Test
+    fun testConnectReplyFailureClosesOutboundSocket() = assertPreRelayFailureClosesOutbound("connect")
+
+    @Test
+    fun testForwardHeaderFailureClosesOutboundSocket() = assertPreRelayFailureClosesOutbound("forward")
+
+    private fun assertPreRelayFailureClosesOutbound(protocol: String) {
+        val outbound = java.util.concurrent.atomic.AtomicReference<Socket>()
+        val proxy = EmbeddedProxyServer(
+            context = null, port = 0,
+            outboundAddressResolver = { _, _ -> arrayOf(InetAddress.getByName("93.184.216.34")) },
+            outboundSocketConnectHook = { sock, _, _, _ -> outbound.set(sock) },
+            allowLoopbackClients = true
+        )
+        val client = object : Socket() {
+            override fun getOutputStream(): OutputStream = object : OutputStream() {
+                private var bytesWritten = 0
+                override fun write(b: Int) {
+                    if (protocol != "socks" || ++bytesWritten > 2) {
+                        throw java.io.IOException("Client reset before relay")
+                    }
+                }
+            }
+        }
+        val input = when (protocol) {
+            "socks" -> java.io.ByteArrayInputStream(byteArrayOf(1, 0, 5, 1, 0, 1, 93, 184.toByte(), 216.toByte(), 34, 0, 80))
+            "connect" -> java.io.ByteArrayInputStream("CONNECT relay.example.test:443 HTTP/1.1\r\nHost: relay.example.test\r\n\r\n".toByteArray())
+            else -> java.io.ByteArrayInputStream("GET http://relay.example.test/ HTTP/1.1\r\nHost: relay.example.test\r\n\r\n".toByteArray())
+        }
+        val methodName = if (protocol == "socks") "handleSocks5" else "handleHttpRequest"
+        val handler = EmbeddedProxyServer::class.java.getDeclaredMethod(
+            methodName, Socket::class.java, InputStream::class.java, android.net.Network::class.java
+        ).apply { isAccessible = true }
+        try {
+            try {
+                handler.invoke(proxy, client, input, null)
+                throw AssertionError("Expected pre-relay I/O failure")
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                assertTrue(e.cause is java.io.IOException)
+            }
+            assertTrue("Outbound must close on $protocol failure", outbound.get().isClosed)
+            val sockets = EmbeddedProxyServer::class.java.getDeclaredField("activeSockets").apply { isAccessible = true }
+            assertTrue((sockets.get(proxy) as Set<*>).isEmpty())
+        } finally {
+            outbound.get()?.close()
+            client.close()
+        }
+    }
+
+    @Test
+    fun testAbsoluteHandshakeDeadlineRejectsTrickledHttpAndSocks() {
+        val proxy = EmbeddedProxyServer(context = null, port = 0, allowLoopbackClients = true)
+        assertTrue(proxy.start())
+        try {
+            Socket("127.0.0.1", proxy.actualPort).use { http ->
+                Socket("127.0.0.1", proxy.actualPort).use { socks ->
+                    http.getOutputStream().write('G'.code)
+                    socks.getOutputStream().write(5)
+                    Thread.sleep(8000)
+                    http.getOutputStream().write('E'.code)
+                    socks.getOutputStream().write(1)
+                    Thread.sleep(8000)
+                    for (client in listOf(http, socks)) {
+                        client.soTimeout = 1000
+                        val closed = try {
+                            client.getInputStream().read() == -1
+                        } catch (_: java.net.SocketTimeoutException) {
+                            false
+                        } catch (_: java.net.SocketException) {
+                            true
+                        }
+                        assertTrue("Trickled handshake must expire at the absolute deadline", closed)
+                    }
+                }
+            }
+        } finally {
+            proxy.stop()
+        }
+    }
+
     private fun readFully(inp: InputStream, buf: ByteArray) {
         var offset = 0
         while (offset < buf.size) {

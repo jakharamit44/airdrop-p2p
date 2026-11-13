@@ -22,8 +22,10 @@ elif [[ -x "$SCRIPT_DIR/GlideDrop.app/Contents/MacOS/GlideDrop" ]]; then
 else
   BLE_BIN="$STATE_DIR/glidedrop-daemon"
 fi
-PORT="${GLIDEDROP_PORT:-8772}"
-PROXY_PORT="${GLIDEDROP_FINDER_PROXY_PORT:-8773}"
+# Ports are always OS-assigned (bind to 0); the bound values are published via port files
+# in $STATE_DIR and exchanged in the handshake. No compiled-in port exists.
+PORT=0
+PROXY_PORT=0
 
 ensure_cert() {
   if [[ ! -f "$STATE_DIR/cert.pem" || ! -f "$STATE_DIR/key.pem" ]]; then
@@ -215,7 +217,7 @@ start_daemons() {
     fi
   fi
 
-  # Start HTTPS receiver (8772) + Finder Share Android proxy (8773)
+  # Start HTTPS receiver + Finder Share Android proxy (OS-assigned ports)
   nohup python3 -u - "$STATE_DIR/cert.pem" "$STATE_DIR/key.pem" "$PORT" "$PROXY_PORT" "$SCRIPT_DIR/glidedrop.sh" >"$LOG_FILE" 2>&1 << 'PYEOF' &
 import gzip, hmac, io, ipaddress, json, os, plistlib, queue, re, select, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, uuid, zlib
 from pathlib import Path
@@ -464,7 +466,13 @@ def _is_local_rx_cancelled() -> bool:
         except Exception:
             return False
 
-def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int, conn=None) -> bool:
+CONSENT_LOCK = threading.Lock()
+
+def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int, conn=None, session_token="", peer_ip="") -> bool:
+    with CONSENT_LOCK:
+        return _wait_for_user_accept(sender_name, file_names, total_bytes, conn, session_token, peer_ip)
+
+def _wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int, conn=None, session_token="", peer_ip="") -> bool:
     s = load_settings()
     if s.get("autoAccept", False):
         return True
@@ -473,8 +481,15 @@ def wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int, c
         try:
             auth_data = json.loads(auth_session_file.read_text(encoding="utf-8"))
             auth_time = float(auth_data.get("authorizedAt", 0))
-            if time.time() - auth_time < 60.0:
-                print(f"[P2P-Receiver] Reusing authorized WP2P session from {auth_data.get('senderName', sender_name)}")
+            session = load_active_p2p_session()
+            bound_token = str(auth_data.get("token") or "").strip().lower()
+            if (0 <= time.time() - auth_time < 60.0 and session
+                    and re.fullmatch(r"[0-9a-f]{64}", session_token)
+                    and hmac.compare_digest(bound_token, session_token)
+                    and auth_data.get("senderName") == sender_name
+                    and auth_data.get("peerIp") == peer_ip == session["gatewayIp"]
+                    and auth_data.get("ssid") == session["ssid"]):
+                print(f"[P2P-Receiver] Reusing session-bound WP2P approval for {sender_name}")
                 auth_session_file.unlink(missing_ok=True)
                 return True
         except Exception:
@@ -629,7 +644,25 @@ def parse_http_request_head(f, max_lines: int = MAX_HTTP_HEADER_LINES, max_bytes
 
     if "content-length" in headers and "transfer-encoding" in headers:
         raise HttpFramingError(400, "Bad Request", "Conflicting Content-Length and Transfer-Encoding headers")
+    if "transfer-encoding" in headers and headers["transfer-encoding"].lower() != "chunked":
+        raise HttpFramingError(400, "Bad Request", "Unsupported Transfer-Encoding")
     return method, path, headers
+
+
+def read_http_trailers(f):
+    total = 0
+    for count in range(MAX_HTTP_HEADER_LINES + 1):
+        line = read_line(f)
+        if line is None:
+            raise EOFError("Missing chunked body terminator")
+        total += len(line) + 2
+        if total > MAX_HTTP_HEADER_BYTES:
+            raise ValueError("HTTP trailers exceed limit")
+        if line == "":
+            return
+        if count == MAX_HTTP_HEADER_LINES or ":" not in line:
+            raise ValueError("Malformed or excessive HTTP trailers")
+    raise ValueError("Too many HTTP trailers")
 
 
 def parse_chunk_size_line(line: str) -> int:
@@ -650,11 +683,41 @@ def load_active_p2p_session(max_age: float = 1800.0):
         if not isinstance(obj, dict):
             return None
         updated = float(obj.get("updatedAt") or 0.0)
-        if (time.time() - updated) > max_age:
+        if not 0 <= time.time() - updated <= max_age:
             return None
+        # Swift writes this only after OS-confirmed DIRECT-* association/subnet discovery.
+        iface = str(obj.get("interface") or obj.get("interfaceName") or "")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,31}", iface):
+            return None
+        if not str(obj.get("ssid") or "").startswith("DIRECT-"):
+            return None
+        net = ipaddress.ip_network(str(obj.get("cidr") or ""), strict=False)
+        gateway = ipaddress.ip_address(str(obj.get("gatewayIp") or ""))
+        if (net.prefixlen == 0 or gateway not in net or gateway.is_loopback
+                or gateway.is_unspecified or gateway.is_multicast or gateway.is_link_local):
+            return None
+        if not 1 <= int(obj.get("httpsPort") or 0) <= 65535:
+            return None
+        obj["interface"] = iface
         return obj
     except Exception:
         return None
+
+
+def validate_peer_route(host: str, port: int):
+    session = load_active_p2p_session()
+    if not session:
+        raise ValueError("No OS-confirmed Wi-Fi Direct session")
+    addr = ipaddress.ip_address(str(host).split("%", 1)[0])
+    if addr != ipaddress.ip_address(session["gatewayIp"]) or port != int(session["httpsPort"]):
+        raise ValueError("Peer endpoint does not match the active Wi-Fi Direct session")
+    family = "-inet6" if addr.version == 6 else "-inet"
+    route = subprocess.check_output(["/sbin/route", "-n", "get", family, str(addr)], text=True, timeout=3.0)
+    match = re.search(r"^\s*interface:\s*(\S+)\s*$", route, re.MULTILINE)
+    if not match or match.group(1) != session["interface"]:
+        raise ValueError("Peer route is not on the confirmed Wi-Fi Direct interface")
+    return session
+
 
 def get_active_p2p_networks():
     nets = []
@@ -681,15 +744,20 @@ def is_active_p2p_peer_ip(peer_ip: str) -> bool:
     return any(addr.version == net.version and addr in net for net in get_active_p2p_networks())
 
 def get_active_p2p_https_port() -> int:
+    """Peer HTTPS port from the OS-confirmed session; 0 when the session carries none (no fallback)."""
     session = load_active_p2p_session()
     if session:
         try:
-            p = int(session.get("httpsPort") or 8771)
+            p = int(session.get("httpsPort") or 0)
             if 1 <= p <= 65535:
                 return p
         except Exception:
             pass
-    return 8771
+    return 0
+
+def active_p2p_endpoint(peer_ip: str) -> str:
+    port = get_active_p2p_https_port()
+    return format_peer_endpoint(peer_ip, port) if port else ""
 
 def format_peer_endpoint(host: str, port: int) -> str:
     clean = str(host or "").strip()
@@ -737,10 +805,7 @@ def read_body_bytes(
                 raise ValueError("Truncated chunked body")
             sz = parse_chunk_size_line(sz_line)
             if sz == 0:
-                while True:
-                    tr = read_line(f)
-                    if tr is None or not tr.strip():
-                        break
+                read_http_trailers(f)
                 break
             if max_bytes is not None and (len(out) + sz) > max_bytes:
                 raise HttpFramingError(413, "Payload Too Large", f"Request body exceeds {max_bytes} byte limit")
@@ -834,10 +899,7 @@ class ChunkedReader:
                 raise ValueError("Truncated chunked stream")
             sz = parse_chunk_size_line(line)
             if sz == 0:
-                while True:
-                    trailer = read_line(self.f)
-                    if trailer is None or not trailer.strip():
-                        break
+                read_http_trailers(self.f)
                 self.eof = True
                 return b""
             self.chunk_rem = sz
@@ -889,8 +951,7 @@ class FixedLengthReader:
         want = min(n, self.rem)
         chunk = self.f.read(want)
         if not chunk:
-            self.rem = 0
-            return b""
+            raise EOFError("Truncated fixed-length HTTP body")
         self.rem -= len(chunk)
         if self.on_bytes:
             self.on_bytes(len(chunk))
@@ -950,14 +1011,17 @@ class StreamDecompressor:
     def _flush_bounded(self, decomp):
         if decomp is None:
             return
+        if not decomp.eof or decomp.unused_data:
+            raise ValueError("Incomplete compressed stream or trailing compressed data")
         remaining = self.max_decompressed_bytes - self.total_decompressed
         step_cap = min(1048576, max(1, remaining + 1))
         out = decomp.flush(step_cap)
         self._append_decompressed(out)
 
     def _init_stream(self):
-        prefix = self.raw.read_exact(6)
-        if len(prefix) < 6:
+        # Four bytes identify DVZip without stealing bytes from a one-byte first block.
+        prefix = self.raw.read_exact(4)
+        if len(prefix) < 4:
             self._append_decompressed(prefix)
             self.mode = "raw"
             return
@@ -965,7 +1029,7 @@ class StreamDecompressor:
             self.mode = "gzip"
             self.decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
             self._decompress_bounded(self.decompressor, prefix)
-        elif prefix[:6] in (b"070707", b"070701", b"070702", b"070764"):
+        elif prefix == b"0707":
             self.mode = "raw"
             self._append_decompressed(prefix)
         else:
@@ -975,15 +1039,8 @@ class StreamDecompressor:
             self.dvzip_rem = v & 0x7FFFFFFF
             if not self.dvzip_stored:
                 self.decompressor = zlib.decompressobj()
-            first_data = prefix[4:]
-            if first_data:
-                take = min(len(first_data), self.dvzip_rem)
-                bpart = first_data[:take]
-                self.dvzip_rem -= len(bpart)
-                if self.dvzip_stored:
-                    self._append_decompressed(bpart)
-                else:
-                    self._decompress_bounded(self.decompressor, bpart)
+            if v == 0:
+                self.eof = True
 
     def read(self, n):
         if n <= 0:
@@ -993,6 +1050,8 @@ class StreamDecompressor:
             if self.dvzip_rem == 0:
                 hdr4 = self.raw.read_exact(4)
                 if len(hdr4) < 4:
+                    if hdr4:
+                        raise EOFError("Truncated DVZip block header")
                     if self.decompressor:
                         self._flush_bounded(self.decompressor)
                         self.decompressor = None
@@ -1012,8 +1071,7 @@ class StreamDecompressor:
                 want = min(n, self.dvzip_rem)
                 chunk = self.raw.read(want)
                 if not chunk:
-                    self.eof = True
-                    return b""
+                    raise EOFError("Truncated stored DVZip block")
                 self._account_decompressed(len(chunk))
                 self.dvzip_rem -= len(chunk)
                 return chunk
@@ -1038,8 +1096,7 @@ class StreamDecompressor:
                     want = min(1048576 if self.dvzip_stored else 65536, self.dvzip_rem)
                     chunk = self.raw.read(want) if self.dvzip_stored else self.raw.read_exact(want)
                     if not chunk:
-                        self.eof = True
-                        break
+                        raise EOFError("Truncated DVZip block")
                     self.dvzip_rem -= len(chunk)
                     if self.dvzip_stored:
                         self._append_decompressed(chunk)
@@ -1053,6 +1110,8 @@ class StreamDecompressor:
                 else:
                     hdr4 = self.raw.read_exact(4)
                     if len(hdr4) < 4:
+                        if hdr4:
+                            raise EOFError("Truncated DVZip block header")
                         if self.decompressor:
                             self._flush_bounded(self.decompressor)
                             self.decompressor = None
@@ -1087,16 +1146,30 @@ class StreamDecompressor:
         return bytes(buf)
 
 
-def extract_cpio_stream(stream, dest_dir: Path, fsync_files: bool = True):
+def publish_noclobber(staged: Path, target: Path):
+    stem, suffix = target.stem, target.suffix
+    idx = 0
+    while True:
+        candidate = target if idx == 0 else target.with_name(f"{stem}_{idx}{suffix}")
+        try:
+            os.link(staged, candidate, follow_symlinks=False)
+            staged.unlink()
+            return candidate
+        except FileExistsError:
+            idx += 1
+
+
+def extract_cpio_stream(stream, dest_dir: Path, fsync_files: bool = True, approved_manifest=None):
     if dest_dir.is_symlink():
         raise ValueError("Destination directory must not be a symlink")
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_resolved = dest_dir.resolve()
     saved = []
+    remaining_manifest = list(approved_manifest) if approved_manifest is not None else None
     while True:
         magic = stream.read_exact(6)
         if len(magic) == 0:
-            break
+            raise EOFError("Missing CPIO trailer")
         if len(magic) < 6:
             raise EOFError("Truncated CPIO magic")
         if magic == b"070707":
@@ -1135,12 +1208,26 @@ def extract_cpio_stream(stream, dest_dir: Path, fsync_files: bool = True):
         name_raw = stream.read_exact(namesize)
         if len(name_raw) < namesize:
             raise EOFError("Truncated CPIO entry name")
-        name = name_raw.rstrip(b"\x00").decode("utf-8", "replace")
+        if not name_raw.endswith(b"\x00") or b"\x00" in name_raw[:-1]:
+            raise ValueError("Invalid CPIO entry name terminator")
+        name = name_raw[:-1].decode("utf-8", "strict")
         if is_newc and (110 + namesize) % 4 != 0:
             pad_len = 4 - ((110 + namesize) % 4)
             if len(stream.read_exact(pad_len)) < pad_len:
                 raise EOFError("Truncated CPIO name padding")
         if name == "TRAILER!!!":
+            if filesize:
+                raise ValueError("Invalid CPIO trailer size")
+            padding = 0
+            while True:
+                tail = stream.read(65536)
+                if not tail:
+                    break
+                padding += len(tail)
+                if padding > 1048576 or any(tail):
+                    raise ValueError("Unexpected data after CPIO trailer")
+            if remaining_manifest:
+                raise ValueError("Upload is missing approved files")
             break
         if (mode & 0o170000) == 0o100000:
             raw_base = os.path.basename(name.replace("\\", "/"))
@@ -1154,6 +1241,11 @@ def extract_cpio_stream(stream, dest_dir: Path, fsync_files: bool = True):
                 if rem > 0:
                     raise IOError(f"Transfer stream truncated on metadata: expected {filesize} bytes, missing {rem} bytes")
             else:
+                if remaining_manifest is not None:
+                    item = (raw_base, filesize)
+                    if item not in remaining_manifest:
+                        raise ValueError("CPIO entry does not match approved file manifest")
+                    remaining_manifest.remove(item)
                 safe_name = raw_base.lstrip(".") or "glidedrop_file"
                 target = dest_dir / safe_name
                 if target.resolve().parent == dest_resolved:
@@ -1173,9 +1265,10 @@ def extract_cpio_stream(stream, dest_dir: Path, fsync_files: bool = True):
                         target = dest_dir / f"{orig_stem}_{idx}{orig_suffix}"
                         part_target = target.with_name(target.name + ".part")
                         idx += 1
+                    fd = None
                     try:
                         o_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-                        fd = os.open(str(part_target), o_flags, 0o644)
+                        fd = os.open(str(part_target), o_flags, 0o600)
                         with os.fdopen(fd, "wb", buffering=2097152) as out_f:
                             rem = filesize
                             while rem > 0:
@@ -1190,16 +1283,15 @@ def extract_cpio_stream(stream, dest_dir: Path, fsync_files: bool = True):
                         if rem > 0:
                             part_target.unlink(missing_ok=True)
                             raise IOError(f"Transfer stream truncated: expected {filesize} bytes, missing {rem} bytes")
-                        if target.is_symlink():
-                            raise ValueError(f"Refusing symlink target path: {target}")
-                        part_target.replace(target)
+                        target = publish_noclobber(part_target, target)
                         try:
                             subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;GlideDrop;", str(target)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         except Exception:
                             pass
                         saved.append(target)
                     except Exception:
-                        part_target.unlink(missing_ok=True)
+                        if fd is not None:
+                            part_target.unlink(missing_ok=True)
                         raise
                 else:
                     rem = filesize
@@ -1226,7 +1318,7 @@ def extract_cpio_stream(stream, dest_dir: Path, fsync_files: bool = True):
     return saved
 
 
-def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = False, file_label: str = "Incoming File", expected_total: int = 0, file_count: int = 1, peer_name: str = "Android Peer", fsync_files: bool = True):
+def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = False, file_label: str = "Incoming File", expected_total: int = 0, file_count: int = 1, peer_name: str = "Android Peer", fsync_files: bool = True, approved_manifest=None):
     t0 = time.time()
     last_emit = [0.0]
     last_term_log = [0.0]
@@ -1280,9 +1372,18 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
         else:
             raw_reader = FixedLengthReader(f, clen, on_bytes=on_bytes_read)
 
-        max_decomp = (expected_total + max(67_108_864, expected_total // 10)) if expected_total > 0 else DEFAULT_MAX_DECOMPRESSED_BYTES
+        max_decomp = (expected_total + max(67_108_864, expected_total // 10)) if (expected_total > 0 or approved_manifest is not None) else DEFAULT_MAX_DECOMPRESSED_BYTES
         decompressor = StreamDecompressor(raw_reader, max_decompressed_bytes=max_decomp)
-        saved = extract_cpio_stream(decompressor, dest_dir, fsync_files=fsync_files)
+        if dest_dir.is_symlink():
+            raise ValueError("Destination directory must not be a symlink")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Publish only after archive, compression integrity and HTTP framing all validate.
+        with tempfile.TemporaryDirectory(prefix=".glidedrop-receive-", dir=dest_dir) as staging:
+            staged = extract_cpio_stream(decompressor, Path(staging), fsync_files=fsync_files,
+                                         approved_manifest=approved_manifest)
+            if raw_reader.read(1):
+                raise ValueError("Trailing data after compressed archive")
+            saved = [publish_noclobber(p, dest_dir / p.name) for p in staged]
         if track_progress:
             write_progress(False)
         return saved, done[0]
@@ -1355,13 +1456,25 @@ def forward_to_peer_worker(tmp_dir: Path, saved_files):
                 pin_file = STATE_DIR / "pinned_peer_tls_fingerprint.txt"
                 if session and pin_file.exists() and (time.time() - pin_file.stat().st_mtime) < 300.0:
                     gw = str(session.get("gatewayIp") or "").strip()
-                    hp = int(session.get("httpsPort") or 8771)
+                    hp = int(session.get("httpsPort") or 0)
                     fp = pin_file.read_text(encoding="utf-8").strip().replace(":", "").replace("-", "").lower()
                     if gw and 1 <= hp <= 65535 and re.fullmatch(r"[0-9a-f]{64}", fp):
-                        cmd.extend(["--peer", format_peer_endpoint(gw, hp), "--pin", fp])
-                subprocess.run(cmd + [str(p) for p in saved_files], check=False)
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+                        # Hand the pin to the child via a fresh one-time 0600 file (child deletes it); never argv.
+                        pin_file.unlink(missing_ok=True)
+                        fd = os.open(str(pin_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        with os.fdopen(fd, "w", encoding="utf-8") as pf:
+                            pf.write(fp)
+                        cmd.extend(["--peer", format_peer_endpoint(gw, hp)])
+                result = subprocess.run(cmd + [str(p) for p in saved_files], check=False)
+                if result.returncode == 0:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    return True
+            print(f"[-] Finder forwarding failed; recover files from {tmp_dir}")
+            safe_notify(f"Android delivery failed. Files retained at {tmp_dir}", "GlideDrop delivery failed")
+            return False
+        except Exception as e:
+            print(f"[-] Finder forwarding error: {e}; files retained at {tmp_dir}")
+            return False
 
 def send_resp(conn, status: int, reason: str, body: bytes = b"", close: bool = False):
     conn_hdr = "Connection: close\r\n" if close else ""
@@ -1389,6 +1502,8 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
     last_total = 0
     last_count = 1
     ask_approved = False
+    approved_token = ""
+    approved_manifest = None
     owns_rx_lock = False
     if isinstance(addr, tuple) and len(addr) >= 1:
         peer_ip = str(addr[0]).replace("::ffff:", "")
@@ -1432,7 +1547,12 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                 send_resp(conn, 403, "Forbidden", b"", close=True)
                 break
             is_upload = (method == "POST" and path == "/Upload")
-            exp_tot = (parse_non_negative_int(headers["totalbytes"], "TotalBytes") if "totalbytes" in headers else 0) or last_total
+            exp_tot = last_total
+            if is_upload and "totalbytes" in headers:
+                claimed_total = parse_non_negative_int(headers["totalbytes"], "TotalBytes")
+                if claimed_total not in (last_total, max(1, last_total)):
+                    send_resp(conn, 400, "Bad Request", b"", close=True)
+                    break
             try:
                 body = b"" if is_upload else read_body_bytes(
                     f,
@@ -1460,8 +1580,9 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
             active_peer_name = (get_active_peers(12.0)[0].get("name") if get_active_peers(12.0) else "Android Peer")
             if method == "POST" and path == "/Discover":
                 if not is_p2p_proxy and is_active_p2p_peer_ip(peer_ip):
-                    p2p_ep = format_peer_endpoint(peer_ip, get_active_p2p_https_port())
-                    record_active_peer(f"p2p-{peer_ip}", active_peer_name, "5GHz Wi-Fi Direct P2P", p2p_ep, -48, 0)
+                    p2p_ep = active_p2p_endpoint(peer_ip)
+                    if p2p_ep:
+                        record_active_peer(f"p2p-{peer_ip}", active_peer_name, "5GHz Wi-Fi Direct P2P", p2p_ep, -48, 0)
                     write_progress(True, "Receiving", "Incoming transfer", 0, 0, 0, 0, 0, 1, phase="Handshaking over 5GHz Wi-Fi Direct…", peer_name=active_peer_name, is_connecting=True)
                 resp = plistlib.dumps({
                     "ReceiverComputerName": active_peer_name if is_p2p_proxy else current_mac_name(),
@@ -1482,10 +1603,29 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     info = {}
                 items = info.get("Items") or []
                 files = info.get("Files") or []
+                if not isinstance(items, list) or not isinstance(files, list) or len(files) > 4096:
+                    send_resp(conn, 400, "Bad Request", b"", close=True)
+                    break
+                approved_manifest = []
+                for fd in files:
+                    if not isinstance(fd, dict):
+                        raise ValueError("Invalid approved file metadata")
+                    name = fd.get("FileName")
+                    size = fd.get("FileSize")
+                    if (not isinstance(name, str) or not name or "\x00" in name
+                            or os.path.basename(name.replace("\\", "/")) != name
+                            or len(name.encode("utf-8")) > 4096
+                            or type(size) is not int or not 0 <= size <= 0x7FFFFFFFFFFFFFFF):
+                        raise ValueError("Invalid approved filename or size")
+                    approved_manifest.append((name, size))
+                if is_p2p_proxy and items:
+                    send_resp(conn, 400, "Bad Request", b"URL forwarding is not supported by the Finder proxy", close=True)
+                    break
                 last_sender = str(info.get("SenderComputerName") or active_peer_name)
                 if not is_p2p_proxy and is_active_p2p_peer_ip(peer_ip):
-                    p2p_ep = format_peer_endpoint(peer_ip, get_active_p2p_https_port())
-                    record_active_peer(f"p2p-{peer_ip}", last_sender, "5GHz Wi-Fi Direct P2P", p2p_ep, -48, 0)
+                    p2p_ep = active_p2p_endpoint(peer_ip)
+                    if p2p_ep:
+                        record_active_peer(f"p2p-{peer_ip}", last_sender, "5GHz Wi-Fi Direct P2P", p2p_ep, -48, 0)
                 fnames = [str(fd.get("FileName") or "file") for fd in files if isinstance(fd, dict)]
                 last_label = fnames[0] if fnames else (str(items[0]) if items else "Incoming File")
                 last_count = max(1, len(fnames))
@@ -1500,7 +1640,8 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     ask_phase = "Starting incoming stream…" if load_settings().get("autoAccept", False) else f"Waiting for approval from {current_mac_name()}…"
                     write_progress(True, "Receiving", last_label, 0, last_total, 0, 0, 0, last_count, phase=ask_phase, peer_name=last_sender, is_connecting=True)
                     conn.settimeout(60.0)
-                    if not wait_for_user_accept(last_sender, fnames if fnames else [str(x) for x in items], last_total, conn=conn):
+                    if not wait_for_user_accept(last_sender, fnames if fnames else [str(x) for x in items], last_total,
+                                                conn=conn, session_token=headers.get("x-glidedrop-token", "").strip().lower(), peer_ip=peer_ip):
                         write_progress(False)
                         print(f"[P2P-Receiver] Declined transfer from {last_sender}")
                         send_resp(conn, 403, "Forbidden", b"")
@@ -1508,6 +1649,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     conn.settimeout(30.0)
                     touch_rx_lock()
                     ask_approved = True
+                    approved_token = headers.get("x-glidedrop-token", "").strip().lower()
                     for it in items:
                         if isinstance(it, str) and (it.startswith("http://") or it.startswith("https://")):
                             if not re.match(r"^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$", it):
@@ -1538,20 +1680,27 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                     "ReceiverMediaCapabilities": MEDIA_CAP,
                     "IsAirDropable": True,  # Apple AWDL Discover wire-protocol bplist key
                 }, fmt=plistlib.FMT_BINARY)
+                if is_p2p_proxy:
+                    ask_approved = True
                 close_conn = headers.get("connection", "").lower() == "close"
                 send_resp(conn, 200, "OK", resp, close=close_conn)
                 if close_conn:
                     break
             elif method == "POST" and path == "/Upload":
-                if not is_p2p_proxy and not ask_approved:
-                    print(f"[{role}] Rejected unauthorized /Upload from {addr} without approved /Ask")
+                if (not ask_approved or (not is_p2p_proxy and not hmac.compare_digest(
+                        approved_token, headers.get("x-glidedrop-token", "").strip().lower()))):
+                    print(f"[{role}] Rejected unauthorized /Upload from {addr} without session-matched /Ask")
                     send_resp(conn, 403, "Forbidden", b"")
                     break
                 conn.settimeout(30.0)
                 if is_p2p_proxy:
-                    tmp_dir = Path(tempfile.mkdtemp(prefix="glidedrop_finder_proxy_"))
+                    recovery = STATE_DIR / "finder_recovery"
+                    recovery.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    if recovery.is_symlink():
+                        raise ValueError("Finder recovery directory must not be a symlink")
+                    tmp_dir = Path(tempfile.mkdtemp(prefix="transfer-", dir=recovery))
                     try:
-                        saved, rx_len = stream_upload_to_dir(f, headers, tmp_dir, track_progress=False, file_label=last_label, expected_total=exp_tot, file_count=last_count, fsync_files=False)
+                        saved, rx_len = stream_upload_to_dir(f, headers, tmp_dir, track_progress=False, file_label=last_label, expected_total=exp_tot, file_count=last_count, fsync_files=False, approved_manifest=approved_manifest)
                     except HttpFramingError as he:
                         shutil.rmtree(tmp_dir, ignore_errors=True)
                         send_resp(conn, he.status_code, he.reason, b"", close=True)
@@ -1564,14 +1713,11 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                         shutil.rmtree(tmp_dir, ignore_errors=True)
                         raise
                     print(f"[{role}] {method} {path} from {addr} ({rx_len} B)")
-                    sig = tuple((p.name, p.stat().st_size) for p in saved)
-                    send_resp(conn, 200, "OK", b"")
-                    if check_and_record_recent_upload(sig):
-                        print(f"[Finder-Proxy] Skipping duplicate retry for {[p.name for p in saved]}")
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                    # No name/size deduplication: it drops distinct same-length revisions.
+                    if forward_to_peer_worker(tmp_dir, saved):
+                        send_resp(conn, 200, "OK", b"")
                     else:
-                        print(f"[Finder-Proxy] Forwarding {len(saved)} file(s) from Finder Share Proxy to {active_peer_name}: {[p.name for p in saved]}")
-                        threading.Thread(target=forward_to_peer_worker, args=(tmp_dir, saved), daemon=True).start()
+                        send_resp(conn, 502, "Bad Gateway", b"Android forwarding failed; files retained for recovery", close=True)
                     break
                 else:
                     try:
@@ -1580,7 +1726,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                         pass
                     touch_rx_lock()
                     try:
-                        saved, rx_len = stream_upload_to_dir(f, headers, DOWNLOADS, track_progress=True, file_label=last_label, expected_total=exp_tot, file_count=last_count, peer_name=last_sender)
+                        saved, rx_len = stream_upload_to_dir(f, headers, DOWNLOADS, track_progress=True, file_label=last_label, expected_total=exp_tot, file_count=last_count, peer_name=last_sender, approved_manifest=approved_manifest)
                     except HttpFramingError as he:
                         send_resp(conn, he.status_code, he.reason, b"", close=True)
                         break
@@ -1607,6 +1753,11 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
     except Exception as e:
         if owns_rx_lock:
             write_progress(False)
+        if isinstance(e, (ValueError, EOFError)):
+            try:
+                send_resp(conn, 400, "Bad Request", b"", close=True)
+            except Exception:
+                pass
         print(f"[-] Client {addr} error: {e}")
         sys.stdout.flush()
     finally:
@@ -1654,27 +1805,13 @@ def is_authorized_peer_ip(peer_ip: str) -> bool:
         return False
     if addr.version == 6 and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
-    if addr.is_loopback:
+    if addr.is_loopback or addr.is_link_local:
+        return False
+    try:
+        validate_peer_route(str(addr), get_active_p2p_https_port())
         return True
-    if any(addr.version == net.version and addr in net for net in get_active_p2p_networks()):
-        return True
-    if addr.version == 6 and addr.is_link_local:
-        return True
-    lan_flag = STATE_DIR / "lan_fallback_active.flag"
-    if lan_flag.exists():
-        try:
-            ts = float(lan_flag.read_text(encoding="utf-8").strip())
-            if (time.time() - ts) < 180.0 and addr.version == 4:
-                rfc1918 = (
-                    ipaddress.ip_network("10.0.0.0/8"),
-                    ipaddress.ip_network("172.16.0.0/12"),
-                    ipaddress.ip_network("192.168.0.0/16"),
-                )
-                if any(addr in net for net in rfc1918):
-                    return True
-        except Exception:
-            pass
-    return False
+    except Exception:
+        return False
 
 def write_bound_port_file(filename: str, value):
     try:
@@ -1684,6 +1821,32 @@ def write_bound_port_file(filename: str, value):
         tmp.replace(target)
     except Exception:
         pass
+
+CLIENT_SLOTS = threading.BoundedSemaphore(16)
+
+def serve_tls_client(raw, addr, is_p2p_proxy):
+    try:
+        raw.settimeout(15.0)
+        set_high_throughput_sockbufs(raw)
+        if not is_p2p_proxy:
+            ip = str(addr[0]).replace("::ffff:", "")
+            if not is_authorized_peer_ip(ip):
+                raw.close()
+                return
+        with ctx.wrap_socket(raw, server_side=True) as tls:
+            if not is_p2p_proxy:
+                if not is_authorized_peer_ip(ip):
+                    return
+                session = load_active_p2p_session()
+                local_ip = ipaddress.ip_address(tls.getsockname()[0].replace("::ffff:", "").split("%", 1)[0])
+                if not session or local_ip not in ipaddress.ip_network(session["cidr"], strict=False):
+                    return
+            handle_client(tls, addr, is_p2p_proxy)
+    except Exception:
+        raw.close()
+    finally:
+        CLIENT_SLOTS.release()
+
 
 def serve_port(bind_port: int, is_p2p_proxy: bool, unix_sock_path=None, on_bound=None):
     is_unix = bool(is_p2p_proxy and unix_sock_path is not None)
@@ -1712,10 +1875,7 @@ def serve_port(bind_port: int, is_p2p_proxy: bool, unix_sock_path=None, on_bound
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         set_high_throughput_sockbufs(sock)
         bind_host = "127.0.0.1"
-        try:
-            sock.bind((bind_host, bind_port))
-        except OSError:
-            sock.bind((bind_host, 0))
+        sock.bind((bind_host, bind_port))
         actual_port = sock.getsockname()[1]
         write_bound_port_file("finder_proxy_port", actual_port)
         bind_desc = f"127.0.0.1:{actual_port}"
@@ -1725,10 +1885,7 @@ def serve_port(bind_port: int, is_p2p_proxy: bool, unix_sock_path=None, on_bound
         sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         set_high_throughput_sockbufs(sock)
         bind_host = "::"
-        try:
-            sock.bind((bind_host, bind_port))
-        except OSError:
-            sock.bind((bind_host, 0))
+        sock.bind((bind_host, bind_port))
         actual_port = sock.getsockname()[1]
         write_bound_port_file("mac_rx_port", actual_port)
         bind_desc = f"*:{actual_port}"
@@ -1750,17 +1907,16 @@ def serve_port(bind_port: int, is_p2p_proxy: bool, unix_sock_path=None, on_bound
                         print(f"[-] Dropping non-loopback connection to internal proxy: {addr[0]}")
                         raw.close()
                         continue
-                else:
-                    if not is_authorized_peer_ip(peer_ip):
-                        print(f"[-] Dropping connection from unauthorized non-P2P address: {addr[0]}")
-                        raw.close()
-                        continue
                 raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            raw.settimeout(15.0)
-            set_high_throughput_sockbufs(raw)
-            tls = ctx.wrap_socket(raw, server_side=True)
-            threading.Thread(target=handle_client, args=(tls, addr, is_p2p_proxy), daemon=True).start()
+            if not CLIENT_SLOTS.acquire(blocking=False):
+                raw.close()
+                continue
+            try:
+                threading.Thread(target=serve_tls_client, args=(raw, addr, is_p2p_proxy), daemon=True).start()
+            except Exception:
+                CLIENT_SLOTS.release()
+                raise
         except Exception:
             raw.close()
 
@@ -1802,7 +1958,8 @@ def get_awdl_instance_id() -> str:
         pass
     return inst_id
 
-def read_awdl_bridge_port(default_port: int = 8774) -> int:
+def read_awdl_bridge_port() -> int:
+    """OS-assigned AWDL bridge port published by the daemon; 0 when not yet published."""
     pf = STATE_DIR / "awdl_bridge_port"
     try:
         if pf.exists():
@@ -1811,7 +1968,7 @@ def read_awdl_bridge_port(default_port: int = 8774) -> int:
                 return p
     except Exception:
         pass
-    return default_port
+    return 0
 
 def watch_awdl_mdns():
     pid_file = STATE_DIR / "awdl-mdns.pid"
@@ -1844,7 +2001,10 @@ def watch_awdl_mdns():
                     pid_file.unlink(missing_ok=True)
                 time.sleep(2.0)
                 continue
-            bridge_port = read_awdl_bridge_port(8774)
+            bridge_port = read_awdl_bridge_port()
+            if bridge_port <= 0:
+                time.sleep(2.0)
+                continue
             out = subprocess.check_output(["ifconfig", "awdl0"], text=True, stderr=subprocess.DEVNULL)
             new_ip = None
             for line in out.splitlines():
@@ -1874,7 +2034,7 @@ threading.Thread(target=serve_port, args=(PROXY_PORT, True, FINDER_PROXY_SOCK), 
 serve_port(PORT, False)
 PYEOF
   echo $! >"$PID_FILE"
-  echo "[+] 5GHz Wi-Fi Direct P2P Receiver ($PORT default) + Native Finder Share Proxy ($PROXY_PORT default) running."
+  echo "[+] 5GHz Wi-Fi Direct P2P Receiver (OS-assigned port, see $STATE_DIR/mac_rx_port) + Native Finder Share Proxy running."
 }
 
 MODE="${1:-status}"
@@ -1893,9 +2053,9 @@ case "$MODE" in
     ;;
   status)
     echo "=== GlideDrop (5GHz Wi-Fi Direct + BLE L2CAP + Native Finder Share Bridge) Status ==="
-    _rx_port="$(cat "$STATE_DIR/mac_rx_port" 2>/dev/null || echo "$PORT")"
+    _rx_port="$(cat "$STATE_DIR/mac_rx_port" 2>/dev/null || echo "unassigned")"
     _fp_sock="$(cat "$STATE_DIR/finder_proxy_sock" 2>/dev/null || echo "$STATE_DIR/finder_proxy.sock")"
-    _awdl_port="$(cat "$STATE_DIR/awdl_bridge_port" 2>/dev/null || echo "8774")"
+    _awdl_port="$(cat "$STATE_DIR/awdl_bridge_port" 2>/dev/null || echo "unassigned")"
     _awdl_id="$(cat "$STATE_DIR/awdl_instance_id" 2>/dev/null || echo "unregistered")"
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
       echo "5GHz P2P Receiver:    RUNNING (PID $(cat "$PID_FILE"), port $_rx_port -> ~/Downloads, Unix Proxy $_fp_sock)"
@@ -2068,7 +2228,7 @@ if peer_pin is None:
         except Exception:
             pass
 
-def parse_peer_target(raw_peer: str, default_port: int = 8771):
+def parse_peer_target(raw_peer: str):
     s = str(raw_peer or "").strip()
     if not s:
         raise ValueError("Empty peer target")
@@ -2081,16 +2241,17 @@ def parse_peer_target(raw_peer: str, default_port: int = 8771):
         if rest.startswith(":"):
             port_val = int(rest[1:].strip())
         elif not rest:
-            port_val = default_port
+            raise ValueError(f"Peer target is missing a port: {raw_peer}")
         else:
             raise ValueError(f"Unexpected trailing characters in peer target: {raw_peer}")
     elif s.count(":") == 1:
         host_part, _, port_s = s.partition(":")
         host = host_part.strip()
-        port_val = int(port_s.strip()) if port_s.strip() else default_port
+        if not port_s.strip():
+            raise ValueError(f"Peer target is missing a port: {raw_peer}")
+        port_val = int(port_s.strip())
     else:
-        host = s
-        port_val = default_port
+        raise ValueError(f"Peer target is missing a port: {raw_peer}")
     if not host or not (1 <= port_val <= 65535):
         raise ValueError(f"Invalid peer target or port: {raw_peer}")
     return host, port_val
@@ -2104,16 +2265,45 @@ def load_active_p2p_session(max_age: float = 1800.0):
         if not isinstance(obj, dict):
             return None
         updated = float(obj.get("updatedAt") or 0.0)
-        if (time.time() - updated) > max_age:
+        if not 0 <= time.time() - updated <= max_age:
             return None
+        iface = str(obj.get("interface") or obj.get("interfaceName") or "")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,31}", iface):
+            return None
+        if not str(obj.get("ssid") or "").startswith("DIRECT-"):
+            return None
+        net = ipaddress.ip_network(str(obj.get("cidr") or ""), strict=False)
+        gateway = ipaddress.ip_address(str(obj.get("gatewayIp") or ""))
+        if (net.prefixlen == 0 or gateway not in net or gateway.is_loopback
+                or gateway.is_unspecified or gateway.is_multicast or gateway.is_link_local):
+            return None
+        if not 1 <= int(obj.get("httpsPort") or 0) <= 65535:
+            return None
+        obj["interface"] = iface
         return obj
     except Exception:
         return None
 
+
+def validate_peer_route(host: str, port: int):
+    session = load_active_p2p_session()
+    if not session:
+        raise ValueError("No OS-confirmed Wi-Fi Direct session")
+    addr = ipaddress.ip_address(str(host).split("%", 1)[0])
+    if addr != ipaddress.ip_address(session["gatewayIp"]) or port != int(session["httpsPort"]):
+        raise ValueError("Peer endpoint does not match the active Wi-Fi Direct session")
+    family = "-inet6" if addr.version == 6 else "-inet"
+    route = subprocess.check_output(["/sbin/route", "-n", "get", family, str(addr)], text=True, timeout=3.0)
+    match = re.search(r"^\s*interface:\s*(\S+)\s*$", route, re.MULTILINE)
+    if not match or match.group(1) != session["interface"]:
+        raise ValueError("Peer route is not on the confirmed Wi-Fi Direct interface")
+    return session
+
+
 def load_outgoing_p2p_token(target_host: str = "") -> str:
-    env_tok = os.environ.get("GLIDEDROP_P2P_TOKEN", "").strip().lower()
-    if re.fullmatch(r"[0-9a-f]{64}", env_tok):
-        return env_tok
+    # Secrets are never read from the environment (visible via process inspection);
+    # the daemon hands the bearer token over through a mode-0600 state file.
+    os.environ.pop("GLIDEDROP_P2P_TOKEN", None)
     now = time.time()
     tf = STATE_DIR / "p2p_outgoing_token.json"
     try:
@@ -2154,15 +2344,15 @@ def discover_android(expected_fp=None):
     if session:
         gw = str(session.get("gatewayIp") or "").strip().strip("[]")
         try:
-            hp = int(session.get("httpsPort") or 8771)
+            hp = int(session.get("httpsPort") or 0)
         except Exception:
-            hp = 8771
+            hp = 0
         if gw and 1 <= hp <= 65535:
             candidates.append((gw, hp))
     for cand_host, cand_port in candidates:
         try:
-            with socket.create_connection((cand_host, cand_port), timeout=0.25):
-                return cand_host, cand_port
+            validate_peer_route(cand_host, cand_port)
+            return cand_host, cand_port
         except Exception:
             pass
     raise RuntimeError("Deferring to BLE L2CAP + 5GHz Wi-Fi Direct P2P")
@@ -2193,11 +2383,22 @@ try:
     total_bytes = sum(f.stat().st_size for f in files)
 
     if peer_override:
-        host, port = parse_peer_target(peer_override, 8771)
+        host, port = parse_peer_target(peer_override)
     else:
         host, port = discover_android(expected_fp)
 
+    try:
+        p2p_session = validate_peer_route(host, port)
+    except Exception as e:
+        print(f"[-] Refusing non-P2P peer route: {e}", file=sys.stderr)
+        sys.exit(46)
+    if not expected_fp:
+        print("[-] Refusing HTTPS without a session TLS fingerprint", file=sys.stderr)
+        sys.exit(46)
     outgoing_token = load_outgoing_p2p_token(host)
+    if not outgoing_token:
+        print("[-] Missing active P2P bearer token", file=sys.stderr)
+        sys.exit(46)
     token_hdr = f"X-GlideDrop-Token: {outgoing_token}\r\n" if outgoing_token else ""
     clean_hdr_host = host.split("%", 1)[0]
     host_header = f"[{clean_hdr_host}]:{port}" if ":" in clean_hdr_host else f"{clean_hdr_host}:{port}"
@@ -2219,22 +2420,51 @@ try:
         pass
 
     def read_http_response(f):
-        status_line = f.readline().decode("iso-8859-1").strip()
-        if not status_line:
-            if in_ask_or_upload:
-                print(f"[-] Transfer cancelled or connection closed by {peer_name}", file=sys.stderr)
-                sys.exit(44)
-            sys.exit("[-] Peer closed connection during handshake")
+        def response_line():
+            line = f.readline(8193)
+            if not line:
+                raise EOFError("Truncated HTTP response")
+            if len(line) > 8192 or not line.endswith(b"\r\n"):
+                raise ValueError("Oversized or malformed HTTP response line")
+            raw = line[:-2]
+            if any(c < 32 and c != 9 for c in raw) or b"\x7f" in raw:
+                raise ValueError("Control character in HTTP response")
+            return raw.decode("iso-8859-1")
+        status_line = response_line()
+        if not re.fullmatch(r"HTTP/1\.[01] [1-5][0-9]{2}(?: [^\r\n]*)?", status_line):
+            raise ValueError("Malformed HTTP response status")
         headers = {}
-        while True:
-            line = f.readline().decode("iso-8859-1").strip()
+        total = len(status_line) + 2
+        for count in range(65):
+            line = response_line()
+            total += len(line) + 2
+            if total > 16384:
+                raise ValueError("HTTP response headers exceed limit")
             if not line:
                 break
+            if count == 64 or ":" not in line:
+                raise ValueError("Too many or malformed HTTP response headers")
             k, v = line.split(":", 1)
-            headers[k.strip().lower()] = v.strip()
-        clen = int(headers.get("content-length", "0"))
-        body = f.read(clen) if clen else b""
-        return status_line, body
+            if not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", k):
+                raise ValueError("Invalid HTTP response header")
+            k = k.lower()
+            if k in headers and k in ("content-length", "transfer-encoding"):
+                raise ValueError("Duplicate HTTP framing header")
+            headers[k] = v.strip()
+        if "transfer-encoding" in headers:
+            raise ValueError("Unsupported HTTP response transfer encoding")
+        length = headers.get("content-length", "")
+        if not re.fullmatch(r"[0-9]{1,10}", length) or int(length) > 1048576:
+            raise ValueError("Invalid or oversized HTTP response Content-Length")
+        remaining = int(length)
+        body = bytearray()
+        while remaining:
+            part = f.read(min(65536, remaining))
+            if not part:
+                raise EOFError("Truncated HTTP response body")
+            body.extend(part)
+            remaining -= len(part)
+        return status_line, bytes(body)
 
     t0 = time.time()
     raw = None
@@ -2264,6 +2494,14 @@ try:
                             break
                         except Exception:
                             continue
+                validate_peer_route(host, port)
+                if sys.platform != "darwin":
+                    raise ValueError("Wi-Fi Direct interface binding requires macOS")
+                iface_index = socket.if_nametoindex(p2p_session["interface"])
+                if family == socket.AF_INET:
+                    cand.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_BOUND_IF", 25), iface_index)
+                else:
+                    cand.setsockopt(socket.IPPROTO_IPV6, getattr(socket, "IPV6_BOUND_IF", 125), iface_index)
                 cand.connect(sockaddr)
                 raw = cand
                 break
@@ -2303,9 +2541,9 @@ try:
             disc = plistlib.dumps({"DeviceSupportFlags": 111611}, fmt=plistlib.FMT_BINARY)
             s.sendall(f"POST /Discover HTTP/1.1\r\nHost: {host_header}\r\n{token_hdr}Content-Type: application/octet-stream\r\nContent-Length: {len(disc)}\r\nConnection: keep-alive\r\n\r\n".encode() + disc)
             st, body = read_http_response(f)
-            if "401" in st:
+            if st.split(" ", 2)[1] == "401":
                 sys.exit("[-] Unauthorized: peer rejected X-GlideDrop-Token (401)")
-            if "200" not in st:
+            if st.split(" ", 2)[1] != "200":
                 sys.exit(f"[-] Peer /Discover failed: {st}")
             peer_name = plistlib.loads(body).get("ReceiverComputerName", "Android Device") if body else "Android Device"
             print(f"[+] Discovered receiver: {peer_name} ({st})")
@@ -2337,10 +2575,10 @@ try:
             in_ask_or_upload = True
             s.sendall(f"POST /Ask HTTP/1.1\r\nHost: {host_header}\r\n{token_hdr}Content-Type: application/octet-stream\r\nContent-Length: {len(ask)}\r\nConnection: keep-alive\r\n\r\n".encode() + ask)
             st2, _ = read_http_response(f)
-            if "403" in st2:
+            if st2.split(" ", 2)[1] == "403":
                 print(f"[-] Transfer declined by {peer_name}")
                 sys.exit(43)
-            if "200" not in st2:
+            if st2.split(" ", 2)[1] != "200":
                 sys.exit(f"[-] Transfer declined or failed: {st2}")
             if files:
                 label = files[0].name
@@ -2417,6 +2655,9 @@ try:
                 s.sendall(b"0\r\n\r\n")
                 write_progress(True, "Sending", label, tot, tot, 0, 0, 99, fcount, phase="Finalizing transfer…", peer_name=peer_name, is_connecting=False)
                 st3, _ = read_http_response(f)
+                if st3.split(" ", 2)[1] != "200":
+                    print(f"[-] Peer rejected /Upload: {st3}", file=sys.stderr)
+                    sys.exit(47)
                 elapsed = time.time() - t0
                 print(f"[+] /Upload complete: {st3} ({elapsed:.2f}s)")
                 names = ", ".join(p.name for p in files)
@@ -2453,6 +2694,10 @@ except ssl.SSLError as e:
     print(f"[-] FATAL TLS/pinning verification failure: {e}", file=sys.stderr)
     terminal_exit_code = 46
     sys.exit(46)
+except ValueError as e:
+    print(f"[-] Invalid peer response or transfer input: {e}", file=sys.stderr)
+    terminal_exit_code = 47
+    sys.exit(47)
 except RuntimeError as e:
     if not peer_override and "Deferring to BLE" in str(e):
         print(f"[*] {e}")
@@ -2463,7 +2708,7 @@ finally:
     _active_raw_sock[0] = None
     # Preserve transfer_progress.json when falling back from glidedrop.sh to "$BLE_BIN" send.
     # Only clear progress when --peer is set, transfer succeeded, or terminal decline/cancel/input/pinning error occurred.
-    if peer_override or transfer_succeeded or terminal_exit_code in (43, 44, 45, 46):
+    if peer_override or transfer_succeeded or terminal_exit_code in (43, 44, 45, 46, 47):
         write_progress(False)
 PYEOF
     PY_PID=$!
@@ -2478,7 +2723,7 @@ PYEOF
       if [[ "$rc" -eq 45 ]]; then
         exit 1
       fi
-      if [[ "$rc" -eq 43 || "$rc" -eq 44 || "$rc" -eq 46 || "$HAS_PEER_ARG" -eq 1 ]]; then
+      if [[ "$rc" -eq 43 || "$rc" -eq 44 || "$rc" -eq 46 || "$rc" -eq 47 || "$HAS_PEER_ARG" -eq 1 ]]; then
         if [[ "$HAS_PEER_ARG" -ne 1 ]]; then
           rm -f "$STATE_DIR/cancel_transfer.flag"
         fi

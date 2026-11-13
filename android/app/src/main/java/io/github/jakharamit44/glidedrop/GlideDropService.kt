@@ -21,6 +21,7 @@ class GlideDropService : Service() {
         private const val CHANNEL_STATUS = "glidedrop_status"
         private const val CHANNEL_RX = "glidedrop_rx"
         private const val NOTIF_ID_STATUS = 1001
+        private const val NOTIF_ID_CONSENT = 1998
         private var rxNotifId = 2000
 
         @Volatile
@@ -136,11 +137,43 @@ class GlideDropService : Service() {
                 nm.notify(1999, progressNotif)
             }
         }
+        node.onConsentNotification = { title, body ->
+            if (title == null) {
+                nm.cancel(NOTIF_ID_CONSENT)
+            } else {
+                val consentIntent = PendingIntent.getActivity(
+                    this,
+                    3,
+                    Intent(this, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    },
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+                val consentNotif = NotificationCompat.Builder(this, CHANNEL_RX)
+                    .setSmallIcon(R.mipmap.ic_launcher)
+                    .setContentTitle(title)
+                    .setContentText(body.orEmpty())
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(body.orEmpty()))
+                    .setCategory(NotificationCompat.CATEGORY_CALL)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setContentIntent(consentIntent)
+                    .setAutoCancel(true)
+                    .setTimeoutAfter(90_000L)
+                    .build()
+                nm.notify(NOTIF_ID_CONSENT, consentNotif)
+            }
+        }
         node.onItemReceived = { item ->
             nm.cancel(1999)
             val notifId = 2000 + (rxNotifId++ % 50)
             val targetIntent = if (item.isUrl) {
                 Intent(Intent.ACTION_VIEW, item.pathOrUrl.toUri())
+            } else if (item.pathOrUrl.startsWith("content://")) {
+                val uri = item.pathOrUrl.toUri()
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, contentResolver.getType(uri) ?: "application/octet-stream")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
             } else {
                 Intent(this, MainActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -193,6 +226,7 @@ class GlideDropService : Service() {
         val node = activeNode ?: peekNode()
         node?.onTransferProgress = null
         node?.onItemReceived = null
+        node?.onConsentNotification = null
         node?.stop()
         activeNode = null
         runCatching {

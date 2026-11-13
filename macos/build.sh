@@ -56,6 +56,10 @@ cat > "$APP_DIR/Contents/Info.plist" << PLIST
   <true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
   <string>GlideDrop uses Bluetooth LE L2CAP to discover and transfer files with Android devices.</string>
+  <key>NSLocationUsageDescription</key>
+  <string>GlideDrop needs Location access so macOS lets it see Wi-Fi network names when joining a nearby phone's Wi-Fi Direct group and returning to your home Wi-Fi. Your location is never read or stored.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>GlideDrop needs Location access so macOS lets it see Wi-Fi network names when joining a nearby phone's Wi-Fi Direct group and returning to your home Wi-Fi. Your location is never read or stored.</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>GlideDrop requires local network access to discover nearby devices and transfer files over high-speed Wi-Fi Direct and local sockets.</string>
 </dict>
