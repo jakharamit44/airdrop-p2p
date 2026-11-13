@@ -2,7 +2,7 @@
 
 All notable changes to GlideDrop are documented in this file.
 
-## [Unreleased]
+## [v3.0.0] - 2026-11-13
 ### Changed (Mac -> Android P2P transfer fix; Mac and Android must be updated together)
 - **W2P2 protocol v3**: HKDF-SHA256 derives the AES key, bearer token and a 6-digit verification code, bound to a random session ID and both TLS fingerprints. Older builds are rejected with an update-required reply; there is no downgrade.
 - **Phone consent**: consent dialog shows the verification code; a Mac can be trusted by TLS fingerprint.
