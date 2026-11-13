@@ -367,4 +367,15 @@ class GlideDropNodeRegressionTest {
             assertFalse(ip, GlideDropNode.isReceiverRequestClientAllowed(ip, subnets, hasActiveSessionToken = true))
         }
     }
+
+    @Test
+    fun clearHistoryOnlyTouchesTheListNeverFiles() {
+        val rel = "src/main/java/io/github/jakharamit44/glidedrop/GlideDropNode.kt"
+        val src = listOf(java.io.File(rel), java.io.File("app/$rel")).first { it.exists() }.readText()
+        val body = src.substringAfter("fun clearReceivedItems(").substringBefore("fun clearLogs()")
+        for (forbidden in listOf("delete(", "deleteRecursively", "contentResolver", "resolver", "MediaStore", "releasePersistableUriPermission")) {
+            org.junit.Assert.assertFalse("clearReceivedItems must not use $forbidden", body.contains(forbidden))
+        }
+        org.junit.Assert.assertTrue(body.contains("filter"))
+    }
 }

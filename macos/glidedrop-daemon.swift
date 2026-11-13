@@ -5821,6 +5821,31 @@ struct MacStorageSummary: Equatable {
     }
 }
 
+/// Removes entries from the history log only (never the transferred files themselves).
+/// filter: 0 = everything, 1 = received only, 2 = sent only (matches the History tab pills).
+func clearHistoryLog(filter: Int, stateDir: URL = STATE_DIR) {
+    let log = stateDir.appendingPathComponent("received.log")
+    guard filter == 1 || filter == 2 else {
+        try? FileManager.default.removeItem(at: log)
+        return
+    }
+    guard let raw = try? String(contentsOf: log, encoding: .utf8) else { return }
+    let kept = raw.split(separator: "\n", omittingEmptySubsequences: true).filter { line in
+        let parts = line.split(separator: "\t").map(String.init)
+        let isOut = parts.count >= 5 ? (parts[4] == "sent") : false
+        return filter == 1 ? isOut : !isOut
+    }
+    if kept.isEmpty {
+        try? FileManager.default.removeItem(at: log)
+        return
+    }
+    let tmp = stateDir.appendingPathComponent("received.log.tmp")
+    if (try? (kept.joined(separator: "\n") + "\n").write(to: tmp, atomically: false, encoding: .utf8)) != nil {
+        _ = chmod(tmp.path, 0o600)
+        if Darwin.rename(tmp.path, log.path) != 0 { try? FileManager.default.removeItem(at: tmp) }
+    }
+}
+
 struct MacHistoryEntry: Identifiable, Hashable {
     let id: String
     let timestamp: Date
@@ -7771,8 +7796,15 @@ struct MacGlideDropMainView: View {
                 .controlSize(.small)
                 if !vm.historyEntries.isEmpty {
                     Button("Clear") {
-                        try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent("received.log"))
-                        vm.historyEntries = []
+                        // Only clears the history list (received.log). Files in ~/Downloads are never touched.
+                        clearHistoryLog(filter: vm.historyFilter)
+                        vm.historyEntries = vm.historyEntries.filter { e in
+                            switch vm.historyFilter {
+                            case 1: return e.isOutgoing
+                            case 2: return !e.isOutgoing
+                            default: return false
+                            }
+                        }
                     }
                     .controlSize(.small)
                 }

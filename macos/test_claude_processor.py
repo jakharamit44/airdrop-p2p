@@ -1806,6 +1806,7 @@ os.environ.pop("GLIDEDROP_P2P_TOKEN", None)
             self.assertFalse((rx_state / "finder_proxy_port").exists())
 
             cli_ctx = ssl.create_default_context()
+            cli_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             cli_ctx.check_hostname = False
             cli_ctx.verify_mode = ssl.CERT_NONE
             raw_cli = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

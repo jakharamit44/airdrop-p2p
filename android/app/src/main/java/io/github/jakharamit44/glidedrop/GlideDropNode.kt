@@ -1522,20 +1522,34 @@ class GlideDropNode(private val context: Context) {
             .toList()
     }
 
+    private fun serializeHistory(items: List<ReceivedItem>): String = items.joinToString("\n") {
+        "${it.title.replace('\t', ' ')}\t${it.pathOrUrl.replace('\t', ' ')}\t${it.isUrl}\t${it.sizeBytes}\t${it.isOutgoing}\t${it.peerName.replace('\t', ' ')}\t${it.timestampMs}"
+    }
+
     private fun recordHistoryItem(item: ReceivedItem) {
         _receivedItems.update { curr ->
             val next = (listOf(item) + curr).take(60)
-            val serialized = next.joinToString("\n") {
-                "${it.title.replace('\t', ' ')}\t${it.pathOrUrl.replace('\t', ' ')}\t${it.isUrl}\t${it.sizeBytes}\t${it.isOutgoing}\t${it.peerName.replace('\t', ' ')}\t${it.timestampMs}"
-            }
-            prefs.edit { putString("history_v2", serialized) }
+            prefs.edit { putString("history_v2", serializeHistory(next)) }
             next
         }
     }
 
-    fun clearReceivedItems() {
-        _receivedItems.value = emptyList()
-        prefs.edit { remove("history_v2") }
+    /**
+     * Removes entries from the in-app history list only. It never deletes, moves or revokes access to
+     * the received files themselves (Downloads/GlideDrop stays untouched).
+     * [filter]: 0 = all entries, 1 = received only, 2 = sent only (matches the History tab chips).
+     */
+    fun clearReceivedItems(filter: Int = 0) {
+        _receivedItems.update { curr ->
+            val next = when (filter) {
+                1 -> curr.filter { it.isOutgoing }
+                2 -> curr.filter { !it.isOutgoing }
+                else -> emptyList()
+            }
+            if (next.isEmpty()) prefs.edit { remove("history_v2") }
+            else prefs.edit { putString("history_v2", serializeHistory(next)) }
+            next
+        }
     }
 
     fun clearLogs() {

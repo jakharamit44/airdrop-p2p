@@ -1781,6 +1781,7 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
             pass
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 ctx.load_cert_chain(CERT_FILE, KEY_FILE)
 try:
     if hasattr(ctx, "set_ciphersuites"):
@@ -2409,6 +2410,7 @@ try:
 
     print(f"[+] Connecting to Android peer over 5GHz Wi-Fi at {host}:{port}...")
     ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if expected_fp:
         # Self-signed P2P certificates are verified immediately post-handshake against the W2P2 SHA-256 pin.
         ctx.check_hostname = False

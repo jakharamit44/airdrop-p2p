@@ -15,7 +15,7 @@ android {
         applicationId = "io.github.jakharamit44.glidedrop"
         minSdk = 31
         targetSdk = 37
-        versionCode = 301
+        versionCode = 302
         versionName = appVersionName
     }
 

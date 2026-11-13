@@ -2,6 +2,11 @@
 
 All notable changes to GlideDrop are documented in this file.
 
+## [v3.0.2]
+### Fixed
+- **History "Clear"** (Android and macOS) now clears only the history list, and only the entries in the selected tab (All / Received / Sent). It never deletes, moves or revokes access to the transferred files. Android shows "History cleared. Your files were not deleted."
+### Security
+- Python TLS contexts (receiver, sender and the Finder-proxy test client) now require TLS 1.2 or newer (CodeQL `py/insecure-protocol`).
 ## [v3.0.1]
 ### Fixed
 - **macOS asked for Location permission on every launch/rebuild**: the ad-hoc signature used a per-build hash as its identity, so macOS treated each build as a new app. The app is now signed with a fixed identifier and designated requirement, and only the signed app (not the bare daemon binary) requests Location, at most once per run and never again after the user decides. If you were prompted repeatedly before, allow GlideDrop once in System Settings > Privacy & Security > Location Services (toggle it off and on if it is already listed).

@@ -1320,6 +1320,26 @@ struct GlideDropDaemonTests {
             check(src.contains("CLLocationManager"), "[EXPLORE] Mac never requests Location authorization (no CLLocationManager)")
             if failures > before { print("[EXPLORE] Swift bug-condition checks FAILED as expected on unfixed code (\(failures - before))") }
         }
+        do {
+            // History Clear removes log lines only, never the transferred files.
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("gd-hist-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let payload = dir.appendingPathComponent("keep.bin")
+            try? Data("x".utf8).write(to: payload)
+            let log = dir.appendingPathComponent("received.log")
+            let lines = ["1\tFILE\t\(payload.path)\t1\treceived\tPhone", "2\tFILE\t/tmp/out.bin\t1\tsent\tPhone"]
+            func seed() { try? (lines.joined(separator: "\n") + "\n").write(to: log, atomically: true, encoding: .utf8) }
+            seed(); clearHistoryLog(filter: 1, stateDir: dir)
+            let afterRx = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+            check(afterRx.contains("sent") && !afterRx.contains("received"), "Clear on Received keeps Sent history")
+            seed(); clearHistoryLog(filter: 2, stateDir: dir)
+            let afterTx = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+            check(afterTx.contains("received") && !afterTx.contains("sent"), "Clear on Sent keeps Received history")
+            seed(); clearHistoryLog(filter: 0, stateDir: dir)
+            check(!FileManager.default.fileExists(atPath: log.path), "Clear on All removes the history log")
+            check(FileManager.default.fileExists(atPath: payload.path), "Clearing history never deletes transferred files")
+        }
         if failures > 0 {
             fputs("[SUMMARY] \(failures) Swift regression check(s) FAILED\n", stderr)
             exit(1)

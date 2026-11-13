@@ -1040,7 +1040,10 @@ fun GlideDropScreen(
                         cm?.setPrimaryClip(ClipData.newPlainText("GlideDrop", txt))
                         Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
                     },
-                    onClearAll = { node.clearReceivedItems() }
+                    onClearAll = { f ->
+                        node.clearReceivedItems(f)
+                        Toast.makeText(context, "History cleared. Your files were not deleted.", Toast.LENGTH_SHORT).show()
+                    }
                 )
                 else -> SettingsScreenTab(
                     running = running,
@@ -2697,7 +2700,7 @@ private fun TransfersHistoryScreen(
     onOpenItem: (ReceivedItem) -> Unit,
     onShareItem: (ReceivedItem) -> Unit,
     onCopyText: (String) -> Unit,
-    onClearAll: () -> Unit
+    onClearAll: (Int) -> Unit
 ) {
     val c = LocalDsColors.current
     val filtered = remember(items, filter, query) {
@@ -2765,7 +2768,7 @@ private fun TransfersHistoryScreen(
                     color = c.textDanger,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.clickable(onClick = onClearAll)
+                    modifier = Modifier.clickable { onClearAll(filter) }
                 )
             }
         }
