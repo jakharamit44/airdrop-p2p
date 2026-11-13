@@ -1456,20 +1456,28 @@ func isLocationAuthorizedForWifiNames() -> Bool {
 /// Requests Location authorization (required for macOS to reveal SSID/BSSID) before the first join.
 /// Returns true when authorized. If denied or undetermined after the wait, logs where to enable it;
 /// the join still proceeds because association is confirmed from interface state.
+private var locationPromptRequested = false
+
 @discardableResult
 func requestLocationAuthorizationForWifi(timeout: TimeInterval = 8.0) -> Bool {
     if isLocationAuthorizedForWifiNames() { return true }
-    DispatchQueue.main.async {
-        if locationAuthManager == nil { locationAuthManager = CLLocationManager() }
-        locationAuthManager?.requestWhenInUseAuthorization()
-        locationAuthManager?.startUpdatingLocation()
-    }
-    if !Thread.isMainThread {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if isLocationAuthorizedForWifiNames() { return true }
-            if CLLocationManager().authorizationStatus != .notDetermined { break }
-            Thread.sleep(forTimeInterval: 0.2)
+    // Only the signed app bundle may ask. The bare ~/.glidedrop/glidedrop-daemon binary is a
+    // different code identity, so asking from it creates a second, separate Location prompt.
+    // Ask at most once per process, and never again once the user has decided (denied/restricted).
+    guard Bundle.main.bundleIdentifier != nil else { return false }
+    let status = CLLocationManager().authorizationStatus
+    if status == .notDetermined && !locationPromptRequested {
+        locationPromptRequested = true
+        DispatchQueue.main.async {
+            if locationAuthManager == nil { locationAuthManager = CLLocationManager() }
+            locationAuthManager?.requestWhenInUseAuthorization()
+        }
+        if !Thread.isMainThread {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                if CLLocationManager().authorizationStatus != .notDetermined { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
         }
     }
     if isLocationAuthorizedForWifiNames() { return true }

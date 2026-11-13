@@ -2,6 +2,9 @@
 
 All notable changes to GlideDrop are documented in this file.
 
+## [v3.0.1]
+### Fixed
+- **macOS asked for Location permission on every launch/rebuild**: the ad-hoc signature used a per-build hash as its identity, so macOS treated each build as a new app. The app is now signed with a fixed identifier and designated requirement, and only the signed app (not the bare daemon binary) requests Location, at most once per run and never again after the user decides. If you were prompted repeatedly before, allow GlideDrop once in System Settings > Privacy & Security > Location Services (toggle it off and on if it is already listed).
 ## [v3.0.0] - 2026-11-13
 ### Changed (Mac -> Android P2P transfer fix; Mac and Android must be updated together)
 - **W2P2 protocol v3**: HKDF-SHA256 derives the AES key, bearer token and a 6-digit verification code, bound to a random session ID and both TLS fingerprints. Older builds are rejected with an update-required reply; there is no downgrade.

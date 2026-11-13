@@ -4,25 +4,25 @@ Send files, photos, videos, links, and text notes directly between Android and M
 
 **Website & Documentation:** [jakharamit44.github.io/glidedrop](https://jakharamit44.github.io/glidedrop/)
 
-[![Release: v3.0.0](https://img.shields.io/badge/Release-v3.0.0-5360F5.svg)](https://github.com/jakharamit44/glidedrop/releases/latest)
+[![Release: v3.0.1](https://img.shields.io/badge/Release-v3.0.1-5360F5.svg)](https://github.com/jakharamit44/glidedrop/releases/latest)
 [![Platform: Android 12+](https://img.shields.io/badge/Android-12%2B%20%28API%2031%2B%29-16A34A.svg)](https://github.com/jakharamit44/glidedrop/releases/latest)
 [![Platform: macOS 13+](https://img.shields.io/badge/macOS-13%2B%20%28Apple%20Silicon%20%26%20Intel%29-0284C7.svg)](https://github.com/jakharamit44/glidedrop/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-334155.svg)](LICENSE)
 [![Status: Public Beta](https://img.shields.io/badge/Status-Public%20Beta-D97706.svg)](SECURITY.md)
 
 > [!WARNING]
-> **Public Beta (v3.0.0)**
+> **Public Beta (v3.0.1)**
 > Core BLE L2CAP, 5 GHz Wi-Fi Direct, and TLS transport layers are functional and covered by unit tests, while OEM Wi-Fi chipset and macOS edge cases continue to be refined. Review [SECURITY.md](SECURITY.md) before transferring sensitive data in untrusted RF spaces, and open issues via [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Downloads (v3.0.0)
+## Downloads (v3.0.1)
 
 Pre-compiled binaries and SHA-256 verification hashes are available on the [latest GitHub Release](https://github.com/jakharamit44/glidedrop/releases/latest).
 
 | Platform | Package | Target Requirements | Notes |
 | :--- | :--- | :--- | :--- |
-| **Android** | [`GlideDrop-v3.0.0.apk`](https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v3.0.0.apk) | Android 12+ (API 31+) | Universal APK for Samsung, Pixel, OnePlus, Xiaomi, Motorola, and AOSP devices |
-| **macOS (PKG)** | [`GlideDrop-v3.0.0.pkg`](https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v3.0.0.pkg) | macOS 13+ (Ventura, Sonoma, Sequoia) | Installs the app in `/Applications`. The app is not notarized (see below) |
-| **macOS (DMG)** | [`GlideDrop-v3.0.0.dmg`](https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v3.0.0.dmg) | macOS 13+ (Apple Silicon & Intel) | Drag-and-drop image. The app is not notarized (see below) |
+| **Android** | [`GlideDrop-v3.0.1.apk`](https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v3.0.1.apk) | Android 12+ (API 31+) | Universal APK for Samsung, Pixel, OnePlus, Xiaomi, Motorola, and AOSP devices |
+| **macOS (PKG)** | [`GlideDrop-v3.0.1.pkg`](https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v3.0.1.pkg) | macOS 13+ (Ventura, Sonoma, Sequoia) | Installs the app in `/Applications`. The app is not notarized (see below) |
+| **macOS (DMG)** | [`GlideDrop-v3.0.1.dmg`](https://github.com/jakharamit44/glidedrop/releases/latest/download/GlideDrop-v3.0.1.dmg) | macOS 13+ (Apple Silicon & Intel) | Drag-and-drop image. The app is not notarized (see below) |
 | **Checksums** | [`SHA256SUMS.txt`](https://github.com/jakharamit44/glidedrop/releases/latest/download/SHA256SUMS.txt) | All | SHA-256 hashes for verifying downloaded packages |
 
 ### Unnotarized macOS app and Gatekeeper
@@ -62,7 +62,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for wire framing, CPIO headers,
 
 ## Key Technical Details
 
-| Component | Behavior in v3.0.0 | Source |
+| Component | Behavior in v3.0.1 | Source |
 | :--- | :--- | :--- |
 | **Radio Discovery & Fallback** | Discovers peers over Bluetooth Low Energy L2CAP CoC without a router. Transfers of 64 KiB or more negotiate a 5 GHz Band 4 Wi-Fi Direct group; smaller items, URLs, or unreachable Wi-Fi Direct peers fall back to ephemeral ECDH AES-256-GCM `ADRE` frames (`BLEK`) over BLE L2CAP (capped at 30 MB on Android). | [`GlideDropNode.kt`](android/app/src/main/java/io/github/jakharamit44/glidedrop/GlideDropNode.kt), [`glidedrop-daemon.swift`](macos/glidedrop-daemon.swift) |
 | **64-bit Large File Streaming** | Streams files up to 8 GiB with POSIX `070707` CPIO headers and switches to 64-bit extended `070764` CPIO headers above 8 GiB so 10 GB+ files move directly from file descriptors without memory buffering. | [`GlideDropCodec.kt`](android/app/src/main/java/io/github/jakharamit44/glidedrop/GlideDropCodec.kt), [`glidedrop.sh`](macos/glidedrop.sh) |

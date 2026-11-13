@@ -69,7 +69,15 @@ PLIST
 # Strip extended attributes and seal bundle with deep code signature
 echo "[+] Sealing and signing GlideDrop.app bundle..."
 xattr -cr "$APP_DIR"
-codesign --force --deep --sign - "$APP_DIR"
+# Ad-hoc signatures default to a cdhash requirement, which changes on every rebuild, so macOS
+# (TCC) treats each build as a new app and asks for Location again. Pin a stable identifier and
+# designated requirement so the grant survives rebuilds and reinstalls.
+APP_ID="io.github.jakharamit44.glidedrop.mac"
+sign_app() {
+  codesign --force --deep --sign - --identifier "$APP_ID" \
+    -r="designated => identifier \"$APP_ID\"" "$1"
+}
+sign_app "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
 
 if [ -w "/Applications" ] || [ -w "/Applications/GlideDrop.app" ]; then
@@ -77,7 +85,7 @@ if [ -w "/Applications" ] || [ -w "/Applications/GlideDrop.app" ]; then
   rm -rf "/Applications/GlideDrop.app"
   cp -R "$APP_DIR" "/Applications/GlideDrop.app"
   xattr -cr "/Applications/GlideDrop.app"
-  codesign --force --deep --sign - "/Applications/GlideDrop.app"
+  sign_app "/Applications/GlideDrop.app"
 fi
 
 echo "[+] GlideDrop.app bundle created at: $APP_DIR"

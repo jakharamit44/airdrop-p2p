@@ -3,7 +3,7 @@
 ## Public Beta Advisory
 
 > [!WARNING]
-> **Active Public Beta Stage (v3.0.0)**
+> **Active Public Beta Stage (v3.0.1)**
 > Core peer-to-peer protocols (BLE L2CAP, ECDH P-256 credential exchange, ephemeral BLE payload encryption, pinned TLS 1.2/1.3, 5 GHz Wi-Fi Direct, and the embedded proxy) are functional and backed by automated tests, while hardware and OS edge cases are still being refined.
 >
 > * Do not transfer unencrypted regulated data in hostile RF environments.
