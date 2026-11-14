@@ -90,7 +90,6 @@ class EmbeddedProxyServer internal constructor(
         private const val SOCKS_ATYP_IPV6 = 0x04
 
         private const val SOCKS_REP_SUCCESS = 0x00
-        private const val SOCKS_REP_GENERAL_FAILURE = 0x01
         private const val SOCKS_REP_NOT_ALLOWED = 0x02
         private const val SOCKS_REP_NETWORK_UNREACHABLE = 0x03
         private const val SOCKS_REP_CONNECTION_REFUSED = 0x05

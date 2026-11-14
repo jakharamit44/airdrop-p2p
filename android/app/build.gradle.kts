@@ -8,6 +8,10 @@ android {
         val vf = rootProject.file("../VERSION")
         if (vf.exists()) vf.readText().trim() else "2.0.0"
     }
+    val versionParts = appVersionName.split(".").map { it.toIntOrNull() ?: 0 }
+    val appVersionCode = (versionParts.getOrElse(0) { 3 } * 100) +
+        (versionParts.getOrElse(1) { 0 } * 10) +
+        versionParts.getOrElse(2) { 0 }
 
     namespace = "io.github.jakharamit44.glidedrop"
     compileSdk = 37
@@ -15,7 +19,7 @@ android {
         applicationId = "io.github.jakharamit44.glidedrop"
         minSdk = 31
         targetSdk = 37
-        versionCode = 302
+        versionCode = appVersionCode
         versionName = appVersionName
     }
 
@@ -75,34 +79,18 @@ kotlin {
 dependencies {
   val composeBom = platform(libs.androidx.compose.bom)
   implementation(composeBom)
-  androidTestImplementation(composeBom)
 
   // Core Android dependencies
   implementation(libs.androidx.core.ktx)
   implementation(libs.androidx.lifecycle.runtime.ktx)
-  implementation(libs.androidx.activity.compose)
-
-  // Arch Components
   implementation(libs.androidx.lifecycle.runtime.compose)
-  implementation(libs.androidx.lifecycle.viewmodel.compose)
+  implementation(libs.androidx.activity.compose)
 
   // Compose
   implementation(libs.androidx.compose.ui)
-  implementation(libs.androidx.compose.ui.tooling.preview)
   implementation(libs.androidx.compose.material3)
-  // Tooling
-  debugImplementation(libs.androidx.compose.ui.tooling)
-  // Instrumented tests
-  androidTestImplementation(libs.androidx.compose.ui.test.junit4)
-  debugImplementation(libs.androidx.compose.ui.test.manifest)
 
-  // Local tests: jUnit, coroutines, Android runner
+  // Local tests: jUnit, coroutines
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
-
-  // Instrumented tests: jUnit rules and runners
-  androidTestImplementation(libs.androidx.test.core)
-  androidTestImplementation(libs.androidx.test.ext.junit)
-  androidTestImplementation(libs.androidx.test.runner)
-  androidTestImplementation(libs.androidx.test.espresso.core)
 }

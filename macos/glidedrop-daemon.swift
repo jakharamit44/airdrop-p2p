@@ -791,50 +791,6 @@ let SCRIPT_PATH: String = {
     return p1
 }()
 
-func currentMacLanIp() -> String {
-    var ifaddr: UnsafeMutablePointer<ifaddrs>?
-    guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return "" }
-    defer { freeifaddrs(ifaddr) }
-    let wifiIface = getWifiInterfaceName()
-    let activeCidr = loadActiveP2pSession()?.cidr
-    let rawSsid = currentRawWifiSsid()
-
-    func extractValidLanIpv4(_ ptr: UnsafeMutablePointer<ifaddrs>, rawWifiSsid: String? = nil) -> String? {
-        guard let sa = ptr.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else { return nil }
-        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-        guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 else {
-            return nil
-        }
-        let ip = String(cString: hostname)
-        guard isNormalWifiIpv4(ip, activeP2pCidr: activeCidr, rawWifiSsid: rawWifiSsid), !isCgnatIpv4(ip) else {
-            return nil
-        }
-        return ip
-    }
-
-    // Pass 1: prefer active Wi-Fi interface over secondary USB/Docker/virtual en* interfaces
-    for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-        let flags = Int32(ptr.pointee.ifa_flags)
-        guard (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) else { continue }
-        if String(cString: ptr.pointee.ifa_name) == wifiIface,
-           let ip = extractValidLanIpv4(ptr, rawWifiSsid: rawSsid) {
-            return ip
-        }
-    }
-
-    // Pass 2: fallback to other active physical en* Ethernet interfaces
-    for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-        let flags = Int32(ptr.pointee.ifa_flags)
-        guard (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) else { continue }
-        let name = String(cString: ptr.pointee.ifa_name)
-        if name != wifiIface && name.hasPrefix("en"),
-           let ip = extractValidLanIpv4(ptr) {
-            return ip
-        }
-    }
-    return ""
-}
-
 func runProcessCapture(_ executablePath: String, _ arguments: [String]) -> (Int32, String) {
     let p = Process()
     let pipe = Pipe()
@@ -1500,18 +1456,6 @@ func saveCurrentWifiSsid() {
         print("[BLE-Daemon] Preserved home Wi-Fi network: '\(ssid)'")
         fflush(stdout)
     }
-}
-
-func topPreferredWifiNetwork() -> String {
-    let iface = getWifiInterfaceName()
-    let (_, out) = runProcessCapture("/usr/sbin/networksetup", ["-listpreferredwirelessnetworks", iface])
-    for line in out.split(separator: "\n") {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty && !trimmed.hasPrefix("Preferred networks") && !trimmed.hasPrefix("DIRECT-") {
-            return trimmed
-        }
-    }
-    return ""
 }
 
 private var _cachedWifiServiceName: String?
@@ -6007,7 +5951,6 @@ final class MacGlideDropViewModel: ObservableObject {
     @Published var systemIsDark: Bool = true
     @Published var storage: MacStorageSummary = MacStorageSummary.queryLocalDisk()
     @Published var receiverRunning: Bool = false
-    @Published var awdlProxyRunning: Bool = false
     @Published var bleRunning: Bool = true
     @Published var autoAccept: Bool = false
     @Published var macDeviceName: String = Host.current().localizedName ?? "MacBook Pro"
@@ -6030,6 +5973,21 @@ final class MacGlideDropViewModel: ObservableObject {
     @Published var bluetoothAuthorized: Bool = true
     @Published var bluetoothPoweredOn: Bool = true
     @Published var wifiPoweredOn: Bool = true
+
+    private struct FileStatSig: Equatable {
+        let mtime: TimeInterval
+        let size: UInt64
+    }
+
+    private var fileStatCache: [String: FileStatSig] = [:]
+    private var cachedProgressUpdatedAt: TimeInterval = 0
+
+    private func fileSignature(_ path: String) -> FileStatSig? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        return FileStatSig(mtime: mtime, size: size)
+    }
 
     func refreshAiStatus() {
         let enabled = readAiSubsystemEnabled()
@@ -6149,16 +6107,25 @@ final class MacGlideDropViewModel: ObservableObject {
     }
 
     func refreshFast() {
-        if themeMode == "system" {
-            let sysDark = Self.detectSystemDark()
-            if systemIsDark != sysDark {
-                systemIsDark = sysDark
-                onThemeChanged?(palette)
-            }
-        }
+        let now = Date().timeIntervalSince1970
 
-        // 0. Poll live active peers with strict 10-second TTL
-        let livePeers = loadActivePeersFromDisk(maxAge: PEER_LIVE_TTL_SECONDS)
+        // 0. Poll live active peers with stat-caching and in-memory TTL expiry pruning
+        let peersFile = STATE_DIR.appendingPathComponent("active_peers.json")
+        let peersSig = fileSignature(peersFile.path)
+        let livePeers: [MacDiscoveredPeer]
+        if let sig = peersSig {
+            if fileStatCache[peersFile.path] != sig {
+                fileStatCache[peersFile.path] = sig
+                livePeers = loadActivePeersFromDisk(maxAge: PEER_LIVE_TTL_SECONDS)
+            } else if !activePeers.isEmpty {
+                livePeers = activePeers.filter { now - $0.lastSeen <= PEER_LIVE_TTL_SECONDS }
+            } else {
+                livePeers = activePeers
+            }
+        } else {
+            fileStatCache.removeValue(forKey: peersFile.path)
+            livePeers = []
+        }
         if activePeers != livePeers {
             activePeers = livePeers
         }
@@ -6173,65 +6140,93 @@ final class MacGlideDropViewModel: ObservableObject {
         }
 
         // 1. Poll real-time transfer progress JSON (22s freshness covers 12s Wi-Fi Direct join)
-        if Date().timeIntervalSince1970 < cancelRequestedUntil {
+        if now < cancelRequestedUntil {
             if isTransferring { isTransferring = false }
             if liveProgress != nil { liveProgress = nil }
             return
         }
         let pf = STATE_DIR.appendingPathComponent("transfer_progress.json")
-        if let d = try? Data(contentsOf: pf),
-           let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-           (obj["active"] as? Bool) == true {
-            let updatedAt = (obj["updatedAt"] as? Double) ?? Date().timeIntervalSince1970
-            if Date().timeIntervalSince1970 - updatedAt < 22.0 {
-                let rawPhase = (obj["phase"] as? String) ?? ""
-                let rawPeer = (obj["peerName"] as? String) ?? ""
-                let connectingFlag = (obj["isConnecting"] as? Bool) ?? false
-                let dir = (obj["direction"] as? String) ?? "Transferring"
-                let pct = (obj["percent"] as? Int) ?? 0
-                let spd = (obj["speedBps"] as? NSNumber)?.int64Value ?? 0
-                let prog = MacLiveProgress(
-                    direction: dir,
-                    fileName: (obj["fileName"] as? String) ?? "File",
-                    fileCount: max(1, (obj["fileCount"] as? Int) ?? 1),
-                    doneBytes: (obj["doneBytes"] as? NSNumber)?.int64Value ?? 0,
-                    totalBytes: (obj["totalBytes"] as? NSNumber)?.int64Value ?? 0,
-                    speedBps: spd,
-                    etaSeconds: (obj["etaSeconds"] as? NSNumber)?.int64Value ?? 0,
-                    percent: pct,
-                    phase: rawPhase.isEmpty
-                        ? (connectingFlag ? "Connecting…" : (dir.lowercased().contains("send") ? "Sending files" : "Receiving files"))
-                        : rawPhase,
-                    peerName: rawPeer.isEmpty ? (livePeers.first?.name ?? "Nearby Device") : rawPeer,
-                    isConnecting: connectingFlag
-                )
-                if liveProgress != prog {
-                    liveProgress = prog
+        let progSig = fileSignature(pf.path)
+        if let sig = progSig {
+            if fileStatCache[pf.path] != sig {
+                fileStatCache[pf.path] = sig
+                if let d = try? Data(contentsOf: pf),
+                   let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+                   (obj["active"] as? Bool) == true {
+                    let updatedAt = (obj["updatedAt"] as? Double) ?? now
+                    cachedProgressUpdatedAt = updatedAt
+                    if now - updatedAt < 22.0 {
+                        let rawPhase = (obj["phase"] as? String) ?? ""
+                        let rawPeer = (obj["peerName"] as? String) ?? ""
+                        let connectingFlag = (obj["isConnecting"] as? Bool) ?? false
+                        let dir = (obj["direction"] as? String) ?? "Transferring"
+                        let pct = (obj["percent"] as? Int) ?? 0
+                        let spd = (obj["speedBps"] as? NSNumber)?.int64Value ?? 0
+                        let prog = MacLiveProgress(
+                            direction: dir,
+                            fileName: (obj["fileName"] as? String) ?? "File",
+                            fileCount: max(1, (obj["fileCount"] as? Int) ?? 1),
+                            doneBytes: (obj["doneBytes"] as? NSNumber)?.int64Value ?? 0,
+                            totalBytes: (obj["totalBytes"] as? NSNumber)?.int64Value ?? 0,
+                            speedBps: spd,
+                            etaSeconds: (obj["etaSeconds"] as? NSNumber)?.int64Value ?? 0,
+                            percent: pct,
+                            phase: rawPhase.isEmpty
+                                ? (connectingFlag ? "Connecting…" : (dir.lowercased().contains("send") ? "Sending files" : "Receiving files"))
+                                : rawPhase,
+                            peerName: rawPeer.isEmpty ? (livePeers.first?.name ?? "Nearby Device") : rawPeer,
+                            isConnecting: connectingFlag
+                        )
+                        if liveProgress != prog {
+                            liveProgress = prog
+                        }
+                    } else if !isTransferring && liveProgress != nil {
+                        liveProgress = nil
+                    }
+                } else {
+                    cachedProgressUpdatedAt = 0
+                    if !isTransferring && liveProgress != nil {
+                        liveProgress = nil
+                    }
                 }
-            } else if !isTransferring && liveProgress != nil {
+            } else if !isTransferring && liveProgress != nil && (now - cachedProgressUpdatedAt >= 22.0) {
                 liveProgress = nil
             }
-        } else if !isTransferring && liveProgress != nil {
-            liveProgress = nil
+        } else {
+            fileStatCache.removeValue(forKey: pf.path)
+            cachedProgressUpdatedAt = 0
+            if !isTransferring && liveProgress != nil {
+                liveProgress = nil
+            }
         }
 
-        // 2. Poll pending Ask prompt JSON
+        // 2. Poll pending Ask prompt JSON (only re-parse when file changes on disk)
         let af = STATE_DIR.appendingPathComponent("pending_ask.json")
-        if let d = try? Data(contentsOf: af),
-           let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-           let id = obj["id"] as? String {
-            let ask = MacPendingAsk(
-                id: id,
-                senderName: (obj["senderName"] as? String) ?? "Nearby Device",
-                fileNames: (obj["fileNames"] as? [String]) ?? ["Incoming File"],
-                totalBytes: (obj["totalBytes"] as? NSNumber)?.int64Value ?? 0
-            )
-            if pendingAsk != ask {
-                pendingAsk = ask
-                onRequestFrontWindow?()
+        if let askSig = fileSignature(af.path) {
+            if fileStatCache[af.path] != askSig {
+                fileStatCache[af.path] = askSig
+                if let d = try? Data(contentsOf: af),
+                   let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+                   let id = obj["id"] as? String {
+                    let ask = MacPendingAsk(
+                        id: id,
+                        senderName: (obj["senderName"] as? String) ?? "Nearby Device",
+                        fileNames: (obj["fileNames"] as? [String]) ?? ["Incoming File"],
+                        totalBytes: (obj["totalBytes"] as? NSNumber)?.int64Value ?? 0
+                    )
+                    if pendingAsk != ask {
+                        pendingAsk = ask
+                        onRequestFrontWindow?()
+                    }
+                } else if pendingAsk != nil {
+                    pendingAsk = nil
+                }
             }
-        } else if pendingAsk != nil {
-            pendingAsk = nil
+        } else {
+            fileStatCache.removeValue(forKey: af.path)
+            if pendingAsk != nil {
+                pendingAsk = nil
+            }
         }
     }
 
@@ -6261,7 +6256,6 @@ final class MacGlideDropViewModel: ObservableObject {
         refreshAiStatus()
         let s = loadMacSettings()
         receiverRunning = s.visible && isPidAlive("daemon.pid")
-        awdlProxyRunning = isPidAlive("awdl-mdns.pid")
         bleRunning = true
 
         let auth = CBManager.authorization
@@ -6277,43 +6271,68 @@ final class MacGlideDropViewModel: ObservableObject {
         }
 
         let rxFile = STATE_DIR.appendingPathComponent("received.log")
-        if let rxRaw = try? String(contentsOf: rxFile, encoding: .utf8) {
-            let parsed: [MacHistoryEntry] = rxRaw.split(separator: "\n").suffix(80).reversed().compactMap { line in
-                let parts = line.split(separator: "\t").map(String.init)
-                guard parts.count >= 3 else { return nil }
-                let ts = TimeInterval(parts[0]) ?? Date().timeIntervalSince1970
-                let isUrl = parts[1] == "URL"
-                let val = parts[2]
-                let sz: Int64 = parts.count >= 4 ? (Int64(parts[3]) ?? 0) : ((try? FileManager.default.attributesOfItem(atPath: val)[.size] as? Int64) ?? 0)
-                let isOut = parts.count >= 5 ? (parts[4] == "sent") : false
-                let peer = parts.count >= 6 ? parts[5] : "Nearby Device"
-                return MacHistoryEntry(
-                    id: "\(parts[0])-\(val)-\(isOut)",
-                    timestamp: Date(timeIntervalSince1970: ts),
-                    isUrl: isUrl,
-                    value: val,
-                    sizeBytes: sz,
-                    isOutgoing: isOut,
-                    peerName: peer
-                )
+        if let rxSig = fileSignature(rxFile.path) {
+            if fileStatCache[rxFile.path] != rxSig {
+                fileStatCache[rxFile.path] = rxSig
+                if let rxRaw = try? String(contentsOf: rxFile, encoding: .utf8) {
+                    let parsed: [MacHistoryEntry] = rxRaw.split(separator: "\n").suffix(80).reversed().compactMap { line in
+                        let parts = line.split(separator: "\t").map(String.init)
+                        guard parts.count >= 3 else { return nil }
+                        let ts = TimeInterval(parts[0]) ?? Date().timeIntervalSince1970
+                        let isUrl = parts[1] == "URL"
+                        let val = parts[2]
+                        let sz: Int64 = parts.count >= 4 ? (Int64(parts[3]) ?? 0) : ((try? FileManager.default.attributesOfItem(atPath: val)[.size] as? Int64) ?? 0)
+                        let isOut = parts.count >= 5 ? (parts[4] == "sent") : false
+                        let peer = parts.count >= 6 ? parts[5] : "Nearby Device"
+                        return MacHistoryEntry(
+                            id: "\(parts[0])-\(val)-\(isOut)",
+                            timestamp: Date(timeIntervalSince1970: ts),
+                            isUrl: isUrl,
+                            value: val,
+                            sizeBytes: sz,
+                            isOutgoing: isOut,
+                            peerName: peer
+                        )
+                    }
+                    if parsed != historyEntries {
+                        historyEntries = parsed
+                    }
+                }
             }
-            if parsed != historyEntries {
-                historyEntries = parsed
+        } else {
+            fileStatCache.removeValue(forKey: rxFile.path)
+            if !historyEntries.isEmpty {
+                historyEntries = []
             }
-        } else if !historyEntries.isEmpty {
-            historyEntries = []
         }
 
-        var combined: [String] = []
-        for f in ["daemon.log", "ble-daemon.log"] {
+        let logFiles = ["daemon.log", "ble-daemon.log"]
+        var logsChanged = false
+        for f in logFiles {
             let lf = STATE_DIR.appendingPathComponent(f)
-            if let content = try? String(contentsOf: lf, encoding: .utf8) {
-                let tail = content.split(separator: "\n").suffix(16).map(String.init)
-                combined.append(contentsOf: tail)
+            let sig = fileSignature(lf.path)
+            if fileStatCache[lf.path] != sig {
+                logsChanged = true
+                if let sig = sig {
+                    fileStatCache[lf.path] = sig
+                } else {
+                    fileStatCache.removeValue(forKey: lf.path)
+                }
             }
         }
-        if combined != logs {
-            logs = Array(combined.suffix(28))
+        if logsChanged {
+            var combined: [String] = []
+            for f in logFiles {
+                let lf = STATE_DIR.appendingPathComponent(f)
+                if let content = try? String(contentsOf: lf, encoding: .utf8) {
+                    let tail = content.split(separator: "\n").suffix(16).map(String.init)
+                    combined.append(contentsOf: tail)
+                }
+            }
+            let sliced = Array(combined.suffix(28))
+            if sliced != logs {
+                logs = sliced
+            }
         }
     }
 

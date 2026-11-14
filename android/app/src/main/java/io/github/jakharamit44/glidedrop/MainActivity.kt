@@ -127,6 +127,7 @@ import ds.tokens.DsMotion
 import ds.tokens.LocalDsColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -435,7 +436,6 @@ fun GlideDropScreen(
     val receivedItems by node.receivedItems.collectAsState()
     val transferProgress by node.transferProgress.collectAsState()
     val p2pStatus by node.p2pStatus.collectAsState()
-    val logs by node.logs.collectAsState()
     val deviceName by node.deviceNameFlow.collectAsState()
     val autoAccept by node.autoAcceptFlow.collectAsState()
     val shareCellularInternet by node.shareCellularInternetFlow.collectAsState()
@@ -458,7 +458,7 @@ fun GlideDropScreen(
     var showRenameDialog by remember { mutableStateOf(false) }
     var renameText by remember { mutableStateOf(deviceName) }
 
-    var storageInfo by remember { mutableStateOf(readInternalStorage()) }
+    var storageInfo by remember { mutableStateOf(StorageBreakdown(0L, 0L, 0L)) }
     LaunchedEffect(receivedItems.size, activeTab) {
         withContext(Dispatchers.IO) {
             storageInfo = readInternalStorage()
@@ -1029,6 +1029,10 @@ fun GlideDropScreen(
                     onOpenRecentSent = { sent ->
                         if (sent.isUrl) {
                             onOpenUrl(sent.pathOrUrl)
+                        } else if (canOpenOrShareHistoryItem(sent)) {
+                            openFileWithProvider(context, sent.pathOrUrl) {
+                                Toast.makeText(context, "Source file no longer accessible", Toast.LENGTH_SHORT).show()
+                            }
                         } else {
                             val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                             cm?.setPrimaryClip(ClipData.newPlainText("GlideDrop", sent.title))
@@ -1069,8 +1073,17 @@ fun GlideDropScreen(
                     onQueryChange = { historyQuery = it },
                     onFilterChange = { historyFilter = it },
                     onOpenItem = { item ->
-                        if (item.isUrl) onOpenUrl(item.pathOrUrl)
-                        else openFileWithProvider(context, item.pathOrUrl, onOpenDownloads)
+                        if (item.isUrl) {
+                            onOpenUrl(item.pathOrUrl)
+                        } else {
+                            openFileWithProvider(context, item.pathOrUrl) {
+                                if (item.isOutgoing) {
+                                    Toast.makeText(context, "Source file no longer accessible", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    onOpenDownloads()
+                                }
+                            }
+                        }
                     },
                     onShareItem = { item -> shareFileOrUrl(context, item) },
                     onCopyText = { txt ->
@@ -1092,7 +1105,7 @@ fun GlideDropScreen(
                     proxyActualPort = proxyActualPort,
                     p2pStatus = p2pStatus,
                     endpoints = endpoints,
-                    logs = logs,
+                    logsFlow = node.logs,
                     showLogs = showLogs,
                     onSelectThemeMode = { node.themeMode = it },
                     onToggleRunning = { enabled ->
@@ -1116,6 +1129,10 @@ fun GlideDropScreen(
                         showRenameDialog = true
                     },
                     onOpenDownloads = onOpenDownloads,
+                    onResetTrustedDevices = {
+                        node.forgetTrustedPeers()
+                        Toast.makeText(context, "Trusted devices reset", Toast.LENGTH_SHORT).show()
+                    },
                     onRescanP2p = {
                         node.refreshP2p()
                         Toast.makeText(context, "Refreshed BLE + 5GHz P2P radio", Toast.LENGTH_SHORT).show()
@@ -1921,7 +1938,7 @@ private fun SendHomeTab(
                                     )
                                 }
                                 Text(
-                                    text = if (sent.isUrl) "Open" else "Copy",
+                                    text = if (canOpenOrShareHistoryItem(sent)) "Open" else "Copy",
                                     color = c.textAccent,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.SemiBold
@@ -2915,7 +2932,7 @@ private fun TransfersHistoryScreen(
                                 }
                             }
 
-                            if (!item.isOutgoing || item.isUrl) {
+                            if (canOpenOrShareHistoryItem(item)) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.End
@@ -2963,7 +2980,7 @@ private fun SettingsScreenTab(
     proxyActualPort: Int,
     p2pStatus: String,
     endpoints: List<String>,
-    logs: List<String>,
+    logsFlow: StateFlow<List<String>>,
     showLogs: Boolean,
     onSelectThemeMode: (String) -> Unit,
     onToggleRunning: (Boolean) -> Unit,
@@ -2971,6 +2988,7 @@ private fun SettingsScreenTab(
     onToggleShareCellularInternet: (Boolean) -> Unit,
     onRenameDevice: () -> Unit,
     onOpenDownloads: () -> Unit,
+    onResetTrustedDevices: () -> Unit,
     onRescanP2p: () -> Unit,
     onToggleLogs: () -> Unit,
     onClearLogs: () -> Unit
@@ -3186,6 +3204,26 @@ private fun SettingsScreenTab(
                             Text("Open Folder", color = c.textAccent, fontSize = 12.sp)
                         }
                     }
+
+                    HorizontalDivider(color = c.borderSeparator)
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Paired Security", color = c.textSecondary, fontSize = 12.sp)
+                            Text("Require verification code again", color = c.textPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        }
+                        OutlinedButton(
+                            onClick = onResetTrustedDevices,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, c.borderDefault)
+                        ) {
+                            Text("Reset Trusted Devices", color = c.textDanger, fontSize = 12.sp)
+                        }
+                    }
                 }
             }
         }
@@ -3270,6 +3308,7 @@ private fun SettingsScreenTab(
                     }
 
                     if (showLogs) {
+                        val logs by logsFlow.collectAsState()
                         Surface(
                             color = c.surfaceSunken,
                             shape = RoundedCornerShape(12.dp),
@@ -3751,6 +3790,9 @@ private fun QuickVectorIcon(
     }
 }
 
+private fun canOpenOrShareHistoryItem(item: ReceivedItem): Boolean =
+    item.isUrl || !item.isOutgoing || item.pathOrUrl.startsWith("content://") || item.pathOrUrl.startsWith("/")
+
 private fun openFileWithProvider(context: Context, path: String, fallback: () -> Unit) {
     try {
         val contentUri = path.toUri().takeIf { it.scheme == "content" }
@@ -3761,8 +3803,9 @@ private fun openFileWithProvider(context: Context, path: String, fallback: () ->
             }
             FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         }
+        val ext = File(path.substringBefore('?')).extension.lowercase()
         val mime = context.contentResolver.getType(uri)
-            ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(File(path).extension.lowercase()) ?: "*/*"
+            ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)

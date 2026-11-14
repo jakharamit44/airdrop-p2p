@@ -231,30 +231,6 @@ CERT_FILE, KEY_FILE, PORT, PROXY_PORT, SCRIPT_PATH = (
 )
 STATE_DIR = Path(CERT_FILE).parent
 
-_CACHED_WIFI_IFACE = None
-
-def get_wifi_interface() -> str:
-    global _CACHED_WIFI_IFACE
-    if _CACHED_WIFI_IFACE:
-        return _CACHED_WIFI_IFACE
-    try:
-        out = subprocess.check_output(["/usr/sbin/networksetup", "-listallhardwareports"], text=True, stderr=subprocess.DEVNULL)
-        lines = out.splitlines()
-        is_wifi = False
-        for line in lines:
-            line_str = line.strip()
-            if line_str.startswith("Hardware Port:"):
-                port = line_str.split(":", 1)[1].strip().lower()
-                is_wifi = ("wi-fi" in port or "wifi" in port or "airport" in port or "wlan" in port)
-            elif is_wifi and line_str.startswith("Device:"):
-                dev = line_str.split(":", 1)[1].strip()
-                if dev:
-                    _CACHED_WIFI_IFACE = dev
-                    return dev
-    except Exception:
-        pass
-    return "en0"
-
 CLAUDE_QUEUE = queue.Queue(maxsize=128)
 
 def _claude_processor_worker():
@@ -786,20 +762,11 @@ def is_transfer_cancelled() -> bool:
 def read_body_bytes(
     f,
     headers,
-    track_progress: bool = False,
-    file_label: str = "Incoming File",
-    expected_total: int = 0,
-    file_count: int = 1,
     max_bytes: int = MAX_NON_UPLOAD_BODY_BYTES,
 ):
-    t0 = time.time()
-    last_emit = 0.0
     if "chunked" in headers.get("transfer-encoding", "").lower():
         out = bytearray()
         while True:
-            if track_progress and is_transfer_cancelled():
-                write_progress(False)
-                raise RuntimeError("Transfer cancelled by user")
             sz_line = read_line(f)
             if sz_line is None:
                 raise ValueError("Truncated chunked body")
@@ -811,26 +778,12 @@ def read_body_bytes(
                 raise HttpFramingError(413, "Payload Too Large", f"Request body exceeds {max_bytes} byte limit")
             rem = sz
             while rem > 0:
-                if track_progress and is_transfer_cancelled():
-                    write_progress(False)
-                    raise RuntimeError("Transfer cancelled by user")
                 step = min(65536, rem)
                 chunk = f.read(step)
                 if not chunk:
                     raise ValueError("Truncated chunk payload")
                 out.extend(chunk)
                 rem -= len(chunk)
-                if track_progress:
-                    now = time.time()
-                    if now - last_emit >= 0.08:
-                        last_emit = now
-                        done = len(out)
-                        tot = max(expected_total, done, 1)
-                        el = max(0.08, now - t0)
-                        spd = int(done / el)
-                        eta = int(max(0, tot - done) / max(1, spd))
-                        pct = min(99, int((done * 100) / tot))
-                        write_progress(True, "Receiving", file_label, done, tot, spd, eta, pct, file_count)
             crlf = bytearray()
             while len(crlf) < 2:
                 part = f.read(2 - len(crlf))
@@ -839,8 +792,6 @@ def read_body_bytes(
                 crlf.extend(part)
             if bytes(crlf) != b"\r\n":
                 raise ValueError("Missing CRLF terminator after chunk")
-        if track_progress:
-            write_progress(False)
         return bytes(out)
     clen = parse_non_negative_int(headers["content-length"], "Content-Length") if "content-length" in headers else 0
     if max_bytes is not None and clen > max_bytes:
@@ -850,28 +801,12 @@ def read_body_bytes(
     out = bytearray()
     rem = clen
     while rem > 0:
-        if track_progress and is_transfer_cancelled():
-            write_progress(False)
-            raise RuntimeError("Transfer cancelled by user")
         step = min(65536, rem)
         chunk = f.read(step)
         if not chunk:
             break
         out.extend(chunk)
         rem -= len(chunk)
-        if track_progress:
-            now = time.time()
-            if now - last_emit >= 0.08:
-                last_emit = now
-                done = len(out)
-                tot = max(expected_total, clen, 1)
-                el = max(0.08, now - t0)
-                spd = int(done / el)
-                eta = int(max(0, tot - done) / max(1, spd))
-                pct = min(99, int((done * 100) / tot))
-                write_progress(True, "Receiving", file_label, done, tot, spd, eta, pct, file_count)
-    if track_progress:
-        write_progress(False)
     return bytes(out)
 
 class ChunkedReader:
@@ -1323,6 +1258,7 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
     last_emit = [0.0]
     last_term_log = [0.0]
     last_touch = [0.0]
+    last_cancel_check = [0.0]
     done = [0]
     rx_lock = STATE_DIR / "rx_in_progress.lock"
 
@@ -1330,15 +1266,17 @@ def stream_upload_to_dir(f, headers, dest_dir: Path, track_progress: bool = Fals
         write_progress(True, "Receiving", file_label, 0, max(1, expected_total), 0, 0, 0, file_count, phase="Receiving files", peer_name=peer_name, is_connecting=False)
 
     def on_bytes_read(n):
-        if is_transfer_cancelled():
-            write_progress(False)
-            try:
-                rx_lock.unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise RuntimeError("Transfer cancelled by user")
-        done[0] += n
         now = time.time()
+        if now - last_cancel_check[0] >= 0.1:
+            last_cancel_check[0] = now
+            if is_transfer_cancelled():
+                write_progress(False)
+                try:
+                    rx_lock.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise RuntimeError("Transfer cancelled by user")
+        done[0] += n
         if now - last_touch[0] >= 1.0:
             last_touch[0] = now
             try:
@@ -1557,10 +1495,6 @@ def handle_client(conn, addr, is_p2p_proxy: bool = False):
                 body = b"" if is_upload else read_body_bytes(
                     f,
                     headers,
-                    track_progress=False,
-                    file_label=last_label,
-                    expected_total=exp_tot,
-                    file_count=last_count,
                     max_bytes=MAX_NON_UPLOAD_BODY_BYTES,
                 )
             except HttpFramingError as he:
@@ -2600,20 +2534,30 @@ try:
                 tx_start = time.time()
                 last_emit = 0.0
                 last_lock_refresh = time.time()
+                last_cancel_check = [0.0]
                 off = 0
                 write_progress(True, "Sending", label, 0, tot, 0, 0, 0, fcount, phase="Sending files", peer_name=peer_name, is_connecting=False)
+
+                CHUNK_CAP = 1048576
+                tx_buf = bytearray(16 + 4 + CHUNK_CAP + 2)
+                tx_mv = memoryview(tx_buf)
+
+                def check_tx_cancelled(now_ts: float):
+                    if now_ts - last_cancel_check[0] >= 0.1:
+                        last_cancel_check[0] = now_ts
+                        if is_transfer_cancelled():
+                            write_progress(False)
+                            try:
+                                raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                            except Exception:
+                                pass
+                            print("[-] Transfer cancelled by user", file=sys.stderr)
+                            sys.exit(44)
 
                 def send_dvzip_block(raw_block: bytes):
                     if not raw_block:
                         return
-                    if is_transfer_cancelled():
-                        write_progress(False)
-                        try:
-                            raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-                        except Exception:
-                            pass
-                        print("[-] Transfer cancelled by user", file=sys.stderr)
-                        sys.exit(44)
+                    check_tx_cancelled(time.time())
                     hdr4 = struct.pack(">I", 0x80000000 | len(raw_block))
                     pkt_len = 4 + len(raw_block)
                     s.sendall(f"{pkt_len:x}\r\n".encode("ascii") + hdr4 + raw_block + b"\r\n")
@@ -2632,12 +2576,20 @@ try:
                     ino += 1
                     with p.open("rb", buffering=2097152) as pf:
                         while True:
-                            chunk = pf.read(1048576)
-                            if not chunk:
+                            n_read = pf.readinto(tx_mv[20 : 20 + CHUNK_CAP])
+                            if not n_read:
                                 break
-                            send_dvzip_block(chunk)
-                            off += len(chunk)
                             now = time.time()
+                            check_tx_cancelled(now)
+                            pkt_len = 4 + n_read
+                            prefix = f"{pkt_len:x}\r\n".encode("ascii")
+                            start = 16 - len(prefix)
+                            tx_buf[start:16] = prefix
+                            struct.pack_into(">I", tx_buf, 16, 0x80000000 | n_read)
+                            end = 20 + n_read
+                            tx_buf[end : end + 2] = b"\r\n"
+                            s.sendall(tx_mv[start : end + 2])
+                            off += n_read
                             if now - last_lock_refresh >= 30.0:
                                 last_lock_refresh = now
                                 tx_lock = STATE_DIR / "tx_in_progress.lock"

@@ -356,6 +356,41 @@ class TransportTests(unittest.TestCase):
                 self.rx["extract_cpio_stream"](stream, dest, fsync_files=False)
         self.assertEqual(other.read_bytes(), b"other writer")
 
+    def test_zero_copy_sender_multichunk_roundtrip(self):
+        import textwrap
+        src_dir = self.root / "tx_src"
+        src_dir.mkdir()
+        payload = bytes(((i * 31) ^ (i >> 7)) & 0xFF for i in range(1_250_000))
+        big_file = src_dir / "large_clip.mp4"
+        big_file.write_bytes(payload)
+
+        code = python_blocks()[1]
+        start = code.index("                tx_start = time.time()")
+        end = code.index("                write_progress(True, \"Sending\", label, tot, tot", start)
+        segment = textwrap.dedent(code[start:end])
+
+        captured = bytearray()
+        class FakeSocket:
+            def sendall(self, data):
+                captured.extend(memoryview(data))
+
+        ns = dict(
+            self.tx,
+            s=FakeSocket(),
+            raw=Mock(),
+            files=[big_file],
+            tot=len(payload),
+            label=big_file.name,
+            fcount=1,
+            peer_name="Android Test",
+            write_progress=lambda *a, **k: None,
+            is_transfer_cancelled=lambda: False,
+        )
+        exec(segment, ns)
+        saved, _ = self.upload(bytes(captured), {"transfer-encoding": "chunked"})
+        self.assertEqual([p.name for p in saved], ["large_clip.mp4"])
+        self.assertEqual(saved[0].read_bytes(), payload)
+
 
 class RuntimeAssignedPortsTests(unittest.TestCase):
     """Task 3.4: no compiled-in ports; peer ports come from the handshake/session."""

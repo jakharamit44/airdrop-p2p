@@ -766,4 +766,23 @@ class GlideDropCodecTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun outgoingEntryPreservesSourceUriOrPathAcrossNormalization() {
+        val defaultEntry = GlideDropCodec.OutgoingEntry(
+            name = "photo.jpg",
+            size = 42L
+        ) { ByteArrayInputStream(ByteArray(42)) }
+        assertEquals("photo.jpg", defaultEntry.sourceUriOrPath)
+
+        val uriEntry = GlideDropCodec.OutgoingEntry(
+            name = "../weird name .mp4 ",
+            size = 100L,
+            sourceUriOrPath = "content://media/external/video/media/9012"
+        ) { ByteArrayInputStream(ByteArray(100)) }
+        val prepared = GlideDropNode.prepareOutgoingFiles(listOf(uriEntry))
+        assertEquals(1, prepared.entries.size)
+        assertEquals("weird name .mp4", prepared.entries[0].name)
+        assertEquals("content://media/external/video/media/9012", prepared.entries[0].sourceUriOrPath)
+    }
 }

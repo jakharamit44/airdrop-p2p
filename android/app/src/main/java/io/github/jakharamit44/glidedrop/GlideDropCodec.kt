@@ -32,7 +32,6 @@ object GlideDropCodec {
     const val DVZIP_BLOCK_BYTES = 65536
     const val DVZIP_STORED_BLOCK_BYTES = 1_048_576
     const val DVZIP_STORED = 0x80000000.toInt()
-    const val DEVICE_SUPPORT_FLAGS = 111611L
 
     private val PRECOMPRESSED_EXTENSIONS = setOf(
         "mkv", "mp4", "mov", "avi", "webm", "m4v", "ts",
@@ -371,6 +370,7 @@ object GlideDropCodec {
         val name: String,
         val size: Long,
         val mtimeSec: Long = System.currentTimeMillis() / 1000L,
+        val sourceUriOrPath: String = name,
         val openStream: () -> InputStream
     )
 

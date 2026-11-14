@@ -109,8 +109,11 @@ import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.X509EncodedKeySpec
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import java.util.Collections
 import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -237,6 +240,7 @@ class GlideDropNode(private val context: Context) {
     }
 
     companion object {
+        private val LOG_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss", Locale.US)
         const val INCOMING_SESSION_TOKEN_TTL_MS = 300_000L
         const val MAX_INCOMING_SESSION_TOKENS = 4
         const val PEER_TTL_MS = 4_500L
@@ -1222,7 +1226,6 @@ class GlideDropNode(private val context: Context) {
     private val random = SecureRandom()
     private val transferMutex = Mutex()
     private val prefs = context.getSharedPreferences("glidedrop_prefs", Context.MODE_PRIVATE)
-    val authTag = ByteArray(3).also { random.nextBytes(it) }
     val serviceId: String = prefs.getString("service_id", null)
         ?: ByteArray(6)
             .also { random.nextBytes(it) }
@@ -1850,17 +1853,6 @@ class GlideDropNode(private val context: Context) {
         }
     }
 
-    private fun hasActiveIncomingSessionTokens(): Boolean {
-        val now = System.currentTimeMillis()
-        synchronized(incomingSessionTokensLock) {
-            val it = incomingSessionTokens.entries.iterator()
-            while (it.hasNext()) {
-                if (it.next().value <= now) it.remove()
-            }
-            return incomingSessionTokens.isNotEmpty()
-        }
-    }
-
     internal fun activeP2pSubnets(): List<Pair<ByteArray, Int>> {
         val list = ArrayList<Pair<ByteArray, Int>>(4)
         val seen = HashSet<String>()
@@ -1979,7 +1971,7 @@ class GlideDropNode(private val context: Context) {
 
     fun log(msg: String) {
         android.util.Log.i("GlideDrop", msg)
-        val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(Date())
+        val time = LocalTime.now().format(LOG_TIME_FORMATTER)
         _logs.update { (it + "[$time] $msg").takeLast(80) }
     }
 
@@ -2088,7 +2080,9 @@ class GlideDropNode(private val context: Context) {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         val expectedInterface = groupInterface ?: activeP2pInterfaceName
         if (!expectedInterface.isNullOrBlank() && cm != null) {
-            trackedP2pNetwork = cm.allNetworks.firstOrNull { cm.getLinkProperties(it)?.interfaceName == expectedInterface }
+            @Suppress("DEPRECATION")
+            val nets = cm.allNetworks
+            trackedP2pNetwork = nets.firstOrNull { cm.getLinkProperties(it)?.interfaceName == expectedInterface }
         }
         val netTriple = trackedP2pNetwork?.let { net ->
             extractP2pAddressFromLinkProperties(cm?.getLinkProperties(net))
@@ -2577,6 +2571,7 @@ class GlideDropNode(private val context: Context) {
                 }
             }
 
+            @Deprecated("Deprecated in Java")
             @Suppress("DEPRECATION")
             override fun onCharacteristicRead(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == MAC_BLE_PSM_CHAR_UUID) {
@@ -2605,7 +2600,9 @@ class GlideDropNode(private val context: Context) {
             }
         }
         return try {
-            gatt = dev.connectGatt(context, false, cb, BluetoothDevice.TRANSPORT_LE)
+            @Suppress("DEPRECATION")
+            val connectedGatt = dev.connectGatt(context, false, cb, BluetoothDevice.TRANSPORT_LE)
+            gatt = connectedGatt
             kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { result.await() } ?: 0
         } catch (_: Throwable) {
             0
@@ -3510,7 +3507,7 @@ class GlideDropNode(private val context: Context) {
                                                     recordHistoryItem(
                                                         ReceivedItem(
                                                             title = e.name,
-                                                            pathOrUrl = e.name,
+                                                            pathOrUrl = e.sourceUriOrPath,
                                                             isUrl = false,
                                                             sizeBytes = e.size,
                                                             isOutgoing = true,
@@ -3823,10 +3820,12 @@ class GlideDropNode(private val context: Context) {
                         totalBytes = totalAskBytes,
                         decision = deferred
                     )
+                    onConsentNotification?.invoke("Incoming GlideDrop from $sender", summary)
                     try {
                         kotlinx.coroutines.withTimeoutOrNull(45_000L) { deferred.await() } ?: false
                     } finally {
-                        _incomingAsk.value = null
+                        if (_incomingAsk.value?.decision === deferred) _incomingAsk.value = null
+                        onConsentNotification?.invoke(null, null)
                     }
                 }
 
@@ -4187,7 +4186,7 @@ class GlideDropNode(private val context: Context) {
                                             recordHistoryItem(
                                                 ReceivedItem(
                                                     title = e.name,
-                                                    pathOrUrl = e.name,
+                                                    pathOrUrl = e.sourceUriOrPath,
                                                     isUrl = false,
                                                     sizeBytes = e.size,
                                                     isOutgoing = true,
@@ -4588,7 +4587,7 @@ class GlideDropNode(private val context: Context) {
                         recordHistoryItem(
                             ReceivedItem(
                                 title = e.name,
-                                pathOrUrl = e.name,
+                                pathOrUrl = e.sourceUriOrPath,
                                 isUrl = false,
                                 sizeBytes = e.size,
                                 isOutgoing = true,
@@ -4734,6 +4733,7 @@ class GlideDropNode(private val context: Context) {
             rawClient.soTimeout = 30_000
             rawClient.tcpNoDelay = true
             rawClient.keepAlive = true
+            runCatching { rawClient.receiveBufferSize = 4 * 1024 * 1024 }
             val sock = (serverSslContext.socketFactory.createSocket(
                 rawClient,
                 remoteIp,
@@ -4879,10 +4879,12 @@ class GlideDropNode(private val context: Context) {
                                 totalBytes = totalAskBytes,
                                 decision = deferred
                             )
+                            onConsentNotification?.invoke("Incoming GlideDrop from $sender", summary)
                             try {
                                 kotlinx.coroutines.withTimeoutOrNull(45_000L) { deferred.await() } ?: false
                             } finally {
-                                _incomingAsk.value = null
+                                if (_incomingAsk.value?.decision === deferred) _incomingAsk.value = null
+                                onConsentNotification?.invoke(null, null)
                             }
                         }
 
@@ -5034,24 +5036,22 @@ class GlideDropNode(private val context: Context) {
         withContext(Dispatchers.IO) {
             if (uris.isEmpty()) return@withContext false
             val peerClean = peer.name.substringBefore(" (PSM").trim().ifEmpty { learnedMacName ?: "MacBook Pro" }
-            val stagedMetas = uris.map { inspectUriMeta(it) }
-            val firstMeta = stagedMetas.first()
-            val totalStagedBytes = calculateAggregateStagedBytes(stagedMetas.map { it.second })
-            val displayLabel = formatMultiFileDisplayLabel(firstMeta.first, uris.size)
-            reportConnecting(
-                label = displayLabel,
-                total = totalStagedBytes,
-                fileCount = uris.size,
-                isSending = true,
-                phase = "Preparing ${uris.size} file(s)…",
-                peerName = peerClean
-            )
             val entries = uris.mapNotNull { uri -> resolveUriEntry(uri) }
             if (entries.isEmpty()) {
                 clearProgressNotification()
                 log("No readable files selected")
                 return@withContext false
             }
+            val totalStagedBytes = calculateAggregateStagedBytes(entries.map { it.size })
+            val displayLabel = formatMultiFileDisplayLabel(entries.first().name, entries.size)
+            reportConnecting(
+                label = displayLabel,
+                total = totalStagedBytes,
+                fileCount = entries.size,
+                isSending = true,
+                phase = "Preparing ${entries.size} file(s)…",
+                peerName = peerClean
+            )
             return@withContext sendOverBleL2cap(entries, null)
         }
 
@@ -5113,6 +5113,7 @@ class GlideDropNode(private val context: Context) {
             return GlideDropCodec.OutgoingEntry(
                 name = f.name,
                 size = f.length(),
+                sourceUriOrPath = f.absolutePath,
                 openStream = { f.inputStream() }
             )
         }
@@ -5161,6 +5162,7 @@ class GlideDropNode(private val context: Context) {
         return GlideDropCodec.OutgoingEntry(
             name = name,
             size = size,
+            sourceUriOrPath = uri.toString(),
             openStream = {
                 cr.openInputStream(uri) ?: throw EOFException("Cannot open $uri")
             }
