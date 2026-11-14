@@ -340,6 +340,25 @@ class TransportTests(unittest.TestCase):
             self.assertFalse(self.rx["wait_for_user_accept"]("Alice", ["one.txt"], 1,
                              session_token="ab" * 32, peer_ip="192.168.73.1"))
 
+    def test_session_bound_consent_tolerates_ble_placeholder_name_difference(self):
+        self.session()
+        self.rx["load_settings"] = lambda: {"autoAccept": False}
+        self.rx["_is_local_rx_cancelled"] = lambda: True
+        auth = self.root / "wp2p_authorized_session.json"
+        auth.write_text(json.dumps(dict(senderName="Android Peer (40BB)", authorizedAt=time.time(), token="cd" * 32,
+                                        peerIp="192.168.73.1", ssid="DIRECT-test")))
+        # Wrong token or IP must still fail even when BLE placeholder differs
+        with patch.object(threading, "Thread"):
+            self.assertFalse(self.rx["wait_for_user_accept"]("Samsung SM-S911B", ["one.txt"], 1,
+                             session_token="ef" * 32, peer_ip="192.168.73.1"))
+            self.assertFalse(self.rx["wait_for_user_accept"]("Samsung SM-S911B", ["one.txt"], 1,
+                             session_token="cd" * 32, peer_ip="192.168.73.99"))
+        self.assertTrue(auth.exists())
+        # Matching cryptographic token + IP + SSID reuses WP2P consent without a second popup
+        self.assertTrue(self.rx["wait_for_user_accept"]("Samsung SM-S911B", ["one.txt"], 1,
+                        session_token="cd" * 32, peer_ip="192.168.73.1"))
+        self.assertFalse(auth.exists())
+
     def test_staging_collision_does_not_delete_another_writers_file(self):
         dest = self.root / "collision"; dest.mkdir()
         original_open = os.open

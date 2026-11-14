@@ -459,10 +459,11 @@ def _wait_for_user_accept(sender_name: str, file_names: list, total_bytes: int, 
             auth_time = float(auth_data.get("authorizedAt", 0))
             session = load_active_p2p_session()
             bound_token = str(auth_data.get("token") or "").strip().lower()
+            # Cryptographically bound to HKDF session_token, peerIp, and SSID (display names may differ
+            # between BLE scan placeholders like "Android Peer (xxxx)" and POST /Ask SenderComputerName).
             if (0 <= time.time() - auth_time < 60.0 and session
                     and re.fullmatch(r"[0-9a-f]{64}", session_token)
                     and hmac.compare_digest(bound_token, session_token)
-                    and auth_data.get("senderName") == sender_name
                     and auth_data.get("peerIp") == peer_ip == session["gatewayIp"]
                     and auth_data.get("ssid") == session["ssid"]):
                 print(f"[P2P-Receiver] Reusing session-bound WP2P approval for {sender_name}")

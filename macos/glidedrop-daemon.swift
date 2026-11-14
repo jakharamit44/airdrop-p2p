@@ -3542,6 +3542,8 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
     var pingTimer: Timer?
     private let pingStateLock = NSLock()
     private var pingPeerDisconnected: Bool = false
+    private var isPublishingL2cap: Bool = false
+    private var hasPublishedGattService: Bool = false
 
     func setPingPeerDisconnected(_ val: Bool) {
         pingStateLock.lock()
@@ -3567,10 +3569,83 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
         }
     }
 
+    private func closeStreamSafely(_ stream: Stream?) {
+        stream?.close()
+    }
+
+    private func publishGattServiceAndAdvertise(peripheral: CBPeripheralManager, psm: CBL2CAPPSM) {
+        guard loadMacSettings().visible, peripheral.state == .poweredOn, psm > 0 else { return }
+        if peripheral.isAdvertising {
+            peripheral.stopAdvertising()
+        }
+        peripheral.removeAllServices()
+        var le = UInt16(psm).littleEndian
+        let psmData = Data(bytes: &le, count: 2)
+        let ch = CBMutableCharacteristic(
+            type: MAC_PSM_CHAR_UUID,
+            properties: [.read],
+            value: psmData,
+            permissions: [.readable]
+        )
+        let svc = CBMutableService(type: MAC_SERVICE_UUID, primary: true)
+        svc.characteristics = [ch]
+        peripheral.add(svc)
+        hasPublishedGattService = true
+        let psmUuid = CBUUID(string: String(format: "%04X", 0xAD00 | (Int(psm) & 0xFF)))
+        // Keep primary advertisement <= 25 bytes (3B Flags + 18B MAC_SERVICE_UUID + 4B psmUuid)
+        // so macOS CoreBluetooth never pushes MAC_SERVICE_UUID into the proprietary Apple Overflow Area.
+        peripheral.startAdvertising([
+            CBAdvertisementDataServiceUUIDsKey: [MAC_SERVICE_UUID, psmUuid]
+        ])
+        print("[BLE-Daemon] Started BLE advertising on PSM \(psm)")
+        fflush(stdout)
+    }
+
+    private func ensurePeripheralPublishedAndAdvertising() {
+        guard loadMacSettings().visible, let pm = pm, pm.state == .poweredOn else { return }
+        if publishedPsm == 0 {
+            if !isPublishingL2cap {
+                isPublishingL2cap = true
+                pm.publishL2CAPChannel(withEncryption: false)
+            }
+            return
+        }
+        if !hasPublishedGattService {
+            publishGattServiceAndAdvertise(peripheral: pm, psm: publishedPsm)
+        } else if !pm.isAdvertising {
+            let psmUuid = CBUUID(string: String(format: "%04X", 0xAD00 | (Int(publishedPsm) & 0xFF)))
+            pm.startAdvertising([
+                CBAdvertisementDataServiceUUIDsKey: [MAC_SERVICE_UUID, psmUuid]
+            ])
+            print("[BLE-Daemon] Started BLE advertising on PSM \(publishedPsm)")
+            fflush(stdout)
+        }
+    }
+
     func stopAdvertisingAndScanning() {
+        isPublishingL2cap = false
         if pm?.state == .poweredOn {
-            pm?.stopAdvertising()
-            print("[BLE-Daemon] Stopped BLE advertising (Incoming radio turned off)")
+            if pm.isAdvertising {
+                pm.stopAdvertising()
+            }
+            // Removing GATT services clears macOS CoreBluetooth Overflow Area service advertisements
+            // so phones cannot continue discovering this Mac after "Discoverable Nearby" is turned off.
+            pm.removeAllServices()
+            hasPublishedGattService = false
+            if publishedPsm > 0 {
+                pm.unpublishL2CAPChannel(publishedPsm)
+            }
+            print("[BLE-Daemon] Stopped BLE advertising, GATT services, and L2CAP channel (Incoming radio turned off)")
+        } else {
+            pm?.removeAllServices()
+            hasPublishedGattService = false
+        }
+        publishedPsm = 0
+        let openChannels = activeChannels
+        activeChannels.removeAll()
+        for ch in openChannels {
+            closeStreamSafely(ch.inputStream)
+            closeStreamSafely(ch.outputStream)
         }
         if cm?.state == .poweredOn {
             cm?.stopScan()
@@ -3585,7 +3660,10 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
 
     func startAdvertisingAndScanning() {
         let settings = loadMacSettings()
-        guard settings.visible else { return }
+        guard settings.visible else {
+            stopAdvertisingAndScanning()
+            return
+        }
         if cm?.state == .poweredOn {
             cm?.stopScan()
             cm?.scanForPeripherals(
@@ -3593,13 +3671,7 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
             )
         }
-        if pm?.state == .poweredOn && publishedPsm > 0 && pm?.isAdvertising == false {
-            let psmUuid = CBUUID(string: String(format: "%04X", 0xAD00 | (Int(publishedPsm) & 0xFF)))
-            pm?.startAdvertising([
-                CBAdvertisementDataServiceUUIDsKey: [MAC_SERVICE_UUID, psmUuid]
-            ])
-            print("[BLE-Daemon] Started BLE advertising on PSM \(publishedPsm)")
-        }
+        ensurePeripheralPublishedAndAdvertising()
     }
 
     func rescanNow() {
@@ -3617,12 +3689,7 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
             )
         }
-        if pm.state == .poweredOn && publishedPsm > 0 && !pm.isAdvertising {
-            let psmUuid = CBUUID(string: String(format: "%04X", 0xAD00 | (Int(publishedPsm) & 0xFF)))
-            pm.startAdvertising([
-                CBAdvertisementDataServiceUUIDsKey: [MAC_SERVICE_UUID, psmUuid]
-            ])
-        }
+        ensurePeripheralPublishedAndAdvertising()
         pingPeerIfNeeded()
     }
 
@@ -3712,11 +3779,9 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
     func pingPeerIfNeeded() {
         let settings = loadMacSettings()
         guard settings.visible else {
-            if cm?.state == .poweredOn && cm?.isScanning == true {
-                cm?.stopScan()
-            }
-            if isPingingPeer {
-                cancelActivePing()
+            if pm?.isAdvertising == true || hasPublishedGattService || publishedPsm > 0 ||
+               (cm?.state == .poweredOn && cm?.isScanning == true) || isPingingPeer {
+                stopAdvertisingAndScanning()
             }
             return
         }
@@ -3808,6 +3873,12 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
     }
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
+        guard loadMacSettings().visible else {
+            closeStreamSafely(channel?.inputStream)
+            closeStreamSafely(channel?.outputStream)
+            cancelActivePing()
+            return
+        }
         guard let ch = channel, error == nil else {
             discoveredPeerPsm = 0
             isPingingPeer = false
@@ -4068,48 +4139,45 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
     }
 
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
-        if peripheral.state == .poweredOn && publishedPsm == 0 {
-            peripheral.publishL2CAPChannel(withEncryption: false)
+        guard peripheral.state == .poweredOn else {
+            isPublishingL2cap = false
+            hasPublishedGattService = false
+            publishedPsm = 0
+            return
+        }
+        if loadMacSettings().visible {
+            ensurePeripheralPublishedAndAdvertising()
+        } else {
+            if peripheral.isAdvertising {
+                peripheral.stopAdvertising()
+            }
+            peripheral.removeAllServices()
+            hasPublishedGattService = false
         }
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didPublishL2CAPChannel PSM: CBL2CAPPSM, error: Error?) {
+        isPublishingL2cap = false
         guard error == nil else {
             print("[BLE-Daemon] Failed to publish L2CAP: \(error!)")
+            return
+        }
+        guard loadMacSettings().visible else {
+            peripheral.unpublishL2CAPChannel(PSM)
+            if peripheral.isAdvertising {
+                peripheral.stopAdvertising()
+            }
+            peripheral.removeAllServices()
+            hasPublishedGattService = false
+            publishedPsm = 0
+            print("[BLE-Daemon] Radio visibility is OFF — unpublished PSM \(PSM) immediately")
+            fflush(stdout)
             return
         }
         publishedPsm = PSM
         print("[BLE-Daemon] Published Direct BLE L2CAP channel on PSM \(PSM)")
         fflush(stdout)
-
-        if peripheral.isAdvertising {
-            peripheral.stopAdvertising()
-        }
-        peripheral.removeAllServices()
-
-        var le = UInt16(PSM).littleEndian
-        let psmData = Data(bytes: &le, count: 2)
-        let ch = CBMutableCharacteristic(
-            type: MAC_PSM_CHAR_UUID,
-            properties: [.read],
-            value: psmData,
-            permissions: [.readable]
-        )
-        let svc = CBMutableService(type: MAC_SERVICE_UUID, primary: true)
-        svc.characteristics = [ch]
-        peripheral.add(svc)
-
-        let psmUuid = CBUUID(string: String(format: "%04X", 0xAD00 | (Int(PSM) & 0xFF)))
-        let settings = loadMacSettings()
-        if settings.visible {
-            // Keep primary advertisement <= 25 bytes (3B Flags + 18B MAC_SERVICE_UUID + 4B psmUuid)
-            // so macOS CoreBluetooth never pushes MAC_SERVICE_UUID into the proprietary Apple Overflow Area.
-            peripheral.startAdvertising([
-                CBAdvertisementDataServiceUUIDsKey: [MAC_SERVICE_UUID, psmUuid]
-            ])
-        } else {
-            print("[BLE-Daemon] Published PSM \(PSM), but radio visibility is OFF.")
-        }
+        publishGattServiceAndAdvertise(peripheral: peripheral, psm: PSM)
     }
 
     func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
@@ -4118,6 +4186,11 @@ final class BleGlideDropDaemon: NSObject, CBPeripheralManagerDelegate, CBCentral
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didOpen channel: CBL2CAPChannel?, error: Error?) {
+        guard loadMacSettings().visible else {
+            closeStreamSafely(channel?.inputStream)
+            closeStreamSafely(channel?.outputStream)
+            return
+        }
         guard let ch = channel, error == nil else { return }
         activeChannels.append(ch)
         print("[BLE-Daemon] Incoming BLE L2CAP connection on PSM \(ch.psm)")
@@ -6018,6 +6091,8 @@ final class MacGlideDropViewModel: ObservableObject {
     private var fastTimer: Timer?
     private var tickCount: Int = 0
     private var appearanceObserver: NSObjectProtocol? = nil
+    private var isTogglingDaemon: Bool = false
+    private var lastDaemonAutoRestartAt: Date = .distantPast
 
     var effectiveIsDark: Bool {
         switch themeMode {
@@ -6130,7 +6205,9 @@ final class MacGlideDropViewModel: ObservableObject {
             activePeers = livePeers
         }
         let statusLine: String
-        if let first = livePeers.first {
+        if !receiverRunning {
+            statusLine = "0 Nearby Devices • Radio Paused"
+        } else if let first = livePeers.first {
             statusLine = "\(first.name) • \(first.transport) (\(first.rssi) dBm)"
         } else {
             statusLine = "0 Nearby Devices • Scanning BLE + 5 GHz Wi-Fi Direct"
@@ -6255,8 +6332,34 @@ final class MacGlideDropViewModel: ObservableObject {
     func refreshSlow() {
         refreshAiStatus()
         let s = loadMacSettings()
-        receiverRunning = s.visible && isPidAlive("daemon.pid")
-        bleRunning = true
+        let daemonAlive = isPidAlive("daemon.pid")
+        if !isTogglingDaemon {
+            // Keep UI switch aligned with persisted visibility setting so a brief receiver restart
+            // never shows the Mac as "Paused" while BLE is still advertising.
+            if receiverRunning != s.visible {
+                receiverRunning = s.visible
+            }
+            if s.visible && !daemonAlive && Date().timeIntervalSince(lastDaemonAutoRestartAt) > 10.0 {
+                lastDaemonAutoRestartAt = Date()
+                BleGlideDropDaemon.shared?.startAdvertisingAndScanning()
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
+                    p.environment = ProcessInfo.processInfo.environment
+                    p.environment?["SKIP_BLE_RESTART"] = "1"
+                    p.arguments = ["restart-receiver"]
+                    try? p.run()
+                    p.waitUntilExit()
+                    DispatchQueue.main.async {
+                        self?.refreshSlow()
+                    }
+                }
+            } else if !s.visible && (daemonAlive || isPidAlive("awdl-mdns.pid")) {
+                BleGlideDropDaemon.shared?.stopAdvertisingAndScanning()
+                stopHttpAndMdnsDaemons()
+            }
+        }
+        bleRunning = s.visible
 
         let auth = CBManager.authorization
         bluetoothAuthorized = (auth != .denied && auth != .restricted)
@@ -6336,10 +6439,34 @@ final class MacGlideDropViewModel: ObservableObject {
         }
     }
 
+    private func stopHttpAndMdnsDaemons() {
+        for pf in ["daemon.pid", "awdl-mdns.pid", "ble-daemon.pid"] {
+            let f = STATE_DIR.appendingPathComponent(pf)
+            if let s = try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               let pid = Int32(s), pid != getpid() {
+                kill(pid, SIGTERM)
+            }
+            if pf != "ble-daemon.pid" || (try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) != String(getpid()) {
+                try? FileManager.default.removeItem(at: f)
+            }
+        }
+        for staleFile in ["mac_rx_port", "finder_proxy_port", "finder_proxy.sock", "finder_proxy_sock", "active_peers.json", "p2p_status"] {
+            try? FileManager.default.removeItem(at: STATE_DIR.appendingPathComponent(staleFile))
+        }
+    }
+
     func rescanNow() {
+        let s = loadMacSettings()
+        guard s.visible else {
+            BleGlideDropDaemon.shared?.stopAdvertisingAndScanning()
+            transferStatus = "Radio paused — turn on Discoverable to scan"
+            refreshFast()
+            refreshSlow()
+            return
+        }
         transferStatus = "Scanning BLE + 5 GHz Wi-Fi Direct for nearby devices…"
         BleGlideDropDaemon.shared?.rescanNow()
-        if !receiverRunning {
+        if !isPidAlive("daemon.pid") {
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: SCRIPT_PATH)
@@ -6358,7 +6485,9 @@ final class MacGlideDropViewModel: ObservableObject {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
             self.refreshFast()
-            if self.activePeers.isEmpty {
+            if !loadMacSettings().visible {
+                self.transferStatus = "Radio paused"
+            } else if self.activePeers.isEmpty {
                 self.transferStatus = "Listening for nearby devices…"
             } else {
                 self.transferStatus = "\(self.activePeers.count) device(s) nearby and ready"
@@ -6367,14 +6496,18 @@ final class MacGlideDropViewModel: ObservableObject {
     }
 
     func toggleDaemons(_ turnOn: Bool) {
+        isTogglingDaemon = true
         transferStatus = turnOn ? "Starting P2P radio…" : "Pausing P2P radio…"
         receiverRunning = turnOn
+        bleRunning = turnOn
         saveMacSettings(autoAccept: autoAccept, visible: turnOn, deviceName: macDeviceName, themeMode: themeMode)
         if turnOn {
             BleGlideDropDaemon.shared?.startAdvertisingAndScanning()
             BleGlideDropDaemon.shared?.rescanNow()
         } else {
             BleGlideDropDaemon.shared?.stopAdvertisingAndScanning()
+            activePeers = []
+            peerStatusSummary = "0 Nearby Devices • Radio Paused"
         }
         DispatchQueue.global(qos: .userInitiated).async {
             if turnOn {
@@ -6386,18 +6519,10 @@ final class MacGlideDropViewModel: ObservableObject {
                 try? p.run()
                 p.waitUntilExit()
             } else {
-                for pf in ["daemon.pid", "awdl-mdns.pid", "ble-daemon.pid"] {
-                    let f = STATE_DIR.appendingPathComponent(pf)
-                    if let s = try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-                       let pid = Int32(s), pid != getpid() {
-                        kill(pid, SIGTERM)
-                    }
-                    if pf != "ble-daemon.pid" || (try? String(contentsOf: f, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) != String(getpid()) {
-                        try? FileManager.default.removeItem(at: f)
-                    }
-                }
+                self.stopHttpAndMdnsDaemons()
             }
             DispatchQueue.main.async {
+                self.isTogglingDaemon = false
                 self.refreshSlow()
                 self.transferStatus = turnOn
                     ? "Radio active (5 GHz Wi-Fi Direct • BLE L2CAP)"
@@ -6807,22 +6932,28 @@ struct MacGlideDropMainView: View {
                     Text("GlideDrop")
                         .font(.system(size: 19, weight: .bold, design: .rounded))
                         .foregroundColor(p.textPrimary)
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(vm.receiverRunning ? p.emerald : p.amber)
-                            .frame(width: 6, height: 6)
-                        Text(vm.receiverRunning ? "Discoverable" : "Paused")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(vm.receiverRunning ? p.emerald : p.amber)
+                    Button(action: { vm.toggleDaemons(!vm.receiverRunning) }) {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(vm.receiverRunning ? p.emerald : p.amber)
+                                .frame(width: 6, height: 6)
+                            Text(vm.receiverRunning ? "Discoverable" : "Paused")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(vm.receiverRunning ? p.emerald : p.amber)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule()
+                                .fill(vm.receiverRunning ? p.emeraldSubtle : p.amberSubtle)
+                        )
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(
-                        Capsule()
-                            .fill(vm.receiverRunning ? p.emeraldSubtle : p.amberSubtle)
-                    )
+                    .buttonStyle(MacScaleButtonStyle())
+                    .help(vm.receiverRunning ? "Click to pause Discoverable Nearby" : "Click to turn on Discoverable Nearby")
                 }
-                Text("Discoverable as \"\(vm.macDeviceName)\" • ~/Downloads")
+                Text(vm.receiverRunning
+                     ? "Discoverable as \"\(vm.macDeviceName)\" • ~/Downloads"
+                     : "Not discoverable to nearby devices • Click Paused to resume")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(p.textSecondary)
                     .lineLimit(1)
@@ -7586,10 +7717,10 @@ struct MacGlideDropMainView: View {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(vm.activePeers.isEmpty ? "Looking for Connections" : "Nearby Devices")
+                        Text(!vm.receiverRunning ? "Visibility Off" : (vm.activePeers.isEmpty ? "Looking for Connections" : "Nearby Devices"))
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundColor(p.textSecondary)
-                        Text(vm.activePeers.isEmpty ? "Radar Scanning…" : "\(vm.activePeers.count) Device\(vm.activePeers.count == 1 ? "" : "s") Ready")
+                        Text(!vm.receiverRunning ? "Radio Paused" : (vm.activePeers.isEmpty ? "Radar Scanning…" : "\(vm.activePeers.count) Device\(vm.activePeers.count == 1 ? "" : "s") Ready"))
                             .font(.system(size: 20, weight: .bold, design: .rounded))
                             .foregroundColor(p.textPrimary)
                     }
@@ -7622,7 +7753,9 @@ struct MacGlideDropMainView: View {
                     }
                 )
 
-                Text("Visible as \"\(vm.macDeviceName)\" • Incoming files save to ~/Downloads")
+                Text(vm.receiverRunning
+                     ? "Visible as \"\(vm.macDeviceName)\" • Incoming files save to ~/Downloads"
+                     : "Not visible to nearby devices • Turn on Discoverable Nearby to receive")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(p.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -7639,7 +7772,34 @@ struct MacGlideDropMainView: View {
                 .font(.system(size: 14, weight: .bold))
                 .foregroundColor(p.textPrimary)
 
-            if vm.activePeers.isEmpty {
+            if !vm.receiverRunning {
+                HStack(spacing: 10) {
+                    Image(systemName: "eye.slash.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(p.amber)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Discoverable Nearby is turned off")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(p.textPrimary)
+                        Text("Your Mac is hidden from nearby phones and stopped scanning.")
+                            .font(.system(size: 11))
+                            .foregroundColor(p.textSecondary)
+                    }
+                    Spacer()
+                    Button("Turn On") {
+                        vm.toggleDaemons(true)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(p.indigo)
+                    .controlSize(.small)
+                }
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(p.bgSurface)
+                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(p.border, lineWidth: 1))
+                )
+            } else if vm.activePeers.isEmpty {
                 HStack(spacing: 10) {
                     ProgressView()
                         .controlSize(.small)

@@ -988,4 +988,78 @@ class GlideDropSecurityTest {
         assertFalse(GlideDropNode.shouldAllowBleAutoFallback(5_000_001L, hasEntries = true))
         assertFalse(GlideDropNode.shouldAllowBleAutoFallback(25_000_000L, hasEntries = true))
     }
+
+    @Test
+    fun overflowBleAdvWithoutExplicitPsmNeverRefreshesPeerWithoutGatt() {
+        assertFalse(GlideDropNode.shouldRefreshMacPeerWithoutGatt(0))
+        assertFalse(GlideDropNode.shouldRefreshMacPeerWithoutGatt(-1))
+        assertTrue(GlideDropNode.shouldRefreshMacPeerWithoutGatt(192))
+    }
+
+    @Test
+    fun w2p2ApprovedSessionTokenSkipsSecondAskPromptOnceAndRepeatsForTrustedPeer() {
+        val now = 1_700_000_000_000L
+        val tok = "a1b2c3d4".repeat(8)
+        val macFp = "01234567".repeat(8)
+
+        // Untrusted peer: first /Ask consumes pre-approved W2P2 consent (no 2nd popup);
+        // reusing the same token for a second unrelated /Ask requires fresh consent.
+        val activeUntrusted = mutableMapOf(
+            tok to GlideDropNode.Companion.IncomingSessionTokenState(
+                expiresAtMs = now + 60_000L,
+                preApprovedTransfer = true,
+                peerTlsFingerprint = macFp
+            )
+        )
+        assertTrue(
+            GlideDropNode.isOrConsumePreApprovedSessionBearerToken(
+                "  ${tok.uppercase()}  ",
+                activeUntrusted,
+                trustedPeerFingerprints = emptySet(),
+                nowMs = now
+            )
+        )
+        assertFalse(
+            GlideDropNode.isOrConsumePreApprovedSessionBearerToken(
+                tok,
+                activeUntrusted,
+                trustedPeerFingerprints = emptySet(),
+                nowMs = now
+            )
+        )
+
+        // Trusted peer ("Always allow this Mac"): valid token bound to trusted fingerprint auto-approves repeatedly
+        val activeTrusted = mutableMapOf(
+            tok to GlideDropNode.Companion.IncomingSessionTokenState(
+                expiresAtMs = now + 60_000L,
+                preApprovedTransfer = false,
+                peerTlsFingerprint = macFp
+            )
+        )
+        assertTrue(
+            GlideDropNode.isOrConsumePreApprovedSessionBearerToken(
+                tok,
+                activeTrusted,
+                trustedPeerFingerprints = setOf(macFp),
+                nowMs = now
+            )
+        )
+        assertTrue(
+            GlideDropNode.isOrConsumePreApprovedSessionBearerToken(
+                tok,
+                activeTrusted,
+                trustedPeerFingerprints = setOf(macFp),
+                nowMs = now
+            )
+        )
+        // Expired token must fail closed even for a trusted peer
+        assertFalse(
+            GlideDropNode.isOrConsumePreApprovedSessionBearerToken(
+                tok,
+                activeTrusted,
+                trustedPeerFingerprints = setOf(macFp),
+                nowMs = now + 60_001L
+            )
+        )
+    }
 }

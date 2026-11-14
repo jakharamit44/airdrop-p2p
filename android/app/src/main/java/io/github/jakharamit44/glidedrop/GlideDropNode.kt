@@ -562,6 +562,16 @@ class GlideDropNode(private val context: Context) {
             return MacBleAdvParsed(hasMacService = true, psm = parsedPsm, displayName = remoteDisplayName)
         }
 
+        internal data class IncomingSessionTokenState(
+            val expiresAtMs: Long,
+            var preApprovedTransfer: Boolean = false,
+            val peerTlsFingerprint: String? = null
+        )
+
+        internal fun shouldRefreshMacPeerWithoutGatt(parsedPsm: Int): Boolean {
+            return parsedPsm > 0
+        }
+
         internal fun isValidSessionBearerToken(
             presented: String?,
             activeTokens: Map<String, Long>,
@@ -579,6 +589,34 @@ class GlideDropNode(private val context: Context) {
                 }
             }
             return matched
+        }
+
+        internal fun isOrConsumePreApprovedSessionBearerToken(
+            presented: String?,
+            activeTokens: Map<String, IncomingSessionTokenState>,
+            trustedPeerFingerprints: Set<String> = emptySet(),
+            nowMs: Long = System.currentTimeMillis()
+        ): Boolean {
+            val clean = presented?.trim()?.lowercase(java.util.Locale.US).orEmpty()
+            if (clean.length != 64 || !clean.all { it in '0'..'9' || it in 'a'..'f' }) return false
+            val presentedBytes = clean.toByteArray(StandardCharsets.US_ASCII)
+            var matchedEntry: IncomingSessionTokenState? = null
+            for ((tok, state) in activeTokens) {
+                if (state.expiresAtMs > nowMs && tok.length == 64) {
+                    if (MessageDigest.isEqual(presentedBytes, tok.toByteArray(StandardCharsets.US_ASCII))) {
+                        matchedEntry = state
+                    }
+                }
+            }
+            val entry = matchedEntry ?: return false
+            val isTrusted = !entry.peerTlsFingerprint.isNullOrBlank() &&
+                normalizeTlsFingerprint(entry.peerTlsFingerprint) in trustedPeerFingerprints
+            if (isTrusted) return true
+            if (entry.preApprovedTransfer) {
+                entry.preApprovedTransfer = false
+                return true
+            }
+            return false
         }
 
         fun isValidBleFrameBounds(metaLen: Int, archiveLen: Int, isEncryptedBle: Boolean): Boolean {
@@ -1793,9 +1831,17 @@ class GlideDropNode(private val context: Context) {
     @Volatile
     private var activeGroupPassphrase: String = ""
     private val incomingSessionTokensLock = Any()
-    private val incomingSessionTokens = LinkedHashMap<String, Long>()
+    private val incomingSessionTokens = LinkedHashMap<String, IncomingSessionTokenState>()
     private val p2pStateLock = Any()
     private val gattPsmResolveInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile
+    private var lastExplicitBleMacAdvAtMs: Long = 0L
+    @Volatile
+    private var lastGattProbeAtMs: Long = 0L
+    @Volatile
+    private var lastW2p2ApprovedAtMs: Long = 0L
+    @Volatile
+    private var lastW2p2ApprovedRemoteAddr: String = ""
     private var wifiTeardownJob: Job? = null
     private val wifiGroupGeneration = AtomicLong(0L)
     private val wifiGroupStarting = AtomicBoolean(false)
@@ -1817,17 +1863,26 @@ class GlideDropNode(private val context: Context) {
         lastMacSessionToken = ""
     }
 
-    private fun registerIncomingSessionToken(token: String) {
+    private fun registerIncomingSessionToken(
+        token: String,
+        preApprovedTransfer: Boolean = false,
+        peerTlsFingerprint: String? = null
+    ) {
         val clean = token.trim().lowercase(java.util.Locale.US)
         if (clean.length != 64 || !clean.all { it in '0'..'9' || it in 'a'..'f' }) return
+        val cleanFp = peerTlsFingerprint?.takeIf { isValidSha256Fingerprint(it) }?.let { normalizeTlsFingerprint(it) }
         val now = System.currentTimeMillis()
         synchronized(incomingSessionTokensLock) {
             val it = incomingSessionTokens.entries.iterator()
             while (it.hasNext()) {
-                if (it.next().value <= now) it.remove()
+                if (it.next().value.expiresAtMs <= now) it.remove()
             }
-            incomingSessionTokens.remove(clean)
-            incomingSessionTokens[clean] = now + INCOMING_SESSION_TOKEN_TTL_MS
+            val existing = incomingSessionTokens.remove(clean)
+            incomingSessionTokens[clean] = IncomingSessionTokenState(
+                expiresAtMs = now + INCOMING_SESSION_TOKEN_TTL_MS,
+                preApprovedTransfer = preApprovedTransfer || (existing?.preApprovedTransfer == true),
+                peerTlsFingerprint = cleanFp ?: existing?.peerTlsFingerprint
+            )
             while (incomingSessionTokens.size > MAX_INCOMING_SESSION_TOKENS) {
                 val eldest = incomingSessionTokens.keys.firstOrNull() ?: break
                 incomingSessionTokens.remove(eldest)
@@ -1840,17 +1895,31 @@ class GlideDropNode(private val context: Context) {
             val now = System.currentTimeMillis()
             val it = incomingSessionTokens.entries.iterator()
             while (it.hasNext()) {
-                if (it.next().value <= now) it.remove()
+                if (it.next().value.expiresAtMs <= now) it.remove()
             }
-            LinkedHashMap(incomingSessionTokens)
+            incomingSessionTokens.mapValues { it.value.expiresAtMs }
         }
         return isValidSessionBearerToken(presented, snapshot)
+    }
+
+    private fun consumePreApprovedIncomingSessionToken(presented: String?): Boolean {
+        val trusted = trustedPeerFingerprints()
+        synchronized(incomingSessionTokensLock) {
+            val now = System.currentTimeMillis()
+            val it = incomingSessionTokens.entries.iterator()
+            while (it.hasNext()) {
+                if (it.next().value.expiresAtMs <= now) it.remove()
+            }
+            return isOrConsumePreApprovedSessionBearerToken(presented, incomingSessionTokens, trusted, now)
+        }
     }
 
     private fun clearIncomingSessionTokens() {
         synchronized(incomingSessionTokensLock) {
             incomingSessionTokens.clear()
         }
+        lastW2p2ApprovedAtMs = 0L
+        lastW2p2ApprovedRemoteAddr = ""
     }
 
     internal fun activeP2pSubnets(): List<Pair<ByteArray, Int>> {
@@ -2613,6 +2682,33 @@ class GlideDropNode(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
+    private fun upsertLiveBleMacPeer(
+        dev: BluetoothDevice,
+        displayMacName: String,
+        psm: Int,
+        rssi: Int,
+        now: Long
+    ) {
+        val peerDisplayLabel = if (psm > 0) "$displayMacName (PSM $psm)" else displayMacName
+        val existing = _peers.value.firstOrNull { it.id == "ble-mac" }
+        val peerChanged = existing == null || existing.host != "ble://${dev.address}" || existing.port != psm
+        val blePeer = GlideDropPeer(
+            id = "ble-mac",
+            name = peerDisplayLabel,
+            host = "ble://${dev.address}",
+            port = psm,
+            rssi = rssi,
+            transport = "5GHz P2P • BLE",
+            lastSeenMs = now
+        )
+        _peers.value = listOf(blePeer)
+        if (peerChanged) {
+            log("Discovered live peer over BLE: $displayMacName (${dev.address}, psm=$psm, rssi=$rssi dBm)")
+            saveDirectSharePeer(blePeer, displayMacName)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private fun handleMacBleScanResult(result: ScanResult) {
         val dev = result.device ?: return
         val record = result.scanRecord ?: return
@@ -2622,66 +2718,43 @@ class GlideDropNode(private val context: Context) {
         val parsed = parseMacBleAdvertisement(uuids, macDataBytes, name)
         if (!parsed.hasMacService) return
 
-        val prevDev = bleMacDevice
-        val prevPsm = bleMacPsm
-        bleMacDevice = dev
-        if (parsed.psm > 0) {
-            bleMacPsm = parsed.psm
-        } else if (prevDev?.address != dev.address) {
-            bleMacPsm = 0
-        }
-        val effectivePsm = if (bleMacPsm > 0) bleMacPsm else 0
         val displayMacName = learnedMacName ?: parsed.displayName
-        val peerDisplayLabel = if (effectivePsm > 0) "$displayMacName (PSM $effectivePsm)" else displayMacName
         val now = System.currentTimeMillis()
 
-        if (effectivePsm <= 0 && gattPsmResolveInFlight.compareAndSet(false, true)) {
+        if (shouldRefreshMacPeerWithoutGatt(parsed.psm)) {
+            bleMacDevice = dev
+            bleMacPsm = parsed.psm
+            lastExplicitBleMacAdvAtMs = now
+            upsertLiveBleMacPeer(dev, displayMacName, parsed.psm, result.rssi, now)
+            return
+        }
+
+        // Ignore cached / macOS Overflow Area advertisements (psm == 0) unless GATT confirms
+        // the Mac's primary GATT service is actively published right now.
+        if ((now - lastGattProbeAtMs) >= 2_500L && gattPsmResolveInFlight.compareAndSet(false, true)) {
+            lastGattProbeAtMs = now
             scope.launch(Dispatchers.IO) {
                 try {
-                    val gattPsm = resolveMacGattPsm(dev)
-                    if (gattPsm > 0 && bleMacDevice?.address == dev.address) {
+                    val gattPsm = resolveMacGattPsm(dev, timeoutMs = 3_500L)
+                    val probeNow = System.currentTimeMillis()
+                    if (gattPsm > 0 && _running.value) {
+                        bleMacDevice = dev
                         bleMacPsm = gattPsm
-                        _peers.update { list ->
-                            list.map {
-                                if (it.id == "ble-mac") {
-                                    it.copy(name = "$displayMacName (PSM $gattPsm)", port = gattPsm)
-                                } else it
-                            }
+                        lastExplicitBleMacAdvAtMs = probeNow
+                        upsertLiveBleMacPeer(dev, displayMacName, gattPsm, result.rssi, probeNow)
+                    } else if ((probeNow - lastExplicitBleMacAdvAtMs) > 2_000L) {
+                        bleMacPsm = 0
+                        bleMacDevice = null
+                        val removed = _peers.value.any { it.id == "ble-mac" }
+                        _peers.update { list -> list.filterNot { it.id == "ble-mac" } }
+                        if (removed) {
+                            log("Mac BLE service unpublished (overflow scan only, GATT PSM=0) — removed offline peer")
                         }
                     }
                 } catch (_: SecurityException) {
                     refreshSystemReadiness()
                 } finally {
                     gattPsmResolveInFlight.set(false)
-                }
-            }
-        }
-
-        if (prevDev?.address != dev.address || (parsed.psm > 0 && prevPsm != parsed.psm) || _peers.value.none { it.id == "ble-mac" }) {
-            log("Discovered live peer over BLE: $displayMacName (${dev.address}, psm=$effectivePsm, rssi=${result.rssi} dBm)")
-            val blePeer = GlideDropPeer(
-                id = "ble-mac",
-                name = peerDisplayLabel,
-                host = "ble://${dev.address}",
-                port = effectivePsm,
-                rssi = result.rssi,
-                transport = "5GHz P2P • BLE",
-                lastSeenMs = now
-            )
-            _peers.value = listOf(blePeer)
-            saveDirectSharePeer(blePeer, displayMacName)
-        } else {
-            _peers.update { list ->
-                list.map {
-                    if (it.id == "ble-mac") {
-                        it.copy(
-                            name = peerDisplayLabel,
-                            host = "ble://${dev.address}",
-                            port = effectivePsm,
-                            rssi = result.rssi,
-                            lastSeenMs = now
-                        )
-                    } else it
                 }
             }
         }
@@ -3259,7 +3332,7 @@ class GlideDropNode(private val context: Context) {
                         val sessionToken = material.token
                         log("${sendPhasePrefix}W2P2 v$W2P2_PROTOCOL_VERSION verification code ${material.verificationCode}")
                         reportConnecting(label, totalRawBytes, fileCount, isSending = true, phase = "Waiting for $peerDisplayName to join 5GHz link… (code ${material.verificationCode})", peerName = peerDisplayName)
-                        registerIncomingSessionToken(sessionToken)
+                        registerIncomingSessionToken(sessionToken, preApprovedTransfer = false, peerTlsFingerprint = rawPin)
                         val proxyPort = activeProxyPortOr0()
                         val localHttpsPort = currentHttpsPort()
                         if (localHttpsPort !in 1..65535) {
@@ -3387,7 +3460,10 @@ class GlideDropNode(private val context: Context) {
                         val macPsm = parts.getOrNull(1)?.trim()?.toIntOrNull()?.takeIf { it > 0 } ?: 0
                         val macRssi = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: -48
                         learnedMacName = macName
-                        if (macPsm > 0) bleMacPsm = macPsm
+                        if (macPsm > 0) {
+                            bleMacPsm = macPsm
+                            lastExplicitBleMacAdvAtMs = System.currentTimeMillis()
+                        }
                         sock.remoteDevice?.let { bleMacDevice = it }
 
                         val effectivePsm = if (bleMacPsm > 0) bleMacPsm else 0
@@ -3590,9 +3666,9 @@ class GlideDropNode(private val context: Context) {
                                 w2p2Consent = cs
                             }
                             if (!cs.approved) {
-                                if (isTrustedPeer(macCertFingerprint)) {
+                                if (autoAccept || isTrustedPeer(macCertFingerprint)) {
                                     cs.approved = true
-                                    log("BLE W2P2 from $remoteAddr: trusted peer, code ${cs.material.verificationCode}")
+                                    log("BLE W2P2 from $remoteAddr: ${if (autoAccept) "auto-accept" else "trusted peer"}, code ${cs.material.verificationCode}")
                                 } else {
                                     busy.set(true)
                                     var deferred = cs.deferred
@@ -3675,7 +3751,13 @@ class GlideDropNode(private val context: Context) {
                                 val proxyPortOut = activeProxyPortOr0()
                                 if (ssidOut.isNotEmpty() && passOut.isNotEmpty() && parseNumericIpBytes(goIpOut) != null && httpsPortOut in 1..65535) {
                                     val material = cs.material
-                                    registerIncomingSessionToken(material.token)
+                                    lastW2p2ApprovedAtMs = System.currentTimeMillis()
+                                    lastW2p2ApprovedRemoteAddr = remoteAddr
+                                    registerIncomingSessionToken(
+                                        material.token,
+                                        preApprovedTransfer = true,
+                                        peerTlsFingerprint = macCertFingerprint
+                                    )
                                     val localTlsFp = normalizeTlsFingerprint(localFpForW2p2)
                                     val fullCreds = "$ssidOut\t$passOut\t$goIpOut\t$httpsPortOut\t$localTlsFp\t$proxyPortOut"
                                     val encCreds = encryptAesGcm(fullCreds.toByteArray(StandardCharsets.UTF_8), material.sessionKey)
@@ -3809,7 +3891,15 @@ class GlideDropNode(private val context: Context) {
                 }
 
                 busy.set(true)
-                val accepted = if (autoAccept) {
+                val recentW2p2FallbackApproved = lastW2p2ApprovedRemoteAddr == remoteAddr &&
+                    (System.currentTimeMillis() - lastW2p2ApprovedAtMs) in 0L..60_000L
+                val preApprovedAdre = autoAccept || recentW2p2FallbackApproved
+                if (recentW2p2FallbackApproved) {
+                    lastW2p2ApprovedAtMs = 0L
+                    lastW2p2ApprovedRemoteAddr = ""
+                }
+                val accepted = if (preApprovedAdre) {
+                    onConsentNotification?.invoke(null, null)
                     true
                 } else {
                     val deferred = CompletableDeferred<Boolean>()
@@ -4860,15 +4950,18 @@ class GlideDropNode(private val context: Context) {
                         }
 
                         log("ASK from $sender: $summary")
+                        val sessionToken = headers["x-glidedrop-token"]
+                        val preApprovedAsk = autoAccept || consumePreApprovedIncomingSessionToken(sessionToken)
                         reportConnecting(
                             label = lastAskLabel,
                             total = totalAskBytes,
                             fileCount = lastAskFileCount,
                             isSending = false,
-                            phase = if (autoAccept) "Starting incoming stream…" else "Waiting for your approval…",
+                            phase = if (preApprovedAsk) "Starting incoming stream…" else "Waiting for your approval…",
                             peerName = sender
                         )
-                        val accepted = if (autoAccept) {
+                        val accepted = if (preApprovedAsk) {
+                            onConsentNotification?.invoke(null, null)
                             true
                         } else {
                             val deferred = CompletableDeferred<Boolean>()

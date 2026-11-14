@@ -2,6 +2,11 @@
 
 All notable changes to GlideDrop are documented in this file.
 
+## [v3.0.3]
+### Fixed
+- **macOS Discoverable Nearby OFF leaked presence to Android**: turning off Discoverable Nearby on macOS now removes CoreBluetooth GATT services (`removeAllServices`), unpublishes the L2CAP channel, closes active channels, and stops stray daemons while keeping the header pill and Receive tab synchronized. On Android, macOS CoreBluetooth Overflow Area advertisements (`psm == 0`) no longer create or refresh a nearby Mac without a verified active GATT PSM.
+- **Duplicate accept popups on Android and Mac**: Android now carries forward one-time `W2P2` session approval and Trusted Devices (`"Always allow this Mac"`) checks into `POST /Ask` and `ADRE` fallback so only one accept dialog is shown per transfer (and zero on subsequent transfers from a trusted Mac). macOS now binds session consent to the verified token, Wi-Fi Direct gateway IP, and SSID even when the BLE placeholder name differs from `SenderComputerName`.
+
 ## [v3.0.2]
 ### Fixed
 - **History "Clear"** (Android and macOS) now clears only the history list, and only the entries in the selected tab (All / Received / Sent). It never deletes, moves or revokes access to the transferred files. Android shows "History cleared. Your files were not deleted."
