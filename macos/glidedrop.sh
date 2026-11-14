@@ -2655,7 +2655,7 @@ try:
                                 write_progress(True, "Sending", label, min(off, tot), tot, spd, eta, pct, fcount, phase="Sending files", peer_name=peer_name, is_connecting=False)
                 send_dvzip_block(make_odc_hdr(0, 0, "TRAILER!!!", 0))
                 s.sendall(b"0\r\n\r\n")
-                write_progress(True, "Sending", label, tot, tot, 0, 0, 99, fcount, phase="Finalizing transfer…", peer_name=peer_name, is_connecting=False)
+                write_progress(True, "Sending", label, tot, tot, 0, 0, 99, fcount, phase="Finalizing transfer on receiver…", peer_name=peer_name, is_connecting=False)
                 st3, _ = read_http_response(f)
                 if st3.split(" ", 2)[1] != "200":
                     print(f"[-] Peer rejected /Upload: {st3}", file=sys.stderr)

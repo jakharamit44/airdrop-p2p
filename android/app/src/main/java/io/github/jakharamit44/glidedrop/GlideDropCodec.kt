@@ -561,7 +561,7 @@ object GlideDropCodec {
         dvzipOut.close()
     }
 
-    private fun availableStorageBytes(destDir: File, context: Context?): Long {
+    internal fun availableStorageBytes(destDir: File, context: Context?): Long {
         if (context != null) {
             val allocatable = runCatching {
                 val sm = context.getSystemService(StorageManager::class.java) ?: return@runCatching null
@@ -579,33 +579,32 @@ object GlideDropCodec {
 
     data class ApprovedFile(val name: String, val size: Long? = null)
 
+    data class StreamedEntrySpec(
+        val name: String,
+        val sizeBytes: Long
+    )
+
     /**
-     * Extracts regular files only after a complete CPIO archive has been validated.
-     * BLE callers must set [maxExpandedBytes] to a transport-specific cap; Wi-Fi streams
-     * remain unrestricted by default. The cap includes headers, skipped entries and padding.
-     * After TRAILER!!!, only up to 64 KiB of zero padding is allowed. Decoder EOF and
-     * compressed-stream checksums/framing are validated before any files are published.
-     * Pass the user-approved [approvedFiles] to enforce the exact flattened names/counts
-     * and known sizes; null sizes support peers that omit FileSize. An empty list denies files.
-     * The caller owns rawIn and must provide a trusted destination directory.
+     * Streams validated regular CPIO entries directly to caller-provided output streams.
+     * Validates all CPIO headers/sizes, approved-file manifests, expansion bounds, TRAILER!!!,
+     * trailing padding, and DVZip/gzip EOF/footers before returning. On any error or
+     * cancellation, [onRollbackEntry] is invoked for every entry handle opened so far.
      */
-    fun extractDvzipCpio(
+    fun <T> extractDvzipCpioStreaming(
         rawIn: InputStream,
-        destDir: File,
-        context: Context? = null,
         maxExpandedBytes: Long = Long.MAX_VALUE,
-        approvedFiles: List<ApprovedFile>? = null
-    ): List<File> {
+        availableStorageBytes: (() -> Long)? = null,
+        approvedFiles: List<ApprovedFile>? = null,
+        checkCancelled: (() -> Unit)? = null,
+        openEntryOutput: (StreamedEntrySpec) -> Pair<T, OutputStream>,
+        onRollbackEntry: (T) -> Unit = {}
+    ): List<T> {
         require(maxExpandedBytes >= 0) { "Negative expansion limit" }
         val remaining = approvedFiles?.map {
             require(it.size == null || it.size >= 0) { "Negative approved file size" }
             it.copy(name = safeFileName(it.name))
         }?.groupingBy { it }?.eachCount()?.toMutableMap()
-        destDir.mkdirs()
-        val destination = destDir.canonicalFile
-        val staging = Files.createTempDirectory(destination.toPath(), ".glidedrop-")
-        val pending = ArrayList<Pair<File, String>>()
-        val saved = ArrayList<File>()
+        val openedHandles = ArrayList<T>()
         val ioBuf = ByteArray(DVZIP_STORED_BLOCK_BYTES)
         // Release decoder resources without closing the caller-owned HTTP/BLE stream.
         val borrowed = object : java.io.FilterInputStream(rawIn) {
@@ -635,6 +634,7 @@ object GlideDropCodec {
                 fun readExact(inp: InputStream, dst: ByteArray, len: Int = dst.size): Int {
                     var off = 0
                     while (off < len) {
+                        checkCancelled?.invoke()
                         val n = inp.read(dst, off, len - off)
                         if (n <= 0) break
                         off += n
@@ -643,6 +643,7 @@ object GlideDropCodec {
                 }
 
                 while (true) {
+                    checkCancelled?.invoke()
                     val magicBuf = ByteArray(6)
                     val m = readExact(cpioStream, magicBuf, 6)
                     if (m == 0) throw EOFException("Missing CPIO trailer")
@@ -720,24 +721,29 @@ object GlideDropCodec {
                         if (fileSize > maxExpandedBytes - cpioStream.expanded) {
                             throw IOException("Expanded archive exceeds limit: $maxExpandedBytes")
                         }
-                        val availableBytes = availableStorageBytes(destination, context)
-                        if (availableBytes < fileSize) {
-                            throw IOException("Insufficient storage space for $baseName: required $fileSize B, available $availableBytes B")
+                        if (availableStorageBytes != null) {
+                            val availableBytes = availableStorageBytes.invoke()
+                            if (availableBytes < fileSize) {
+                                throw IOException("Insufficient storage space for $baseName: required $fileSize B, available $availableBytes B")
+                            }
                         }
-                        val partFile = staging.resolve("${pending.size}.part").toFile()
-                        BufferedOutputStream(Files.newOutputStream(
-                            partFile.toPath(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS
-                        ), DVZIP_STORED_BLOCK_BYTES).use { fos ->
+                        checkCancelled?.invoke()
+                        val (handle, outStream) = openEntryOutput(StreamedEntrySpec(baseName, fileSize))
+                        openedHandles.add(handle)
+                        outStream.use { fos ->
                             var left = fileSize
                             while (left > 0) {
+                                checkCancelled?.invoke()
                                 val want = minOf(ioBuf.size.toLong(), left).toInt()
                                 val n = cpioStream.read(ioBuf, 0, want)
                                 if (n <= 0) throw EOFException("Truncated CPIO file data for $baseName")
+                                checkCancelled?.invoke()
                                 fos.write(ioBuf, 0, n)
                                 left -= n
                             }
+                            checkCancelled?.invoke()
+                            fos.flush()
                         }
-                        pending.add(partFile to baseName)
                     } else {
                         // Senders (macOS sharingd and GlideDrop for Mac) emit an empty "." root
                         // directory entry before files. Empty directories are never materialised
@@ -749,6 +755,7 @@ object GlideDropCodec {
                         }
                         var left = fileSize
                         while (left > 0) {
+                            checkCancelled?.invoke()
                             val want = minOf(ioBuf.size.toLong(), left).toInt()
                             val n = cpioStream.read(ioBuf, 0, want)
                             if (n <= 0) throw EOFException("Truncated CPIO non-file entry")
@@ -766,6 +773,7 @@ object GlideDropCodec {
                 // Reaching TRAILER!!! alone does not validate a gzip/zlib footer or later DVZip blocks.
                 var padding = 0
                 while (true) {
+                    checkCancelled?.invoke()
                     val n = cpioStream.read(ioBuf, 0, minOf(ioBuf.size, MAX_CPIO_TRAILING_PADDING_BYTES - padding + 1))
                     if (n < 0) break
                     padding += n
@@ -776,6 +784,59 @@ object GlideDropCodec {
                 }
             }
             if (!remaining.isNullOrEmpty()) throw IOException("CPIO archive is missing approved files")
+            checkCancelled?.invoke()
+            return openedHandles
+        } catch (t: Throwable) {
+            for (handle in openedHandles) {
+                runCatching { onRollbackEntry(handle) }
+            }
+            throw t
+        }
+    }
+
+    /**
+     * Extracts regular files only after a complete CPIO archive has been validated.
+     * BLE callers must set [maxExpandedBytes] to a transport-specific cap; Wi-Fi streams
+     * remain unrestricted by default. The cap includes headers, skipped entries and padding.
+     * After TRAILER!!!, only up to 64 KiB of zero padding is allowed. Decoder EOF and
+     * compressed-stream checksums/framing are validated before any files are published.
+     * Pass the user-approved [approvedFiles] to enforce the exact flattened names/counts
+     * and known sizes; null sizes support peers that omit FileSize. An empty list denies files.
+     * The caller owns rawIn and must provide a trusted destination directory.
+     */
+    fun extractDvzipCpio(
+        rawIn: InputStream,
+        destDir: File,
+        context: Context? = null,
+        maxExpandedBytes: Long = Long.MAX_VALUE,
+        approvedFiles: List<ApprovedFile>? = null
+    ): List<File> {
+        destDir.mkdirs()
+        val destination = destDir.canonicalFile
+        val staging = Files.createTempDirectory(destination.toPath(), ".glidedrop-")
+        val saved = ArrayList<File>()
+        try {
+            var entryIdx = 0
+            val pending = extractDvzipCpioStreaming(
+                rawIn = rawIn,
+                maxExpandedBytes = maxExpandedBytes,
+                availableStorageBytes = { availableStorageBytes(destination, context) },
+                approvedFiles = approvedFiles,
+                openEntryOutput = { spec ->
+                    val partFile = staging.resolve("${entryIdx++}.part").toFile()
+                    val out = BufferedOutputStream(
+                        Files.newOutputStream(
+                            partFile.toPath(),
+                            StandardOpenOption.CREATE_NEW,
+                            StandardOpenOption.WRITE,
+                            LinkOption.NOFOLLOW_LINKS
+                        ),
+                        DVZIP_STORED_BLOCK_BYTES
+                    )
+                    (partFile to spec.name) to out
+                },
+                onRollbackEntry = { (partFile, _) -> partFile.delete() }
+            )
             for ((partFile, baseName) in pending) {
                 var suffix = 0
                 while (true) {

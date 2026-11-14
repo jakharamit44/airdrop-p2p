@@ -378,4 +378,72 @@ class GlideDropNodeRegressionTest {
         }
         org.junit.Assert.assertTrue(body.contains("filter"))
     }
+
+    @Test
+    fun extractDvzipCpioStreamingWritesValidatedEntriesAndRollsBackOnFailure() {
+        val payloadA = "first-streamed-payload".toByteArray()
+        val payloadB = ByteArray(128 * 1024) { (it % 251).toByte() }
+        val archive = ByteArrayOutputStream().also { out ->
+            GlideDropCodec.writeDvzipCpio(
+                listOf(
+                    GlideDropCodec.OutgoingEntry("first.txt", payloadA.size.toLong()) { payloadA.inputStream() },
+                    GlideDropCodec.OutgoingEntry("second.bin", payloadB.size.toLong()) { payloadB.inputStream() }
+                ),
+                out
+            )
+        }.toByteArray()
+
+        val committed = LinkedHashMap<String, ByteArrayOutputStream>()
+        val rolledBack = ArrayList<String>()
+        val handles = GlideDropCodec.extractDvzipCpioStreaming(
+            rawIn = archive.inputStream(),
+            approvedFiles = listOf(
+                GlideDropCodec.ApprovedFile("first.txt", payloadA.size.toLong()),
+                GlideDropCodec.ApprovedFile("second.bin", payloadB.size.toLong())
+            ),
+            openEntryOutput = { spec ->
+                val buf = ByteArrayOutputStream()
+                committed[spec.name] = buf
+                spec.name to buf
+            },
+            onRollbackEntry = { name -> rolledBack.add(name) }
+        )
+        assertEquals(listOf("first.txt", "second.bin"), handles)
+        assertTrue(rolledBack.isEmpty())
+        assertTrue(committed.getValue("first.txt").toByteArray().contentEquals(payloadA))
+        assertTrue(committed.getValue("second.bin").toByteArray().contentEquals(payloadB))
+
+        // Truncated before TRAILER!!! + EOF must invoke rollback for all opened handles
+        val truncatedArchive = archive.copyOfRange(0, archive.size - 16)
+        val rolledBackTruncated = ArrayList<String>()
+        try {
+            GlideDropCodec.extractDvzipCpioStreaming(
+                rawIn = truncatedArchive.inputStream(),
+                openEntryOutput = { spec -> spec.name to ByteArrayOutputStream() },
+                onRollbackEntry = { name -> rolledBackTruncated.add(name) }
+            )
+            fail("Truncated streaming archive must fail")
+        } catch (_: IOException) {
+            assertEquals(listOf("first.txt", "second.bin"), rolledBackTruncated)
+        }
+
+        // Cancellation after first entry opened must also roll back
+        val rolledBackCancel = ArrayList<String>()
+        var cancelled = false
+        try {
+            GlideDropCodec.extractDvzipCpioStreaming(
+                rawIn = archive.inputStream(),
+                checkCancelled = { if (cancelled) throw IOException("cancelled mid-stream") },
+                openEntryOutput = { spec ->
+                    cancelled = true
+                    spec.name to ByteArrayOutputStream()
+                },
+                onRollbackEntry = { name -> rolledBackCancel.add(name) }
+            )
+            fail("Cancelled streaming extraction must fail")
+        } catch (e: IOException) {
+            assertEquals("cancelled mid-stream", e.message)
+            assertEquals(listOf("first.txt"), rolledBackCancel)
+        }
+    }
 }

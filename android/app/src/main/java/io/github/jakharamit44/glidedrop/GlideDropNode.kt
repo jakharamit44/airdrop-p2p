@@ -1437,7 +1437,7 @@ class GlideDropNode(private val context: Context) {
                 val mgr = wifiP2pManager ?: return
                 val ch = wifiP2pChannel ?: return
                 runCatching {
-                    mgr.requestGroupInfo(ch) { group ->
+                    requestWifiDirectGroupInfo(mgr, ch) { group ->
                         if (generation == wifiGroupGeneration.get() && group == null && wifiDirectCreds.isNotEmpty()) {
                             stopWifiDirectGroup()
                         }
@@ -1445,6 +1445,29 @@ class GlideDropNode(private val context: Context) {
                 }
             }
         }
+    }
+
+    private fun hasWifiDirectPermission(): Boolean {
+        val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.NEARBY_WIFI_DEVICES
+        } else {
+            Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        return ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestWifiDirectGroupInfo(
+        mgr: WifiP2pManager,
+        ch: WifiP2pManager.Channel,
+        onDenied: (() -> Unit)? = null,
+        onResult: (WifiP2pGroup?) -> Unit,
+    ) {
+        if (!hasWifiDirectPermission()) {
+            onDenied?.invoke()
+            return
+        }
+        mgr.requestGroupInfo(ch, onResult)
     }
 
     fun refreshSystemReadiness() {
@@ -1460,10 +1483,7 @@ class GlideDropNode(private val context: Context) {
                 ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
                 ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
                 localNetOk &&
-                ContextCompat.checkSelfPermission(
-                    context,
-                    if (Build.VERSION.SDK_INT >= 33) Manifest.permission.NEARBY_WIFI_DEVICES else Manifest.permission.ACCESS_FINE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED
+                hasWifiDirectPermission()
         val prevBt = _bluetoothEnabled.value
         _bluetoothEnabled.value = btOn
         _wifiEnabled.value = wfOn
@@ -1628,6 +1648,32 @@ class GlideDropNode(private val context: Context) {
             peerName = cleanPeer
         )
         onTransferProgress?.invoke(label, 0, 0L, total, 0L, isSending, true, phase)
+    }
+
+    private fun reportFinalizing(
+        label: String,
+        total: Long,
+        fileCount: Int,
+        isSending: Boolean,
+        phase: String,
+        peerName: String = learnedMacName ?: "Nearby Peer"
+    ) {
+        if (transferCancelled) return
+        val cleanPeer = peerName.substringBefore(" (PSM").trim().ifEmpty { "Nearby Peer" }
+        _transferProgress.value = TransferProgress(
+            label = label,
+            percent = 99,
+            doneBytes = total,
+            totalBytes = total,
+            speedBytesPerSec = 0L,
+            etaSeconds = 0L,
+            fileCount = fileCount.coerceAtLeast(1),
+            isSending = isSending,
+            isConnecting = false,
+            phase = phase,
+            peerName = cleanPeer
+        )
+        onTransferProgress?.invoke(label, 99, total, total, 0L, isSending, false, phase)
     }
 
     private fun isValidPeerTransferIp(ip: String): Boolean {
@@ -2873,7 +2919,13 @@ class GlideDropNode(private val context: Context) {
                         continuation.resume(null)
                     } else {
                         try {
-                            mgr.requestGroupInfo(ch) { group ->
+                            requestWifiDirectGroupInfo(
+                                mgr = mgr,
+                                ch = ch,
+                                onDenied = {
+                                    if (continuation.isActive) continuation.resume(null)
+                                }
+                            ) { group ->
                                 if (continuation.isActive) continuation.resume(group)
                             }
                         } catch (_: Exception) {
@@ -2966,38 +3018,97 @@ class GlideDropNode(private val context: Context) {
         maxExpandedBytes: Long = Long.MAX_VALUE,
         publicationTimeoutMs: Long = 240_000L
     ): List<ReceivedItem> {
-        val stagingRoot = File(context.filesDir, "incoming-staging")
-        if (!stagingRoot.isDirectory && !stagingRoot.mkdirs()) throw IOException("Cannot create private receive staging directory")
-        val staging = Files.createTempDirectory(stagingRoot.toPath(), "transfer-").toFile()
         val resolver = context.contentResolver
-        val inserted = ArrayList<Uri>()
+        val inserted = Collections.synchronizedList(ArrayList<Uri>())
+        val items = ArrayList<ReceivedItem>()
         val publicationJob = currentCoroutineContext()[Job]
         val sessionSocket = activeTransferSocket
         var heartbeat: Job? = null
+        fun checkStreamActive() {
+            publicationJob?.ensureActive()
+            if (transferCancelled) throw IOException("Transfer cancelled")
+        }
+        val downloadsVolumeProbe = runCatching {
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
+        }.getOrNull()
         try {
-            val extracted = GlideDropCodec.extractDvzipCpio(
-                input, staging, context, maxExpandedBytes = maxExpandedBytes, approvedFiles = approvedFiles
+            GlideDropCodec.extractDvzipCpioStreaming(
+                rawIn = input,
+                maxExpandedBytes = maxExpandedBytes,
+                availableStorageBytes = {
+                    val dir = downloadsVolumeProbe ?: context.filesDir
+                    GlideDropCodec.availableStorageBytes(dir, context)
+                },
+                approvedFiles = approvedFiles,
+                checkCancelled = ::checkStreamActive,
+                openEntryOutput = { spec ->
+                    checkStreamActive()
+                    val ext = spec.name.substringAfterLast('.', "").lowercase(java.util.Locale.US)
+                    val mime = if (ext.isNotEmpty()) {
+                        MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+                    } else {
+                        "application/octet-stream"
+                    }
+                    val values = ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, spec.name)
+                        put(MediaStore.Downloads.MIME_TYPE, mime)
+                        put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/GlideDrop")
+                        put(MediaStore.Downloads.IS_PENDING, 1)
+                    }
+                    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IOException("Cannot create Downloads item for ${spec.name}")
+                    inserted.add(uri)
+                    val rawOut = resolver.openOutputStream(uri, "w")
+                        ?: throw IOException("Cannot open Downloads item for ${spec.name}")
+                    activePublicationStream = rawOut
+                    val bufferedOut = object : BufferedOutputStream(rawOut, GlideDropCodec.DVZIP_STORED_BLOCK_BYTES) {
+                        override fun close() {
+                            try {
+                                super.close()
+                            } finally {
+                                if (activePublicationStream === rawOut) activePublicationStream = null
+                            }
+                        }
+                    }
+                    items.add(
+                        ReceivedItem(
+                            title = spec.name,
+                            pathOrUrl = uri.toString(),
+                            isUrl = false,
+                            sizeBytes = spec.sizeBytes,
+                            isOutgoing = false,
+                            peerName = sender
+                        )
+                    )
+                    uri to bufferedOut
+                },
+                onRollbackEntry = { uri ->
+                    inserted.remove(uri)
+                    runCatching { resolver.delete(uri, null, null) }
+                }
             )
             // Validate the transport terminator before publishing; CPIO ends before HTTP chunk framing does.
             val drainBuffer = ByteArray(65_536)
             while (input.read(drainBuffer) != -1) {
-                if (transferCancelled) throw IOException("Transfer cancelled")
+                checkStreamActive()
             }
             val deadline = System.nanoTime() + publicationTimeoutMs * 1_000_000L
-            val publishedBytes = AtomicLong(0L)
-            val totalBytes = extracted.sumOf { it.length() }
-            val label = extracted.firstOrNull()?.name ?: "Incoming files"
+            val totalBytes = items.sumOf { it.sizeBytes }
+            val label = items.firstOrNull()?.title ?: "Incoming files"
             fun checkPublicationActive() {
                 publicationJob?.ensureActive()
                 if (transferCancelled) throw IOException("Transfer cancelled")
                 if (System.nanoTime() >= deadline) throw IOException("Downloads publication timed out")
             }
-            fun emitPublicationStatus() {
-                reportConnecting(label, totalBytes, maxOf(1, extracted.size), isSending = false,
-                    phase = "Saving to Downloads (${formatBytes(publishedBytes.get())} / ${formatBytes(totalBytes)})", peerName = sender)
-            }
             checkPublicationActive()
-            emitPublicationStatus()
+            reportFinalizing(
+                label = label,
+                total = totalBytes,
+                fileCount = maxOf(1, items.size),
+                isSending = false,
+                phase = "Finalizing in Downloads…",
+                peerName = sender
+            )
             heartbeat = scope.launch {
                 while (isActive) {
                     kotlinx.coroutines.delay(1_000L)
@@ -3006,48 +3117,10 @@ class GlideDropNode(private val context: Context) {
                         runCatching { activePublicationStream?.close() }
                         break
                     }
-                    emitPublicationStatus()
                 }
             }
-            var completedBytes = 0L
-            val items = extracted.map { file ->
-                checkPublicationActive()
-                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase(java.util.Locale.US))
-                    ?: "application/octet-stream"
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, file.name)
-                    put(MediaStore.Downloads.MIME_TYPE, mime)
-                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/GlideDrop")
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                    ?: throw IOException("Cannot create Downloads item for ${file.name}")
-                inserted.add(uri)
-                val output = resolver.openOutputStream(uri, "w") ?: throw IOException("Cannot open Downloads item for ${file.name}")
-                activePublicationStream = output
-                try {
-                    output.use { out ->
-                        file.inputStream().use { source ->
-                            copyForPublication(source, out, ::checkPublicationActive) { copied ->
-                                publishedBytes.set(completedBytes + copied)
-                            }
-                        }
-                    }
-                } finally {
-                    if (activePublicationStream === output) activePublicationStream = null
-                }
-                completedBytes += file.length()
-                checkPublicationActive()
-                ReceivedItem(
-                    title = file.name,
-                    pathOrUrl = uri.toString(),
-                    isUrl = false,
-                    sizeBytes = file.length(),
-                    isOutgoing = false,
-                    peerName = sender
-                )
-            }
-            for (uri in inserted) {
+            val urisToPublish = synchronized(inserted) { inserted.toList() }
+            for (uri in urisToPublish) {
                 checkPublicationActive()
                 val updated = resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
                 if (updated != 1) throw IOException("Cannot publish Downloads item")
@@ -3055,12 +3128,14 @@ class GlideDropNode(private val context: Context) {
             checkPublicationActive()
             return items
         } catch (t: Throwable) {
-            for (uri in inserted) runCatching { resolver.delete(uri, null, null) }
+            val toDelete = synchronized(inserted) { inserted.toList() }
+            for (uri in toDelete) runCatching { resolver.delete(uri, null, null) }
             throw t
         } finally {
             withContext(NonCancellable) {
                 heartbeat?.cancelAndJoin()
-                staging.deleteRecursively()
+                runCatching { activePublicationStream?.close() }
+                activePublicationStream = null
             }
         }
     }
@@ -4502,7 +4577,7 @@ class GlideDropNode(private val context: Context) {
                         chunkedOut.close()
                         writeWatchdogJob.cancel()
                         tls.soTimeout = RECEIVER_CONFIRMATION_TIMEOUT_MS
-                        reportConnecting(label, total, fileCount, isSending = true, phase = "Waiting for receiver to save files…")
+                        reportFinalizing(label, total, fileCount, isSending = true, phase = "Finalizing transfer on receiver…")
                         val upStatus = readHttpLine(inp).orEmpty()
                         if (!upStatus.contains("200") || transferCancelled) return false
                         reportProgress(label, 100, total, total, startedAt, fileCount, isSending = true)

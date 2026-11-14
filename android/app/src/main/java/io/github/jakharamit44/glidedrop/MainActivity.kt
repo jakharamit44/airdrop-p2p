@@ -2,7 +2,6 @@ package io.github.jakharamit44.glidedrop
 
 import android.Manifest
 import android.animation.ValueAnimator
-import android.app.Activity
 import android.app.DownloadManager
 import android.bluetooth.BluetoothAdapter
 import android.content.ClipData
@@ -64,21 +63,23 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextFieldColors
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -107,7 +108,6 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -122,7 +122,6 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.net.toUri
-import androidx.core.view.WindowCompat
 import io.github.jakharamit44.glidedrop.theme.GlideDropTheme
 import ds.tokens.DsMotion
 import ds.tokens.LocalDsColors
@@ -290,21 +289,17 @@ class MainActivity : ComponentActivity() {
 
         enableEdgeToEdge()
         setContent {
-            val themeMode by node.themeModeFlow.collectAsState()
+            val rawThemeMode by node.themeModeFlow.collectAsState()
+            val themeMode = when (rawThemeMode.lowercase(Locale.US)) {
+                "light", "day" -> "light"
+                "dark", "night" -> "dark"
+                else -> "system"
+            }
             val systemDark = isSystemInDarkTheme()
             val isDark = when (themeMode) {
                 "light" -> false
                 "dark" -> true
                 else -> systemDark
-            }
-            val view = LocalView.current
-            if (!view.isInEditMode) {
-                SideEffect {
-                    val window = (view.context as? Activity)?.window ?: return@SideEffect
-                    val controller = WindowCompat.getInsetsController(window, view)
-                    controller.isAppearanceLightStatusBars = !isDark
-                    controller.isAppearanceLightNavigationBars = !isDark
-                }
             }
 
             GlideDropTheme(darkTheme = isDark) {
@@ -396,6 +391,28 @@ private enum class QuickIconKind {
     SEND, RECEIVE, HISTORY, SETTINGS,
     IMAGE, VIDEO, DOC, AUDIO, LINK, FOLDER,
     SUN, MOON, REFRESH, CHECK, CLOSE, PLUS, SEARCH, BLUETOOTH, UPLOAD, DOWNLOAD
+}
+
+@Composable
+private fun glideTextFieldColors(): TextFieldColors {
+    val c = LocalDsColors.current
+    return OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = c.bgActionPrimary,
+        unfocusedBorderColor = c.borderDefault,
+        focusedLabelColor = c.bgActionPrimary,
+        unfocusedLabelColor = c.textSecondary,
+        cursorColor = c.bgActionPrimary,
+        focusedTextColor = c.textPrimary,
+        unfocusedTextColor = c.textPrimary,
+        focusedPlaceholderColor = c.textTertiary,
+        unfocusedPlaceholderColor = c.textTertiary,
+        focusedLeadingIconColor = c.iconDefault,
+        unfocusedLeadingIconColor = c.iconSubtle,
+        focusedTrailingIconColor = c.iconDefault,
+        unfocusedTrailingIconColor = c.iconSubtle,
+        focusedContainerColor = c.surfaceSunken,
+        unfocusedContainerColor = c.surfaceSunken
+    )
 }
 
 @Composable
@@ -667,7 +684,12 @@ fun GlideDropScreen(
                             onCheckedChange = {
                                 rememberPeerChecked = it
                                 ask.rememberPeer?.set(it)
-                            }
+                            },
+                            colors = CheckboxDefaults.colors(
+                                checkedColor = c.bgActionPrimary,
+                                uncheckedColor = c.textSecondary,
+                                checkmarkColor = c.textOnAction
+                            )
                         )
                         Text("Always allow this Mac", color = c.textPrimary, fontSize = 14.sp)
                     }
@@ -814,6 +836,8 @@ fun GlideDropScreen(
                         value = textSnippetDraft,
                         onValueChange = { textSnippetDraft = it },
                         placeholder = { Text("https://example.com or note…", color = c.textTertiary) },
+                        colors = glideTextFieldColors(),
+                        shape = RoundedCornerShape(12.dp),
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 96.dp, max = 180.dp)
@@ -860,18 +884,23 @@ fun GlideDropScreen(
                     onValueChange = { renameText = it.take(28) },
                     singleLine = true,
                     label = { Text("Visible to nearby Macs") },
+                    colors = glideTextFieldColors(),
+                    shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth()
                 )
             },
             confirmButton = {
                 Button(
+                    enabled = renameText.trim().isNotEmpty(),
                     onClick = {
-                        node.deviceName = renameText
+                        node.deviceName = renameText.trim()
                         showRenameDialog = false
                     },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = c.bgActionPrimary,
-                        contentColor = c.textOnAction
+                        contentColor = c.textOnAction,
+                        disabledContainerColor = c.bgDisabled,
+                        disabledContentColor = c.textDisabled
                     ),
                     shape = RoundedCornerShape(10.dp)
                 ) {
@@ -996,6 +1025,15 @@ fun GlideDropScreen(
                     onSwitchToHistory = {
                         historyFilter = 2
                         activeTab = 2
+                    },
+                    onOpenRecentSent = { sent ->
+                        if (sent.isUrl) {
+                            onOpenUrl(sent.pathOrUrl)
+                        } else {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("GlideDrop", sent.title))
+                            Toast.makeText(context, "Copied filename: ${sent.title}", Toast.LENGTH_SHORT).show()
+                        }
                     },
                     onRescan = { node.refreshP2p() }
                 )
@@ -1281,6 +1319,11 @@ private fun LiveConnectionBridgeCard(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.weight(1f)
                 ) {
+                    val isFinalizing = !progress.isConnecting && (
+                        progress.phase.contains("Finalizing", ignoreCase = true) ||
+                            progress.phase.contains("Saving", ignoreCase = true) ||
+                            (progress.percent >= 99 && progress.speedBytesPerSec <= 0L)
+                        )
                     Box(
                         modifier = Modifier
                             .size(9.dp)
@@ -1288,7 +1331,11 @@ private fun LiveConnectionBridgeCard(
                             .background(if (progress.isConnecting) c.bgActionPrimary else c.bgSuccessBold)
                     )
                     Text(
-                        text = if (progress.isConnecting) "Connecting\u2026" else "Connected",
+                        text = when {
+                            progress.isConnecting -> "Connecting\u2026"
+                            isFinalizing -> "Finalizing\u2026"
+                            else -> "Connected"
+                        },
                         color = c.textPrimary,
                         fontWeight = FontWeight.Bold,
                         fontSize = 16.sp,
@@ -1434,7 +1481,12 @@ private fun LiveConnectionBridgeCard(
                     )
                     MetricColumn(
                         label = "Speed",
-                        value = if (progress.isConnecting) "Handshake\u2026" else GlideDropNode.formatSpeed(progress.speedBytesPerSec),
+                        value = when {
+                            progress.isConnecting -> "Handshake\u2026"
+                            progress.speedBytesPerSec <= 0L && progress.percent >= 99 -> "Finalizing\u2026"
+                            progress.speedBytesPerSec <= 0L -> "Starting\u2026"
+                            else -> GlideDropNode.formatSpeed(progress.speedBytesPerSec)
+                        },
                         textColor = c.textOnAction,
                         modifier = Modifier.weight(0.95f)
                     )
@@ -1573,7 +1625,7 @@ private fun MetricColumn(
         Text(
             text = value,
             color = textColor,
-            fontSize = 12.sp,
+            fontSize = if (value.length > 14) 11.sp else 12.sp,
             fontWeight = FontWeight.Bold,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -1605,6 +1657,7 @@ private fun SendHomeTab(
     onPickAnyFiles: () -> Unit,
     onSwitchToReceive: () -> Unit,
     onSwitchToHistory: () -> Unit,
+    onOpenRecentSent: (ReceivedItem) -> Unit,
     onRescan: () -> Unit
 ) {
     val c = LocalDsColors.current
@@ -1725,17 +1778,19 @@ private fun SendHomeTab(
 
         // 4. Primary Send / Receive Action Buttons (Mockup 2 Bottom Action Pair)
         item {
+            val sendDisabled = transferActive && stagedItems.isNotEmpty()
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Surface(
-                    color = c.bgActionPrimary,
+                    color = if (sendDisabled) c.bgDisabled else c.bgActionPrimary,
                     shape = RoundedCornerShape(16.dp),
                     modifier = Modifier
                         .weight(1f)
                         .height(54.dp)
                         .pressableScale(
+                            enabled = !sendDisabled,
                             onClick = {
                                 if (stagedItems.isEmpty()) onPickAnyFiles() else onSendStaged()
                             }
@@ -1748,11 +1803,19 @@ private fun SendHomeTab(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center
                     ) {
-                        QuickVectorIcon(kind = QuickIconKind.SEND, tint = c.textOnAction, size = 18.dp)
+                        QuickVectorIcon(
+                            kind = QuickIconKind.SEND,
+                            tint = if (sendDisabled) c.textDisabled else c.textOnAction,
+                            size = 18.dp
+                        )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (stagedItems.isEmpty()) "Select Files" else "Send (${stagedItems.size})",
-                            color = c.textOnAction,
+                            text = when {
+                                sendDisabled -> "Sending\u2026"
+                                stagedItems.isEmpty() -> "Select Files"
+                                else -> "Send (${stagedItems.size})"
+                            },
+                            color = if (sendDisabled) c.textDisabled else c.textOnAction,
                             fontWeight = FontWeight.Bold,
                             fontSize = 15.sp,
                             maxLines = 1
@@ -1823,7 +1886,11 @@ private fun SendHomeTab(
                         }
                         recentSent.forEach { sent ->
                             Row(
-                                modifier = Modifier.fillMaxWidth(),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { onOpenRecentSent(sent) }
+                                    .padding(vertical = 4.dp, horizontal = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
@@ -1853,6 +1920,12 @@ private fun SendHomeTab(
                                         maxLines = 1
                                     )
                                 }
+                                Text(
+                                    text = if (sent.isUrl) "Open" else "Copy",
+                                    color = c.textAccent,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
                             }
                         }
                     }
@@ -2748,6 +2821,7 @@ private fun TransfersHistoryScreen(
                     }
                 }
             },
+            colors = glideTextFieldColors(),
             shape = RoundedCornerShape(14.dp),
             modifier = Modifier.fillMaxWidth()
         )
@@ -2856,6 +2930,15 @@ private fun TransfersHistoryScreen(
                                     }
                                     TextButton(onClick = { onOpenItem(item) }) {
                                         Text("Open", color = c.textAccent, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                                    }
+                                }
+                            } else {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.End
+                                ) {
+                                    TextButton(onClick = { onCopyText(item.title) }) {
+                                        Text("Copy Name", color = c.textSecondary, fontSize = 12.sp)
                                     }
                                 }
                             }
@@ -3144,7 +3227,11 @@ private fun SettingsScreenTab(
                             onCheckedChange = onToggleRunning,
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color.White,
-                                checkedTrackColor = c.bgActionPrimary
+                                checkedTrackColor = c.bgActionPrimary,
+                                checkedBorderColor = c.bgActionPrimary,
+                                uncheckedThumbColor = c.textSecondary,
+                                uncheckedTrackColor = c.surfaceSunken,
+                                uncheckedBorderColor = c.borderDefault
                             )
                         )
                     }

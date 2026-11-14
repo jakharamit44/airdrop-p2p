@@ -5598,6 +5598,19 @@ struct MacThemePalette: Equatable {
         nsCanvasGreen: 0.063,
         nsCanvasBlue: 0.094
     )
+
+    static func isSystemDark() -> Bool {
+        if let style = UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain)?["AppleInterfaceStyle"] as? String {
+            return style.lowercased() == "dark"
+        }
+        if let style = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") {
+            return style.lowercased() == "dark"
+        }
+        if let match = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) {
+            return match == .darkAqua
+        }
+        return false
+    }
 }
 
 struct MacScaleButtonStyle: ButtonStyle {
@@ -6046,6 +6059,7 @@ final class MacGlideDropViewModel: ObservableObject {
     private var activeSendProcess: Process? = nil
     private var fastTimer: Timer?
     private var tickCount: Int = 0
+    private var appearanceObserver: NSObjectProtocol? = nil
 
     var effectiveIsDark: Bool {
         switch themeMode {
@@ -6088,11 +6102,31 @@ final class MacGlideDropViewModel: ObservableObject {
                 }
             }
         }
+        appearanceObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("AppleInterfaceStyleChangedNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            let sysDark = Self.detectSystemDark()
+            if self.systemIsDark != sysDark {
+                self.systemIsDark = sysDark
+            }
+            if self.themeMode == "system" {
+                self.onThemeChanged?(self.palette)
+            }
+        }
+    }
+
+    deinit {
+        if let obs = appearanceObserver {
+            DistributedNotificationCenter.default().removeObserver(obs)
+        }
+        fastTimer?.invalidate()
     }
 
     static func detectSystemDark() -> Bool {
-        let match = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
-        return match == .darkAqua
+        return MacThemePalette.isSystemDark()
     }
 
     func setThemeMode(_ mode: String) {
@@ -6875,7 +6909,11 @@ struct MacGlideDropMainView: View {
         let isSending = prog.direction.lowercased().contains("send")
         let senderLabel = isSending ? vm.macDeviceName : prog.peerName
         let receiverLabel = isSending ? prog.peerName : vm.macDeviceName
-        let statusTitle = prog.isConnecting ? "Connecting…" : "Connected"
+        let isFinalizing = !prog.isConnecting && (
+            prog.phase.lowercased().contains("finalizing") ||
+                (prog.percent >= 99 && prog.speedBps <= 0)
+        )
+        let statusTitle = prog.isConnecting ? "Connecting…" : (isFinalizing ? "Finalizing…" : "Connected")
         let sizeSummary: String = {
             if prog.totalBytes > 0 && prog.doneBytes > 0 {
                 return "\(formatByteSize(prog.doneBytes)) / \(formatByteSize(prog.totalBytes))"
@@ -6885,8 +6923,11 @@ struct MacGlideDropMainView: View {
             return "Preparing"
         }()
         let speedSummary: String = {
-            if prog.isConnecting || prog.speedBps <= 0 {
-                return prog.isConnecting ? "Handshake" : "Starting…"
+            if prog.isConnecting {
+                return "Handshake"
+            }
+            if prog.speedBps <= 0 {
+                return prog.percent >= 99 ? "Finalizing…" : "Starting…"
             }
             return formatTransferSpeed(prog.speedBps)
         }()
@@ -7042,6 +7083,7 @@ struct MacGlideDropMainView: View {
                 .font(.system(size: 12, weight: .bold).monospacedDigit())
                 .foregroundColor(.white)
                 .lineLimit(1)
+                .minimumScaleFactor(0.8)
         }
         .frame(maxWidth: .infinity)
     }
@@ -7069,6 +7111,7 @@ struct MacGlideDropMainView: View {
 
             // 5. Bottom Dual Action Buttons (Send / Select Files + Receive)
             HStack(spacing: 12) {
+                let sendBusy = vm.isTransferring && !vm.stagedItems.isEmpty
                 Button(action: {
                     if vm.stagedItems.isEmpty {
                         vm.chooseFilesForCategory(title: "Files", types: [])
@@ -7079,7 +7122,7 @@ struct MacGlideDropMainView: View {
                     HStack(spacing: 8) {
                         Image(systemName: "paperplane.fill")
                             .font(.system(size: 14, weight: .bold))
-                        Text(vm.stagedItems.isEmpty ? "Select Files" : "Send (\(vm.stagedItems.count))")
+                        Text(sendBusy ? "Sending…" : (vm.stagedItems.isEmpty ? "Select Files" : "Send (\(vm.stagedItems.count))"))
                             .font(.system(size: 14, weight: .bold))
                     }
                     .foregroundColor(.white)
@@ -7092,6 +7135,7 @@ struct MacGlideDropMainView: View {
                 }
                 .buttonStyle(MacScaleButtonStyle())
                 .disabled(vm.isTransferring)
+                .opacity(vm.isTransferring ? 0.55 : 1.0)
 
                 Button(action: { vm.selectedTab = 1 }) {
                     HStack(spacing: 8) {
@@ -7259,7 +7303,7 @@ struct MacGlideDropMainView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "paperplane.fill")
                         .font(.system(size: 13, weight: .bold))
-                    Text("Send \(vm.stagedItems.count) \(vm.stagedItems.count == 1 ? "File" : "Files") (\(formatByteSize(vm.totalStagedBytes)))")
+                    Text(vm.isTransferring ? "Sending…" : "Send \(vm.stagedItems.count) \(vm.stagedItems.count == 1 ? "File" : "Files") (\(formatByteSize(vm.totalStagedBytes)))")
                         .font(.system(size: 13, weight: .bold).monospacedDigit())
                 }
                 .foregroundColor(.white)
@@ -7269,6 +7313,7 @@ struct MacGlideDropMainView: View {
             }
             .buttonStyle(MacScaleButtonStyle())
             .disabled(vm.isTransferring)
+            .opacity(vm.isTransferring ? 0.55 : 1.0)
         }
         .padding(15)
         .background(
@@ -8251,20 +8296,27 @@ struct MacGlideDropMainView: View {
             HStack(spacing: 10) {
                 Button(action: { vm.respondToAsk(accepted: false) }) {
                     Text("Decline")
-                        .fontWeight(.semibold)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(p.textPrimary)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(p.bgSubtle)
+                                .overlay(RoundedRectangle(cornerRadius: 12).stroke(p.border, lineWidth: 1))
+                        )
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(MacScaleButtonStyle())
 
                 Button(action: { vm.respondToAsk(accepted: true) }) {
                     Text("Accept")
-                        .fontWeight(.bold)
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(.white)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
+                        .padding(.vertical, 10)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(p.indigo))
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(p.indigo)
+                .buttonStyle(MacScaleButtonStyle())
             }
         }
         .padding(20)
@@ -8468,7 +8520,7 @@ final class StatusBarController: NSObject, NSWindowDelegate, NSApplicationDelega
 
     private func applyWindowAppearance(_ pal: MacThemePalette) {
         guard let win = window else { return }
-        win.appearance = NSAppearance(named: pal.isDark ? .darkAqua : .aqua)
+        win.appearance = (viewModel.themeMode == "system") ? nil : NSAppearance(named: pal.isDark ? .darkAqua : .aqua)
         win.backgroundColor = NSColor(
             calibratedRed: pal.nsCanvasRed,
             green: pal.nsCanvasGreen,
